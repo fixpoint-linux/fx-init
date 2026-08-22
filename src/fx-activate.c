@@ -82,6 +82,17 @@ static const char *path_of(const PathEntry *es, int ne, const char *name) {
     return NULL;
 }
 
+/* find the PathEntry of a closure package by name (or NULL).  Used to derive
+ * the store-RELATIVE form `<hash>-<name>` of a package's store path: the
+ * generation facts and the genhash serialization record relative paths so the
+ * generation is relocatable (fx-init resolves them against its --store at
+ * boot, when the store may live under a different root than at activation). */
+static const PathEntry *entry_of(const PathEntry *es, int ne, const char *name) {
+    for (int i = 0; i < ne; i++)
+        if (!strcmp(es[i].p->name, name)) return &es[i];
+    return NULL;
+}
+
 static void paths_free(PathEntry *es, int n) {
     for (int i = 0; i < n; i++) { free(es[i].path); free(es[i].hash); free(es[i].src_hash); }
     free(es);
@@ -394,17 +405,30 @@ static int serialize_generation(Buf *b, const FxConfig *cfg,
         if (buf_lpstr(b, s->probe_arg ? s->probe_arg : "") != 0) { free(sv); return -1; }
     }
     free(sv);
-    /* closure store paths sorted */
+    /* closure store paths sorted.  RECORDED STORE-RELATIVE (`<hash>-<name>`,
+     * NOT `<store_root>/<hash>-<name>`): the genhash must be independent of the
+     * store root so a generation activated against one store root boots
+     * identically after the store is relocated to another root (the chroot
+     * harness activates against a host temp dir, then fx-init boots with the
+     * store at /fx/store).  Re-activate idempotency holds because the relative
+     * form is the same for the same closure regardless of store root. */
     char **paths = calloc((size_t)(ne ? ne : 1), sizeof(char *));
     if (!paths) return -1;
-    for (int i = 0; i < ne; i++) paths[i] = es[i].path;
+    for (int i = 0; i < ne; i++) {
+        /* store-relative form `<hash>-<name>` (see comment above) */
+        size_t need = strlen(es[i].hash) + 1 + strlen(es[i].p->name) + 1;
+        paths[i] = malloc(need);
+        if (!paths[i]) { for (int k = 0; k < i; k++) free(paths[k]); free(paths); return -1; }
+        snprintf(paths[i], need, "%s-%s", es[i].hash, es[i].p->name);
+    }
     for (int i = 1; i < ne; i++) {
         char *t = paths[i]; int j = i;
         while (j > 0 && strcmp(paths[j-1], t) > 0) { paths[j] = paths[j-1]; j--; }
         paths[j] = t;
     }
-    if (buf_u32(b, (uint32_t)ne) != 0) { free(paths); return -1; }
-    for (int i = 0; i < ne; i++) if (buf_lpstr(b, paths[i]) != 0) { free(paths); return -1; }
+    if (buf_u32(b, (uint32_t)ne) != 0) { for (int i = 0; i < ne; i++) free(paths[i]); free(paths); return -1; }
+    for (int i = 0; i < ne; i++) if (buf_lpstr(b, paths[i]) != 0) { for (int k = i; k < ne; k++) free(paths[k]); free(paths); return -1; }
+    for (int i = 0; i < ne; i++) free(paths[i]);
     free(paths);
     return 0;
 }
@@ -539,7 +563,12 @@ int main(int argc, char **argv) {
         }
     }
     const char *dhake_path = store_path_of(es, ne, "dhake");
-    char dhake_bin[PATH_MAX]; snprintf(dhake_bin, sizeof dhake_bin, "%s/dhake.com", dhake_path);
+    /* store-RELATIVE dhake path for the generation fact: `<hash>-dhake/dhake.com`.
+     * fx-init resolves it against its --store at boot.  (entry_of is non-NULL:
+     * need_tools already required "dhake" in the closure.) */
+    const PathEntry *dhake_e = entry_of(es, ne, "dhake");
+    char dhake_rel[PATH_MAX];
+    snprintf(dhake_rel, sizeof dhake_rel, "%s-dhake/dhake.com", dhake_e->hash);
 
     /* collect /etc items: hostname, passwd, group, then extraEtc (sorted) */
     int netc = 3 + cfg.nextra_etc;
@@ -640,8 +669,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* buildfile + dhake absolute paths for the generation fact */
+    /* buildfile path.  buildfile_abs (host-absolute) is kept for the human-facing
+     * print line; the generation FACT records the store-RELATIVE form
+     * `<genhash>-system-generation/Dhakefile.dhall` so fx-init can resolve it
+     * against its --store at boot (the store root may differ from activation
+     * time, e.g. host temp dir -> chroot /fx/store).  The buildfile TEXT itself
+     * still embeds the host store root (let GEN = "<host_store>/...") — fx-init
+     * rewrites that root to its own --store before exec'ing dhake (fx_reloc). */
     char buildfile_abs[PATH_MAX]; snprintf(buildfile_abs, sizeof buildfile_abs, "%s/Dhakefile.dhall", gen_dir);
+    char buildfile_rel[PATH_MAX]; snprintf(buildfile_rel, sizeof buildfile_rel, "%s-system-generation/Dhakefile.dhall", genhash);
 
     /* declare + txn: generation facts */
     uint32_t now = (uint32_t)time(NULL);
@@ -683,10 +719,12 @@ int main(int argc, char **argv) {
         binlink_free(bin, nbin); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1;
     }
 
-    /* generation(genhash, buildfile, dhake, epoch) a4 */
+    /* generation(genhash, buildfile, dhake, epoch) a4.
+     * buildfile + dhake columns are STORE-RELATIVE paths (resolved by fx-init
+     * against its --store at boot) — see the buildfile_rel / dhake_rel notes. */
     {
-        uint32_t cols[4] = { dl_intern_str(db, genhash), dl_intern_str(db, buildfile_abs),
-                             dl_intern_str(db, dhake_bin), now };
+        uint32_t cols[4] = { dl_intern_str(db, genhash), dl_intern_str(db, buildfile_rel),
+                             dl_intern_str(db, dhake_rel), now };
         add_fact(db, "generation", cols, 4);
     }
     /* tool_fxstore(path) a1 — record the activator's conventional rootfs path so
@@ -725,12 +763,17 @@ int main(int argc, char **argv) {
             uint32_t c[3] = { sn, (uint32_t)a, dl_intern_str(db, sv->argv[a]) };
             add_fact(db, "svc_argv", c, 3);
         }
-        /* resolve svc_bin: argv[0] -> store path / target-basename, or absolute */
+        /* resolve svc_bin: argv[0] -> store path / target-basename, or absolute.
+         * For a pkg'd service the recorded path is STORE-RELATIVE
+         * (`<hash>-<pkg>/<target>`) so fx-init can resolve it against its
+         * --store at boot (relocatable).  A non-pkg'd service's argv[0] is
+         * recorded verbatim (typically an absolute path like /bin/sh, which
+         * fx-init passes through unchanged). */
         char resolved[PATH_MAX];
         if (sv->pkg) {
-            const char *p = store_path_of(es, ne, sv->pkg);
+            const PathEntry *pe = entry_of(es, ne, sv->pkg);
             Package *pk = fx_find_package(&ps, sv->pkg);
-            snprintf(resolved, sizeof resolved, "%s/%s", p, base_name(pk->target));
+            snprintf(resolved, sizeof resolved, "%s-%s/%s", pe->hash, sv->pkg, base_name(pk->target));
         } else {
             snprintf(resolved, sizeof resolved, "%s", sv->argv[0]);
         }

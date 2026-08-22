@@ -18,7 +18,8 @@
  *      (roll-forward, monotonic) then re-read facts AS-OF v'
  *   7. append .bootlog (v, in-progress, now)
  *   8. fork+exec dhake -f <buildfile> rootfs; pipe output to the log DB; nonzero
- *      -> append (v,failed) + boot_status(v,failed), KEEP RUNNING
+ *      -> append (v,failed) + boot_status(v,failed) + PIN the boot decision so
+ *      the START-ONLY grace rule can never flip it to ok, KEEP RUNNING
  *   9. txn: generation_current(v), boot_status(v,in-progress)
  *   10. build on= readiness graph, validate, enter main loop
  *
@@ -33,6 +34,7 @@
  * GUARD: runs only if getpid()==1 or env FX_INIT_FORCE=1.
  */
 #include "fx.h"            /* enums only: FX_ON_*, FX_PROBE_*, FX_RESTART_* */
+#include "fx_reloc.h"      /* store-relocatability: buildfile root rewrite */
 #include "fx_probe.h"
 #include "fx_log.h"
 #include "fxstore.h"
@@ -415,8 +417,12 @@ static int read_store_facts(uint32_t version) {
     const char *bf = dl_intern_str_of(db, gp.bf);
     const char *dh = dl_intern_str_of(db, gp.dh);
     if (!bf || !dh) { fx_store_close(s); return -1; }
-    strncpy(g_buildfile, bf, sizeof g_buildfile - 1); g_buildfile[sizeof g_buildfile - 1] = '\0';
-    strncpy(g_dhake, dh, sizeof g_dhake - 1); g_dhake[sizeof g_dhake - 1] = '\0';
+    /* bf + dh are STORE-RELATIVE (fx-activate records `<genhash>-system-generation/
+     * Dhakefile.dhall` and `<hash>-dhake/dhake.com`); resolve against g_store so
+     * the paths resolve wherever the store lives at boot (host temp dir at
+     * activation time, /fx/store in the chroot, or any other --store root). */
+    snprintf(g_buildfile, sizeof g_buildfile, "%s/%s", g_store, bf);
+    snprintf(g_dhake, sizeof g_dhake, "%s/%s", g_store, dh);
 
     ToolPathCtx tp = { db, g_fxstore, sizeof g_fxstore, 0 };
     dl_query_version(db, version, "tool_fxstore", tool_path_cb, &tp);
@@ -443,6 +449,14 @@ static int read_store_facts(uint32_t version) {
 
         BinCtx bc; bc.db = db; bc.bin = NULL; bc.got = 0;
         dl_query_bound_version(db, version, "svc_bin", &sn, 1, svc_bin_cb, &bc);
+        /* svc_bin is STORE-RELATIVE for a pkg'd service (`<hash>-<pkg>/<target>`);
+         * resolve it against g_store.  A non-pkg'd service's argv[0] is absolute
+         * (e.g. /bin/sh) and is passed through unchanged. */
+        if (bc.bin && bc.bin[0] != '/') {
+            char abs[PATH_MAX];
+            snprintf(abs, sizeof abs, "%s/%s", g_store, bc.bin);
+            free(bc.bin); bc.bin = strdup(abs);
+        }
         build_argv(sv, &ac, bc.bin);
         free(bc.bin);
 
@@ -507,23 +521,51 @@ static uint32_t decide_boot_version(void) {
 }
 
 /* fork+exec dhake -f buildfile rootfs; pipe stdout/stderr to the log DB;
- * waitpid.  returns dhake exit code (0 ok). */
+ * waitpid.  returns dhake exit code (0 ok).
+ *
+ * The stored buildfile embeds the ACTIVATION-time host store root in its
+ * `let GEN = "<host_store>/..."` and every bin Symlink `from`.  At boot the
+ * store may live under a different root (chroot: /fx/store, or any --store), so
+ * we rewrite that host root to g_store (fx_reloc_rewrite_buildfile) and exec
+ * dhake on the rewritten copy under the run dir.  The `to` paths (/etc/...,
+ * /bin/..., /run/...) are absolute and never under the store, so they pass
+ * through unchanged. */
 static int run_dhake(void) {
     if (access(g_dhake, X_OK) != 0) {
         log_line("dhake", "error", "dhake binary not executable");
         return -1;
     }
+    /* read the stored buildfile and rewrite its host store root to g_store */
+    char bootbf[1100];
+    snprintf(bootbf, sizeof bootbf, "%s/Dhakefile.boot.dhall", g_run);
+    {
+        FILE *f = fopen(g_buildfile, "r");
+        if (!f) { log_line("dhake", "error", "cannot open buildfile"); return -1; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz < 0) { fclose(f); log_line("dhake", "error", "buildfile stat failed"); return -1; }
+        char *text = malloc((size_t)sz + 1);
+        if (!text) { fclose(f); log_line("dhake", "error", "oom reading buildfile"); return -1; }
+        size_t rd = fread(text, 1, (size_t)sz, f); fclose(f); text[rd] = '\0';
+        char *rew = fx_reloc_rewrite_buildfile(text, g_store);
+        free(text);
+        if (!rew) { log_line("dhake", "error", "buildfile reloc rewrite failed"); return -1; }
+        FILE *of = fopen(bootbf, "w");
+        if (!of) { free(rew); log_line("dhake", "error", "cannot write boot buildfile"); return -1; }
+        size_t wl = strlen(rew);
+        if (fwrite(rew, 1, wl, of) != wl) { fclose(of); free(rew); unlink(bootbf); log_line("dhake", "error", "boot buildfile write failed"); return -1; }
+        fclose(of); free(rew);
+    }
     int outpipe[2] = {-1,-1};
-    if (pipe(outpipe) != 0) { log_line("dhake","error","pipe failed"); return -1; }
+    if (pipe(outpipe) != 0) { log_line("dhake","error","pipe failed"); unlink(bootbf); return -1; }
     pid_t pid = fork();
-    if (pid < 0) { close(outpipe[0]); close(outpipe[1]); log_line("dhake","error","fork failed"); return -1; }
+    if (pid < 0) { close(outpipe[0]); close(outpipe[1]); log_line("dhake","error","fork failed"); unlink(bootbf); return -1; }
     if (pid == 0) {
         /* child */
         close(outpipe[0]);
         dup2(outpipe[1], 1);
         dup2(outpipe[1], 2);
         close(outpipe[1]);
-        char *const av[] = { (char*)"dhake.com", (char*)"-f", (char*)g_buildfile, (char*)"rootfs", NULL };
+        char *const av[] = { (char*)"dhake.com", (char*)"-f", (char*)bootbf, (char*)"rootfs", NULL };
         execv(g_dhake, av);
         /* if execv fails, write and exit nonzero */
         const char *m = "fx-init: exec dhake failed\n";
@@ -544,6 +586,7 @@ static int run_dhake(void) {
     } else close(outpipe[0]);
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    unlink(bootbf);   /* clean up the rewritten boot buildfile */
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return rc;
 }
@@ -1164,15 +1207,25 @@ int main(int argc, char **argv) {
         /* materialize rootfs via dhake */
         log_line("fx-init", "info", "materializing rootfs via dhake");
         int drc = run_dhake();
-        if (drc != 0) {
+        int dhake_failed = (drc != 0);
+        if (dhake_failed) {
             char m[256]; snprintf(m, sizeof m, "dhake exited %d", drc);
             log_line("fx-init", "error", m);
             rt_txn_begin(); rt_set_boot(g_current_version, "failed"); rt_txn_commit();
             bootlog_append(g_current_version, "failed", now_s());
+            /* A failed rootfs materialization means the boot can NEVER reach ok:
+             * /etc + /bin were not materialized, so the system is not usable.
+             * Pin the decision so evaluate_boot_ok() (START-ONLY grace rule)
+             * cannot later flip boot_status to ok — without this the
+             * unconditional in-progress set below would mask the failure, and
+             * the grace rule could mark the boot ok even though dhake failed
+             * (the observed bug: .bootlog showed in-progress -> failed -> ok). */
+            g_boot_decided = 1;
+            g_boot_failed = 1;
         }
         rt_txn_begin();
         rt_set_generation_current(g_current_version);
-        rt_set_boot(g_current_version, "in-progress");
+        if (!dhake_failed) rt_set_boot(g_current_version, "in-progress");
         for (int i = 0; i < g_nsvc; i++) rt_set_service(&g_svc[i]);
         rt_txn_commit();
     }
