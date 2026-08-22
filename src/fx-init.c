@@ -242,8 +242,16 @@ static int bootlog_last(uint32_t *v_out, char *status_out, size_t scap) {
     FILE *f = fopen(p, "r");
     if (!f) return 0;
     char line[256], sv[64]; uint32_t v = 0; int got = 0;
-    while (fgets(line, sizeof line, f))
-        if (sscanf(line, "%u %63s", &v, sv) == 2) got = 1;
+    while (fgets(line, sizeof line, f)) {
+        uint32_t tv; char tsv[64];
+        /* skip lifecycle 'shutdown' markers so the last BOOT outcome (which may
+         * be in-progress/ok/failed) is what a stale-failed roll-forward check
+         * sees — a clean shutdown of a failed boot must not mask the failure.
+         * Only record v/sv for a genuine boot-status line. */
+        if (sscanf(line, "%u %63s", &tv, tsv) == 2 && strcmp(tsv, "shutdown") != 0) {
+            v = tv; memcpy(sv, tsv, sizeof sv); got = 1;
+        }
+    }
     fclose(f);
     if (got) { *v_out = v; strncpy(status_out, sv, scap - 1); status_out[scap - 1] = '\0'; }
     return got;
@@ -1143,8 +1151,11 @@ static void main_loop(void) {
         rt_txn_commit();
         for (int i = 0; i < g_nsvc; i++) {
             Svc *sv = &g_svc[i];
-            if (sv->state == ST_PENDING) { start_service(sv); }
-            else if (sv->state == ST_BACKOFF && now >= sv->next_start) {
+            /* start only when the on= readiness condition is actually met — a
+             * service gated on `on=up:X` (or a socket/time/net condition) must
+             * NOT be launched until X is ready, even though it is ST_PENDING. */
+            if (sv->state == ST_PENDING && on_ready(sv)) { start_service(sv); }
+            else if (sv->state == ST_BACKOFF && now >= sv->next_start && on_ready(sv)) {
                 sv->state = ST_PENDING; start_service(sv);
             }
         }

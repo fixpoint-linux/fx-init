@@ -112,12 +112,18 @@ boot_stop() {
 }
 
 wait_status() {
-    # poll fxctl status until it responds (up to 20s).  echoes the status output.
-    for i in $(seq 1 40); do
-        out=$(fxctl status 2>/dev/null) && { echo "$out"; return 0; }
+    # poll fxctl status until the boot DECISION is made (boot_status reaches
+    # ok or failed — boot-ok now lands at grace-end, after the socket is up),
+    # up to 30s.  echoes the status output.
+    for i in $(seq 1 60); do
+        out=$(fxctl status 2>/dev/null) || { sleep 0.5; continue; }
+        bs=$(st_bs "$out")
+        case "$bs" in
+            *ok|*failed) echo "$out"; return 0;;
+        esac
         sleep 0.5
     done
-    fail "fxctl status never responded (boot did not bring up control.sock?)"
+    fail "boot_status never reached ok/failed (fxctl responded but no boot decision in 30s)"
 }
 
 bootlog_has() {
