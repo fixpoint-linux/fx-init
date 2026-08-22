@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <sys/un.h>
 
@@ -18,10 +19,14 @@
 
 int fx_sock_ready(int tcp, const char *arg) {
     if (!arg || !*arg) return 0;
+    /* 250ms connect timeout (defensive): localhost/unix connects return fast
+     * (ECONNREFUSED/ENOENT), but a slow endpoint must not hang the poll loop. */
+    struct timeval to = { .tv_sec = 0, .tv_usec = 250000 };
     int fd;
     if (tcp) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
         struct sockaddr_in a;
         memset(&a, 0, sizeof a);
         a.sin_family = AF_INET;
@@ -33,6 +38,7 @@ int fx_sock_ready(int tcp, const char *arg) {
     }
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
     a.sun_family = AF_UNIX;
