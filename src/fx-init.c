@@ -14,8 +14,11 @@
  *   5. transient store open: current version v; read generation/svc facts AS-OF
  *      v (or the rolled-back predecessor) into the in-memory Svc table; close
  *   6. boot decision: stale in-progress/failed for current v + a known-good ok
- *      predecessor v'<v exists in dl_snapshot_versions -> fx_store_rollback(v',0)
- *      (roll-forward, monotonic) then re-read facts AS-OF v'
+ *      predecessor v'<v exists in dl_snapshot_versions -> restore v's M4 init
+ *      facts into the live store WAL (fx_store_rollback only restores fxstore's
+ *      package facts, NOT the M4 svc/generation facts), then fx_store_rollback
+ *      (v',0) (roll-forward, monotonic) re-publishing v's FULL state; re-read
+ *      facts AS-OF the new CURRENT
  *   7. append .bootlog (v, in-progress, now)
  *   8. fork+exec dhake -f <buildfile> rootfs; pipe output to the log DB; nonzero
  *      -> append (v,failed) + boot_status(v,failed) + PIN the boot decision so
@@ -493,6 +496,119 @@ static int read_store_facts(uint32_t version) {
     return 0;
 }
 
+/* ─── roll-forward M4 fact restore ──────────────────────────────────────────
+ *
+ * fx_store_rollback (fxstore's M5 API) only restores fxstore's OWN package
+ * facts — store/srcstore/pkg/dep/root + a re-derived closure.  It does NOT
+ * touch the M4 init relations written by fx-activate (generation, svc,
+ * svc_argv, svc_bin, svc_backoff, svc_env, svc_probe, user, tool_fxstore,
+ * boot_grace).  Those stay in the live WAL as the FAILED boot's, so the
+ * snapshot fx_store_rollback re-publishes carries the WRONG service set.
+ * fx-init reads facts AS-OF the re-published version, so the boot following a
+ * roll-forward (and any FUTURE roll-forward that targets that re-published
+ * version) would boot the failed boot's services instead of the good
+ * predecessor's — the observed harness blocker: the 2nd roll-forward re-publish
+ * carried config-bad-exit's crasher instead of the good generation's heartbeat.
+ *
+ * Fix: BEFORE fx_store_rollback publishes, restore vok's M4 facts into the live
+ * WAL (clear the current set, add vok's, one txn — NO publish).  Then
+ * fx_store_rollback's publish-first captures vok's M4 alongside the package
+ * swap, and its final closure-rebuild publish produces a re-published snapshot
+ * carrying vok's FULL state (packages + service set).  Repeated roll-forwards
+ * are then self-consistent: every re-published version carries its target's
+ * service facts, so a future roll-forward targeting it reads the correct set.
+ * (fxstore is a read-only vendored submodule, so this M4 fact restore is fx-init's
+ *  responsibility — the design's "re-publish old state as new version" means the
+ *  FULL old state, not just the package closure.) */
+
+static const struct { const char *name; uint8_t arity; } M4_RELS[] = {
+    {"generation", 4}, {"svc", 3}, {"svc_argv", 3}, {"svc_env", 3},
+    {"svc_probe", 3}, {"svc_bin", 2}, {"svc_backoff", 2},
+    {"user", 3}, {"tool_fxstore", 1}, {"boot_grace", 1},
+};
+#define M4_NRELS (sizeof M4_RELS / sizeof M4_RELS[0])
+
+/* raw sym-id tuple collector (mirrors store.c raw_cb): tuples are interned sym
+ * ids that resolve against the live db's shared/persisted interner, so a
+ * collected tuple can be re-added verbatim via dl_txn_add_fact. */
+typedef struct { uint32_t *tuples; size_t n, cap; } M4Bag;
+static int m4_raw_cb(const uint32_t *c, uint8_t ar, void *u) {
+    M4Bag *b = (M4Bag *)u;
+    if (b->n == b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 16;
+        uint32_t *nt = realloc(b->tuples, nc * (size_t)ar * sizeof *nt);
+        if (!nt) return 1;                 /* OOM: stop enumeration */
+        b->tuples = nt; b->cap = nc;
+    }
+    memcpy(&b->tuples[b->n * ar], c, (size_t)ar * sizeof *c);
+    b->n++;
+    return 0;
+}
+
+/* Restore the M4 init facts AS-OF `vok` into the live store WAL: declare the
+ * relations (schema is in-memory on a fresh open), then one txn that clears the
+ * current live facts and adds vok's.  No publish — the caller's subsequent
+ * fx_store_rollback captures this in its re-published snapshot.  0/-1. */
+static int restore_m4_facts(struct dl_db *db, uint32_t vok,
+                            char *err, size_t errcap) {
+    for (size_t i = 0; i < M4_NRELS; i++)
+        if (dl_declare_relation(db, M4_RELS[i].name, M4_RELS[i].arity) != 0)
+            return fx_err(err, errcap, "declare %s/%u failed",
+                          M4_RELS[i].name, M4_RELS[i].arity);
+    if (dl_txn_begin(db) != 0)
+        return fx_err(err, errcap, "m4 restore: txn begin failed");
+    for (size_t i = 0; i < M4_NRELS; i++) {
+        const char *rel = M4_RELS[i].name;
+        uint8_t ar = M4_RELS[i].arity;
+        /* clear the current live facts (collect then delete — safe vs the live
+         * DAFSA cursor, same pattern as fx-activate's clear_rel).  An arity
+         * mismatch (shouldn't happen — we declare the canonical arities) is
+         * an error. */
+        dl_iter *it = dl_iter_open(db, rel, NULL, 0);
+        if (it) {
+            int bad = (dl_iter_arity(it) != ar);
+            size_t cap = 64, n = 0;
+            uint32_t *all = bad ? NULL : malloc(cap * ar * sizeof *all);
+            uint32_t row[8];
+            int oom = 0;
+            while (!bad && dl_iter_next(it, row) == 1) {
+                if (n >= cap) {
+                    cap *= 2;
+                    uint32_t *na = realloc(all, cap * ar * sizeof *all);
+                    if (!na) { oom = 1; break; }
+                    all = na;
+                }
+                memcpy(all + n * ar, row, ar * sizeof *all);
+                n++;
+            }
+            dl_iter_close(it);
+            if (oom) { free(all); fx_err(err, errcap, "m4 restore: oom"); goto fail; }
+            if (bad) { fx_err(err, errcap, "m4 restore: %s arity mismatch", rel); goto fail; }
+            for (size_t k = 0; k < n; k++)
+                dl_txn_delete_fact(db, rel, all + k * ar, ar);
+            free(all);
+        }
+        /* add vok's facts.  A relation ABSENT from vok's snapshot
+         * (dl_query_version returns -1) is treated as empty — leave the
+         * relation clear (vok had no such facts to restore). */
+        M4Bag bag = {0};
+        long cnt = dl_query_version(db, vok, rel, m4_raw_cb, &bag);
+        if (cnt >= 0)
+            for (size_t k = 0; k < bag.n; k++)
+                dl_txn_add_fact(db, rel, &bag.tuples[k * ar], ar);
+        free(bag.tuples);
+    }
+    if (dl_txn_commit(db) != 0) {
+        fx_err(err, errcap, "m4 restore: commit failed");
+        dl_txn_rollback(db);
+        return -1;
+    }
+    return 0;
+fail:
+    dl_txn_rollback(db);
+    return -1;
+}
+
 /* ─── boot decision + dhake materialization ────────────────────────────────── */
 
 /* returns the version to read facts AS-OF (after possible rollback), and sets
@@ -520,12 +636,26 @@ static uint32_t decide_boot_version(void) {
                     lstatus, g_current_version, vok);
             char e2[1024];
             FxStore *rs = fx_store_open(g_store, e2, sizeof e2);
-            if (rs && fx_store_rollback(rs, vok, 0, e2, sizeof e2) == 0) {
+            if (rs) {
+                /* fx_store_rollback restores only fxstore's package facts; the
+                 * M4 init facts (svc/generation/...) would otherwise stay as the
+                 * failed boot's, so the re-published snapshot (which fx-init
+                 * reads AS-OF) would carry the WRONG service set.  Restore vok's
+                 * M4 facts into the live WAL BEFORE the rollback so its publish
+                 * captures vok's FULL state (packages + service set). */
+                int restored = (restore_m4_facts(fx_store_db(rs), vok, e2, sizeof e2) == 0);
+                int rb = restored ? fx_store_rollback(rs, vok, 0, e2, sizeof e2) : -1;
                 fx_store_current_version(rs, &g_current_version, e2, sizeof e2);
-                log_line("fx-init", "info", "rolled forward to known-good generation");
+                if (rb == 0)
+                    log_line("fx-init", "info", "rolled forward to known-good generation");
+                else
+                    fprintf(stderr, "fx-init: roll-forward failed (m4-restore=%d): %s\n",
+                            restored, e2);
+                fx_store_close(rs);
             }
-            if (rs) fx_store_close(rs);
-            return vok;  /* read facts AS-OF the good predecessor */
+            /* read facts AS-OF the re-published CURRENT, which now carries
+             * vok's full state (so g_boot_version == g_current_version). */
+            return g_current_version;
         }
     }
     return g_current_version;
@@ -988,7 +1118,11 @@ static void handle_request(FILE *o, char *line) {
             uint32_t v = (uint32_t)strtoul(arg, NULL, 10);
             char e2[1024]; FxStore *s = fx_store_open(g_store, e2, sizeof e2);
             if (!s) { resp_err(o, "store open"); return; }
-            if (fx_store_rollback(s, v, 0, e2, sizeof e2) != 0) { fx_store_close(s); resp_err(o, e2); return; }
+            /* restore v's M4 init facts into the live WAL before the rollback so
+             * the re-published snapshot carries v's service set (fx_store_rollback
+             * only restores fxstore's package facts — see restore_m4_facts). */
+            if (restore_m4_facts(fx_store_db(s), v, e2, sizeof e2) != 0 ||
+                fx_store_rollback(s, v, 0, e2, sizeof e2) != 0) { fx_store_close(s); resp_err(o, e2); return; }
             fx_store_current_version(s, &g_current_version, e2, sizeof e2); fx_store_close(s);
             read_store_facts(g_current_version);
             rt_txn_begin(); rt_set_generation_current(g_current_version); rt_txn_commit();
