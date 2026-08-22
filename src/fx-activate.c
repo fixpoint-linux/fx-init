@@ -528,7 +528,7 @@ int main(int argc, char **argv) {
     }
     free(miss.d);
 
-    const char *need_tools[] = { "dhake", "fx-init", "fxctl" };
+    const char *need_tools[] = { "dhake", "fx-init", "fxctl", "fx-activate" };
     for (size_t i = 0; i < sizeof need_tools/sizeof need_tools[0]; i++) {
         if (!store_path_of(es, ne, need_tools[i])) {
             fprintf(stderr, "fx-activate: required package '%s' not in the closure "
@@ -556,8 +556,8 @@ int main(int argc, char **argv) {
     }
     qsort(etc, netc, sizeof *etc, etcitem_cmp);
 
-    /* collect /bin symlinks: init, fxctl, dhake, + one per service pkg */
-    int nbin = 3;
+    /* collect /bin symlinks: init, fxctl, dhake, fx-activate, + one per service pkg */
+    int nbin = 4;
     for (int i = 0; i < cfg.nservices; i++) if (cfg.services[i].pkg) nbin++;
     BinLink *bin = calloc((size_t)(nbin ? nbin : 1), sizeof *bin);
     if (!bin) { fprintf(stderr, "fx-activate: out of memory\n"); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1; }
@@ -566,6 +566,7 @@ int main(int argc, char **argv) {
     bin[bi].name = strdup("init"); bin[bi].storedir = strdup(initp); bi++;
     bin[bi].name = strdup("fxctl"); bin[bi].storedir = strdup(store_path_of(es, ne, "fxctl")); bi++;
     bin[bi].name = strdup("dhake"); bin[bi].storedir = strdup(dhake_path); bi++;
+    bin[bi].name = strdup("fx-activate"); bin[bi].storedir = strdup(store_path_of(es, ne, "fx-activate")); bi++;
     for (int i = 0; i < cfg.nservices; i++) {
         FxService *sv = &cfg.services[i];
         if (!sv->pkg) continue;
@@ -650,7 +651,8 @@ int main(int argc, char **argv) {
         declare(db, "svc_bin", 2, err, sizeof err) != 0 ||
         declare(db, "svc_backoff", 2, err, sizeof err) != 0 ||
         declare(db, "user", 3, err, sizeof err) != 0 ||
-        declare(db, "tool_fxstore", 1, err, sizeof err) != 0) {
+        declare(db, "tool_fxstore", 1, err, sizeof err) != 0 ||
+        declare(db, "boot_grace", 1, err, sizeof err) != 0) {
         fprintf(stderr, "fx-activate: %s\n", err);
         binlink_free(bin, nbin); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1;
     }
@@ -672,7 +674,8 @@ int main(int argc, char **argv) {
         clear_rel(db, "svc_bin", 2) != 0 ||
         clear_rel(db, "svc_backoff", 2) != 0 ||
         clear_rel(db, "user", 3) != 0 ||
-        clear_rel(db, "tool_fxstore", 1) != 0) {
+        clear_rel(db, "tool_fxstore", 1) != 0 ||
+        clear_rel(db, "boot_grace", 1) != 0) {
         fprintf(stderr, "fx-activate: clear old facts failed\n");
         dl_txn_rollback(db);
         binlink_free(bin, nbin); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1;
@@ -684,14 +687,22 @@ int main(int argc, char **argv) {
                              dl_intern_str(db, dhake_bin), now };
         add_fact(db, "generation", cols, 4);
     }
-    /* tool_fxstore(path) a1 — record the activator's own store path so fx-init
-     * can fork fx-activate re-activations; fall back to /bin/fxstore at boot */
+    /* tool_fxstore(path) a1 — record the activator's conventional rootfs path so
+     * fx-init can fork fx-activate for re-activations over the control socket.
+     * (Relation name kept for plan compatibility; the binary IS fx-activate, the
+     *  activation tool moved out of fxstore in the standalone-repo structure.)
+     *  The /bin/fx-activate symlink is created by dhake from the bin target. */
     {
-        /* the fxstore binary lives at <fx-init store path>/../<fxstore-hash>-fxstore/fxstore
-         * but we don't have the fxstore package in the closure necessarily;
-         * record a conventional /bin/fxstore fallback path instead. */
-        uint32_t cols[1] = { dl_intern_str(db, "/bin/fxstore") };
+        uint32_t cols[1] = { dl_intern_str(db, "/bin/fx-activate") };
         add_fact(db, "tool_fxstore", cols, 1);
+    }
+    /* boot_grace(ms) a1 — persist the config's bootGraceMs so fx-init honors the
+     * per-activation grace timeout (config.dhall's bootGraceMs; default 30000).
+     * fx-init cannot read dhall, so the value must reach it via a store fact.
+     * Stored as a RAW u32 column (same convention as svc_backoff.backoff_ms). */
+    {
+        uint32_t cols[1] = { cfg.grace_ms };
+        add_fact(db, "boot_grace", cols, 1);
     }
     /* svc facts */
     for (int i = 0; i < cfg.nservices; i++) {

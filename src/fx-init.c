@@ -107,7 +107,7 @@ static uint32_t g_boot_version;     /* version whose facts we booted */
 static uint32_t g_current_version;  /* CURRENT (after any rollback) */
 static char g_buildfile[1024];
 static char g_dhake[1024];
-static char g_fxstore[1024] = "/bin/fxstore";
+static char g_fxstore[1024] = "/bin/fx-activate";
 static char g_hostname[256] = "";
 static time_t g_boot_start;
 static time_t g_boot_deadline;
@@ -392,6 +392,13 @@ static int backoff_cb(const uint32_t *c, uint8_t ar, void *u) {
     BkCtx *b = (BkCtx *)u; b->v = c[1]; b->got = 1; return 0;
 }
 
+/* boot_grace(ms) a1 — raw u32; single tuple, the per-activation boot grace. */
+typedef struct { uint32_t v; int got; } GraceCtx;
+static int grace_cb(const uint32_t *c, uint8_t ar, void *u) {
+    (void)ar;
+    GraceCtx *g = (GraceCtx *)u; g->v = c[0]; g->got = 1; return 0;
+}
+
 /* read all generation + svc facts AS-OF `version`; clears g_svc first. 0/-1. */
 static int read_store_facts(uint32_t version) {
     char err[1024];
@@ -413,6 +420,11 @@ static int read_store_facts(uint32_t version) {
 
     ToolPathCtx tp = { db, g_fxstore, sizeof g_fxstore, 0 };
     dl_query_version(db, version, "tool_fxstore", tool_path_cb, &tp);
+
+    /* boot_grace(ms) — override the default grace with the activation's value. */
+    GraceCtx gc = {0,0};
+    dl_query_version(db, version, "boot_grace", grace_cb, &gc);
+    if (gc.got && gc.v > 0) g_grace_ms = gc.v;
 
     SvcCtx sc = { db };
     dl_query_version(db, version, "svc", svc_name_cb, &sc);
@@ -1136,14 +1148,18 @@ int main(int argc, char **argv) {
 
     /* boot decision + read facts */
     g_boot_start = time(NULL);
-    g_boot_deadline = g_boot_start + (g_grace_ms / 1000);
     uint32_t boot_v = decide_boot_version();
     if (boot_v == 0 || read_store_facts(boot_v) != 0) {
         fprintf(stderr, "fx-init: no generation to boot\n");
         /* still run (control socket up so fxctl can activate) */
         g_boot_version = 0;
+        g_boot_deadline = g_boot_start + (g_grace_ms / 1000);
     } else {
         g_boot_version = boot_v;
+        /* boot_grace(ms) fact (read in read_store_facts) overrides the default
+         * grace; compute the deadline AFTER the override so per-activation
+         * bootGraceMs (e.g. config-bad-hang's 2000ms) is honored. */
+        g_boot_deadline = g_boot_start + (g_grace_ms / 1000);
         bootlog_append(g_current_version, "in-progress", now_s());
         /* materialize rootfs via dhake */
         log_line("fx-init", "info", "materializing rootfs via dhake");
