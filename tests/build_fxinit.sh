@@ -8,5 +8,5 @@ FXSTORE="vendor/fxstore/store.c vendor/fxstore/closure.c vendor/fxstore/build.c 
 INC="-I src -I vendor/fxstore -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/dafsa -I vendor/dhall-c/src"
 DEF='-DFXSTORE_STAGE3_PATH="/fx/store/share/stage3"'
 echo "[fx-init] compiling..."
-cosmocc -std=c11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections $DEF $INC -o build-tmp/fx-init src/fx-init.c src/fx_probe.c src/fx_log.c $FXSTORE $ENGINE $DAFSA 2>build-tmp/fx-init.err
+cosmocc -std=c11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections $DEF $INC -o build-tmp/fx-init src/fx-init.c src/fx_reloc.c src/fx_probe.c src/fx_log.c $FXSTORE $ENGINE $DAFSA 2>build-tmp/fx-init.err
 echo "[fx-init] exit=$?  (errors in build-tmp/fx-init.err)"
