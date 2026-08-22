@@ -92,7 +92,7 @@ boot_run() {
         --dev /dev \
         --proc /proc \
         --ro-bind /sys /sys \
-        --clearenv --setenv FX_INIT_FORCE 1 --setenv PATH /bin \
+        --clearenv --setenv FX_INIT_FORCE 1 --setenv PATH /bin:/usr/bin \
         -- "$FXINIT_CHROOT" --store /fx/store --run-dir /run/fx \
         >"$WORK/boot.out" 2>&1 &
     BPID=$!
@@ -125,12 +125,20 @@ bootlog_has() {
     grep -q "^$1 $2 " "$STORE/.bootlog" 2>/dev/null
 }
 
+# fxctl status emits each section as a header line then value lines.  Extract:
+#  boot_status:  \n  4\tok          -> "4\tok"
+#  generation_current: \n  4        -> "4"
+#  service_runtime: \n name\tpid\tstate\trestarts
+st_bs()  { echo "$1" | grep -A1 '^boot_status:'         | tail -n1 | sed 's/^ *//'; }
+st_gen() { echo "$1" | grep -A1 '^generation_current:'  | tail -n1 | sed 's/^ *//'; }
+st_sr()  { echo "$1" | sed -n '/^service_runtime:/,$p'  | tail -n +2; }
+
 echo "=== fxinit-boot [2]: good boot (config-good -> v1) ==="
 activate "$REPO/m3/config-good.dhall" >/dev/null
 boot_run
 st=$(wait_status)
-echo "$st" | grep -q 'boot_status:.*ok' || { echo "$st"; boot_stop; fail "good boot did not reach ok"; }
-echo "$st" | grep -q 'service_runtime:.*heartbeat.*started' || { echo "$st"; boot_stop; fail "heartbeat not started"; }
+st_bs "$st" | grep -q 'ok' || { echo "$st"; boot_stop; fail "good boot did not reach ok"; }
+st_sr "$st" | grep '^heartbeat' | grep -q 'started' || { echo "$st"; boot_stop; fail "heartbeat not started"; }
 # /etc/hostname materialized by dhake into the chroot root
 [ -f "$ROOT/etc/hostname" ] || { boot_stop; fail "/etc/hostname not materialized"; }
 [ "$(cat "$ROOT/etc/hostname")" = "fixbox" ] || { boot_stop; fail "/etc/hostname wrong: $(cat "$ROOT/etc/hostname")"; }
@@ -141,7 +149,7 @@ readlink "$ROOT/bin/init" | grep -q 'fx-init' || { boot_stop; fail "/bin/init ->
 fxctl grep heartbeat | grep -q 'heartbeat from heartbeat' || { boot_stop; fail "grep heartbeat returned no lines"; }
 fxctl search heartbeat | grep -q 'heartbeat' || { boot_stop; fail "search heartbeat returned no lines"; }
 # durable bootlog marker
-V1=$(echo "$st" | sed -n 's/.*generation_current:.*\t\([0-9]*\).*/\1/p' | head -1)
+V1=$(st_gen "$st" | grep -o '[0-9][0-9]*' | head -1)
 boot_stop
 bootlog_has "$V1" ok || fail ".bootlog missing (v$V1, ok)"
 echo "good boot OK (v$V1)"
@@ -150,10 +158,10 @@ echo "=== fxinit-boot [3]: failed boot (config-bad-exit -> v2) ==="
 activate "$REPO/m3/config-bad-exit.dhall" >/dev/null
 boot_run
 st=$(wait_status)
-echo "$st" | grep -q 'boot_status:.*failed' || { echo "$st"; boot_stop; fail "crasher boot did not reach failed"; }
-echo "$st" | grep -q 'service_runtime:.*crasher' || { echo "$st"; boot_stop; fail "crasher not in service_runtime"; }
+st_bs "$st" | grep -q 'failed' || { echo "$st"; boot_stop; fail "crasher boot did not reach failed"; }
+st_sr "$st" | grep -q '^crasher' || { echo "$st"; boot_stop; fail "crasher not in service_runtime"; }
 # restart counter on crasher >= 1 (restart=always + backoff)
-V2=$(echo "$st" | sed -n 's/.*generation_current:.*\t\([0-9]*\).*/\1/p' | head -1)
+V2=$(st_gen "$st" | grep -o '[0-9][0-9]*' | head -1)
 boot_stop
 bootlog_has "$V2" failed || fail ".bootlog missing (v$V2, failed)"
 echo "failed-exit boot OK (v$V2)"
@@ -161,12 +169,12 @@ echo "failed-exit boot OK (v$V2)"
 echo "=== fxinit-boot [4]: roll-forward (boot again, stale failed v2 -> ok v1 -> re-publish v3) ==="
 boot_run
 st=$(wait_status)
-echo "$st" | grep -q 'boot_status:.*ok' || { echo "$st"; boot_stop; fail "roll-forward did not reach ok"; }
-V3=$(echo "$st" | sed -n 's/.*generation_current:.*\t\([0-9]*\).*/\1/p' | head -1)
+st_bs "$st" | grep -q 'ok' || { echo "$st"; boot_stop; fail "roll-forward did not reach ok"; }
+V3=$(st_gen "$st" | grep -o '[0-9][0-9]*' | head -1)
 [ "$V3" -gt "$V2" ] || { echo "v3=$V3 v2=$V2"; boot_stop; fail "roll-forward version not monotonic (v3 > v2)"; }
 # service set == good set (heartbeat present, crasher absent)
-echo "$st" | grep -q 'service_runtime:.*heartbeat' || { boot_stop; fail "roll-forward did not restore heartbeat"; }
-echo "$st" | grep -q 'service_runtime:.*crasher' && { boot_stop; fail "roll-forward kept stale crasher service"; }
+st_sr "$st" | grep -q '^heartbeat' || { boot_stop; fail "roll-forward did not restore heartbeat"; }
+st_sr "$st" | grep -q '^crasher' && { boot_stop; fail "roll-forward kept stale crasher service"; }
 boot_stop
 # host-side: fxstore timeline shows 3 versions, CURRENT=v3 monotonic
 TL=$("$FXSTORE" timeline --store "$STORE" 2>&1) || true
@@ -177,10 +185,10 @@ echo "=== fxinit-boot [5]: failed boot hang (config-bad-hang -> v4; grace 2s) ==
 activate "$REPO/m3/config-bad-hang.dhall" >/dev/null
 boot_run
 st=$(wait_status)
-echo "$st" | grep -q 'boot_status:.*failed' || { echo "$st"; boot_stop; fail "hang boot did not reach failed (grace expiry)"; }
+st_bs "$st" | grep -q 'failed' || { echo "$st"; boot_stop; fail "hang boot did not reach failed (grace expiry)"; }
 # hanger never started (gate never ready)
-echo "$st" | grep -q 'service_runtime:.*hanger.*pending\|service_runtime:.*hanger.*starting' || echo "(hanger state check best-effort)"
-V4=$(echo "$st" | sed -n 's/.*generation_current:.*\t\([0-9]*\).*/\1/p' | head -1)
+st_sr "$st" | grep '^hanger' | grep -qE 'pending|starting' || echo "(hanger state check best-effort)"
+V4=$(st_gen "$st" | grep -o '[0-9][0-9]*' | head -1)
 boot_stop
 bootlog_has "$V4" failed || fail ".bootlog missing (v$V4, failed)"
 echo "failed-hang boot OK (v$V4)"
@@ -188,8 +196,8 @@ echo "failed-hang boot OK (v$V4)"
 echo "=== fxinit-boot [6]: boot again -> roll-forward to newest ok (v3) ==="
 boot_run
 st=$(wait_status)
-echo "$st" | grep -q 'boot_status:.*ok' || { echo "$st"; boot_stop; fail "post-hang roll-forward did not reach ok"; }
-echo "$st" | grep -q 'service_runtime:.*heartbeat' || { boot_stop; fail "post-hang did not restore heartbeat"; }
+st_bs "$st" | grep -q 'ok' || { echo "$st"; boot_stop; fail "post-hang roll-forward did not reach ok"; }
+st_sr "$st" | grep -q '^heartbeat' || { boot_stop; fail "post-hang did not restore heartbeat"; }
 boot_stop
 echo "post-hang roll-forward OK"
 
