@@ -1,0 +1,15 @@
+[submodule "vendor/fxstore"]
+	path = vendor/fxstore
+	url = https://github.com/fixpoint-linux/fxstore.git
+[submodule "vendor/datalog-dafsa"]
+	path = vendor/datalog-dafsa
+	url = https://github.com/fixpoint-linux/datalog-dafsa.git
+[submodule "vendor/dafsa"]
+	path = vendor/dafsa
+	url = https://github.com/fixpoint-linux/dafsa.git
+[submodule "vendor/dhake"]
+	path = vendor/dhake
+	url = https://github.com/fixpoint-linux/dhake.git
+[submodule "vendor/dhall-c"]
+	path = vendor/dhall-c
+	url = https://github.com/fixpoint-linux/dhall-c.git

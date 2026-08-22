@@ -1,0 +1,19 @@
+# cosmocc cross-build intermediates (staged in /tmp by the build, not the repo)
+*.ape
+*.ape.com.dbg
+*.aarch64.elf
+*.com.dbg
+*.o
+
+# elm / node / mfe (docs-site surface, if present)
+dist/
+elm-stuff/
+node_modules/
+mfe-framework/
+
+# build scratch
+build-tmp/
+*.build.*
+
+# local runtime artifacts (never commit)
+/fx/
