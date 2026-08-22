@@ -144,7 +144,9 @@ static int buf_reserve(Buf *b, size_t add) {
     char *nd = realloc(b->d, nc); if (!nd) return -1; b->d = nd; b->cap = nc; return 0;
 }
 static int buf_put(Buf *b, const void *p, size_t n) {
-    if (buf_reserve(b, n) != 0) return -1; memcpy(b->d + b->len, p, n); b->len += n; return 0;
+    if (buf_reserve(b, n) != 0) return -1; memcpy(b->d + b->len, p, n); b->len += n;
+    b->d[b->len] = '\0'; /* keep NUL-terminated for strlen() consumers (etc content) */
+    return 0;
 }
 static int buf_str(Buf *b, const char *s) { return buf_put(b, s, strlen(s)); }
 static int buf_ch(Buf *b, char c) { return buf_put(b, &c, 1); }

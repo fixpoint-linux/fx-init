@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build fxctl (U-D) — pure-POSIX control/query client, no external deps.
-cd /workspace/fx-init
+cd "$(dirname "$0")/.."
 mkdir -p build-tmp
 INC="-I src"
 echo "[fxctl] compiling..."

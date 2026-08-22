@@ -79,7 +79,7 @@ static int find_net(struct dl_db *db, const char *iface, uint32_t cols[6]) {
 int main(void) {
     /* fixture root */
     char root[512];
-    snprintf(root, sizeof root, "/workspace/fx-init/build-tmp/probe-XXXXXX");
+    snprintf(root, sizeof root, "/tmp/fxprobe-XXXXXX");
     if (!mkdtemp(root)) { fprintf(stderr, "mkdtemp failed\n"); return 2; }
 
     /* ─── build the fixture tree ─── */

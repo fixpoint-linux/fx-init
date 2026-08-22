@@ -38,12 +38,12 @@ echo "=== activate-test: building closure into $STORE ==="
 ( cd "$REPO/m3" && "$FXSTORE" build --store "$STORE" ) || fail "fxstore build failed"
 
 echo "=== activate-test: activate config-good ==="
-# fx-activate reads config + package-set from cwd by default; stage them.
-STAGE="$WORK/run-good"
-mkdir -p "$STAGE"
-cp "$REPO/m3/config-good.dhall" "$STAGE/config.dhall"
-cp "$REPO/m3/package-set.dhall" "$STAGE/package-set.dhall"
-OUT=$( cd "$STAGE" && "$FX_ACTIVATE" --store "$STORE" 2>&1 ) || fail "activate failed: $OUT"
+# fx-activate resolves package src Paths relative to the package-set FILE's dir,
+# so point it at the real m3/package-set.dhall + the config by absolute path
+# (never copy package-set away from its tree).
+OUT=$( "$FX_ACTIVATE" --store "$STORE" \
+    --package-set "$REPO/m3/package-set.dhall" \
+    --config "$REPO/m3/config-good.dhall" 2>&1 ) || fail "activate failed: $OUT"
 echo "$OUT"
 # "activated <genhash> as version <v>; buildfile <path>"
 GENHASH=$(echo "$OUT" | sed -n 's/^activated \([0-9a-f]*\) as version.*/\1/p')
@@ -74,16 +74,15 @@ if grep -q 'phony = False' "$BF"; then
 fi
 
 echo "=== activate-test: re-activate idempotency (same genhash) ==="
-OUT2=$( cd "$STAGE" && "$FX_ACTIVATE" --store "$STORE" 2>&1 ) || fail "re-activate failed: $OUT2"
+OUT2=$( "$FX_ACTIVATE" --store "$STORE" \
+    --package-set "$REPO/m3/package-set.dhall" \
+    --config "$REPO/m3/config-good.dhall" 2>&1 ) || fail "re-activate failed: $OUT2"
 GENHASH2=$(echo "$OUT2" | sed -n 's/^activated \([0-9a-f]*\) as version.*/\1/p')
 [ "$GENHASH2" = "$GENHASH" ] || fail "re-activate genhash differs: $GENHASH vs $GENHASH2 (not content-addressed idempotent)"
 
 echo "=== activate-test: missing-package rejection ==="
-STAGE2="$WORK/run-missing"
-mkdir -p "$STAGE2"
-cp "$REPO/m3/package-set.dhall" "$STAGE2/package-set.dhall"
 # a config whose only service pkg is "ghost-package" — not in the store.
-cat > "$STAGE2/config.dhall" <<'EOF'
+cat > "$WORK/missing-config.dhall" <<'EOF'
 let Probe = < Tcp : Natural | Unix : Text | File : Text >
 let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
                 restart : Optional Text, backoffMs : Optional Natural,
@@ -97,7 +96,9 @@ in  { hostname = "fixbox"
     , extraEtc = None (List { path : Text, content : Text })
     , bootGraceMs = None Natural }
 EOF
-if ( cd "$STAGE2" && "$FX_ACTIVATE" --store "$STORE" ) >/dev/null 2>&1; then
+if "$FX_ACTIVATE" --store "$STORE" \
+    --package-set "$REPO/m3/package-set.dhall" \
+    --config "$WORK/missing-config.dhall" >/dev/null 2>&1; then
     fail "activate accepted a config with an unbuilt package (should reject)"
 fi
 echo "missing-package rejected OK"

@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
     } else {
         /* fresh unique dir per run via mkdtemp (no shell system() — APE's
          * bundled tools differ from host coreutils) */
-        snprintf(dbdir, sizeof dbdir, "/workspace/fx-init/build-tmp/logtest-XXXXXX");
+        snprintf(dbdir, sizeof dbdir, "/tmp/fxlog-XXXXXX");
         if (!mkdtemp(dbdir)) { fprintf(stderr, "mkdtemp failed\n"); return 2; }
     }
 

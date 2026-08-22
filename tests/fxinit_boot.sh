@@ -51,6 +51,13 @@ FXCTL_BIN=$(ls "$STORE"/*-fxctl/fxctl 2>/dev/null | head -1)
 [ -n "$FXINIT_BIN" ] || fail "fx-init not found in store ($STORE/*-fx-init/fx-init)"
 [ -n "$FXCTL_BIN" ] || fail "fxctl not found in store ($STORE/*-fxctl/fxctl)"
 
+# The path to fx-init AS SEEN INSIDE the bwrap chroot.  bwrap execs the given
+# path inside the new mount namespace, where only / (=$ROOT) and /fx/store
+# (=$STORE) are bound — the HOST path $STORE/<hash>-fx-init/fx-init does not
+# exist there.  (fxctl runs host-side against the bound control socket, so it
+# keeps the host path.)
+FXINIT_CHROOT="/fx/store/$(basename "$(dirname "$FXINIT_BIN")")/fx-init"
+
 # fxctl helper: connect to the chroot's control socket from the host.
 # $ROOT/run/fx is bound into the bwrap at /run/fx; the unix socket inode is
 # reachable through the bind, so no second namespace is needed.
@@ -59,30 +66,34 @@ fxctl() {
 }
 
 activate() {
-    # $1 = config path (absolute).  Stages config+package-set in a cwd and runs
-    # fx-activate; echoes "activated <genhash> as version <v>".
+    # $1 = config path (absolute).  Point fx-activate at the real m3/package-set
+    # (src Paths resolve relative to the package-set FILE's dir) + the config by
+    # absolute path; echoes "activated <genhash> as version <v>".
     cfg="$1"
-    stage="$WORK/act.$$"
-    mkdir -p "$stage"
-    cp "$cfg" "$stage/config.dhall"
-    cp "$REPO/m3/package-set.dhall" "$stage/package-set.dhall"
-    out=$( cd "$stage" && "$FX_ACTIVATE" --store "$STORE" 2>&1 ) || fail "activate $cfg failed: $out"
-    rm -rf "$stage"
+    out=$( "$FX_ACTIVATE" --store "$STORE" \
+        --package-set "$REPO/m3/package-set.dhall" \
+        --config "$cfg" 2>&1 ) || fail "activate $cfg failed: $out"
     echo "$out"
 }
 
 boot_run() {
     # start fx-init in a bwrap chroot in the background.  Caller polls fxctl.
     rm -rf "$ROOT/etc" "$ROOT/bin" "$ROOT/run/fx"/* 2>/dev/null
-    mkdir -p "$ROOT/run/fx"
+    mkdir -p "$ROOT/etc" "$ROOT/bin" "$ROOT/run/fx" "$ROOT/tmp"
+    # The org binaries are cosmocc APEs whose shell-polyglot path needs /bin/sh
+    # (+ its libs) at exec; bind host /bin/sh and /usr /lib /lib64 read-only so
+    # fx-init/dhake/fakesvc can run, while / =$ROOT keeps /etc /bin /run /tmp as
+    # writable materialization targets.
     "$BWRAP" \
         --bind "$ROOT" / \
         --bind "$STORE" /fx/store \
+        --ro-bind /bin/sh /bin/sh \
+        --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
         --dev /dev \
         --proc /proc \
         --ro-bind /sys /sys \
         --clearenv --setenv FX_INIT_FORCE 1 --setenv PATH /bin \
-        -- "$FXINIT_BIN" --store /fx/store --run-dir /run/fx \
+        -- "$FXINIT_CHROOT" --store /fx/store --run-dir /run/fx \
         >"$WORK/boot.out" 2>&1 &
     BPID=$!
     # give fx-init ~1s to bring up the control socket

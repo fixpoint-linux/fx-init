@@ -17,3 +17,10 @@ build-tmp/
 
 # local runtime artifacts (never commit)
 /fx/
+
+# built binaries (host-verify / dhake outputs)
+/fx-init
+/fx-activate
+/fxctl
+/fakesvc
+*.b.out
