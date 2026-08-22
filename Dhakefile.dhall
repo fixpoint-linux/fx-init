@@ -227,6 +227,74 @@ in  { default = "fx-init"
               }
           }
 
+        -- ─── docs site (fixpoint design components) ─────────────────────────
+        -- The docs site is an Elm app (src/Main.elm) rendered against the shared
+        -- Fixpoint.* design package (vendor/design) + the @mfe/framework shell
+        -- (vendor/mfe-framework). Pipeline, mirroring shen/visage:
+        --
+        --   vendor/mfe-framework -> vendor/@mfe -> dist/elm.js -> dist/index.html
+        --
+        -- The `dist/index.html` target produces the full multi-route site
+        -- (dist/index.html + the five sub-page index.html files). Run it
+        -- explicitly with `dhake dist/index.html`.
+        , { mapKey = "mfe-framework"
+          , mapValue =
+              { deps = [] : List Text
+              , phony = True
+              , recipe =
+                  [ < Shell = "cd vendor/mfe-framework && npm ci && npm run build" > ]
+              }
+          }
+        , { mapKey = "vendor-mfe"
+          , mapValue =
+              { deps = [ "mfe-framework" ]
+              , phony = True
+              , recipe =
+                  [ < Rm = { path = "vendor/@mfe", recursive = True } >
+                  , < Mkdir = { path = "vendor/@mfe/core", parents = True } >
+                  , < Mkdir = { path = "vendor/@mfe/framework", parents = True } >
+                  , < Shell =
+                        "cp vendor/mfe-framework/packages/core/dist/*.js vendor/@mfe/core/"
+                    >
+                  , < Shell =
+                        "cp vendor/mfe-framework/packages/framework/dist/*.js vendor/@mfe/framework/"
+                    >
+                  ]
+              }
+          }
+        , { mapKey = "dist/elm.js"
+          , mapValue =
+              { deps = [ "src/Main.elm", "elm.json", "vendor/design/src" ]
+              , phony = False
+              , recipe =
+                  [ < Shell =
+                        "node_modules/elm/bin/elm make src/Main.elm --output=dist/elm.js --optimize"
+                    >
+                  ]
+              }
+          }
+        , { mapKey = "dist/index.html"
+          , mapValue =
+              { deps =
+                  [ "dist/elm.js"
+                  , "vendor-mfe"
+                  , "shell/index.html"
+                  , "shell/pages.js"
+                  , "shell/shell.js"
+                  , "shell/templates/fx-init-landing.html"
+                  , "shell/templates/fx-init-boot.html"
+                  , "shell/templates/fx-init-supervise.html"
+                  , "shell/templates/fx-init-activate.html"
+                  , "shell/templates/fx-init-fxctl.html"
+                  , "shell/templates/fx-init-logs.html"
+                  , "shell/mfe/fx-init-page.js"
+                  , "scripts/ssg.mjs"
+                  ]
+              , phony = False
+              , recipe = [ < Shell = "node scripts/ssg.mjs" > ]
+              }
+          }
+
         -- ─── clean ──────────────────────────────────────────────────────────
         , { mapKey = "clean"
           , mapValue =

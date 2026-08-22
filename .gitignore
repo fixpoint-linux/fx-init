@@ -5,11 +5,11 @@
 *.com.dbg
 *.o
 
-# elm / node / mfe (docs-site surface, if present)
+# elm / node / mfe (docs-site surface)
 dist/
 elm-stuff/
 node_modules/
-mfe-framework/
+vendor/@mfe/
 
 # build scratch
 build-tmp/

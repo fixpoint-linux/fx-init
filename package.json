@@ -1,0 +1,32 @@
+{
+    "name": "fx-init",
+    "version": "1.0.0",
+    "description": "fx-init — the M4 init system for fixpoint-linux: a lean PID1/supervisor, build-time activation, a datalog control/query plane, and a DAFSA-interned service log DB. Docs site built on the Fixpoint design stack with the mfe-framework.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist",
+        "test": "tests"
+    },
+    "scripts": {
+        "build": "./vendor/dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/fx-init.git"
+    },
+    "keywords": [],
+    "type": "module",
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/fx-init/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/fx-init#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    },
+    "allowScripts": {
+        "elm@0.19.2-0": true,
+        "elm-format@0.8.8": true
+    }
+}

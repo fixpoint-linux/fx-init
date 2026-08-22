@@ -13,3 +13,9 @@
 [submodule "vendor/dhall-c"]
 	path = vendor/dhall-c
 	url = https://github.com/fixpoint-linux/dhall-c.git
+[submodule "vendor/design"]
+	path = vendor/design
+	url = https://github.com/fixpoint-linux/design.git
+[submodule "vendor/mfe-framework"]
+	path = vendor/mfe-framework
+	url = https://github.com/fixpoint-linux/mfe-framework.git
