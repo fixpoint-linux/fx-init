@@ -382,7 +382,7 @@ bootView =
                     , text ", transiently opens the store to read the CURRENT generation's facts AS-OF that version, then execs dhake to materialize the rootfs."
                     ]
                 , Fixpoint.Code.block
-                    [ text "1. mkdirs run-dir; signal handlers (SIGCHLD->self-pipe)\n"
+                    [ text "1. mkdirs run-dir; signal handlers (SIGTERM/SIGINT->shutdown, SIGCHLD->self-pipe)\n"
                     , text "2. dl_open(run-dir/state.db) held for life; declare runtime + probe relations\n"
                     , text "3. fx_log_open(run-dir/log.db) held for life\n"
                     , text "4. read durable <store>/.bootlog (\"<version> <status> <epoch>\")\n"
@@ -865,7 +865,7 @@ logsView =
                         , tr [] [ td [ class "name" ] [ text "fs" ], td [] [ text "path, fstype, total_kb, used_kb, avail_kb." ] ]
                         , tr [] [ td [ class "name" ] [ text "file" ], td [] [ text "path, size, mode, uid, gid, mtime." ] ]
                         , tr [] [ td [ class "name" ] [ text "device" ], td [] [ text "name, major, minor, type, size." ] ]
-                        , tr [] [ td [ class "name" ] [ text "kernel" ], td [] [ text "version, release, hostname, uptime_s, load1, mem_total, mem_free." ] ]
+                        , tr [] [ td [ class "name" ] [ text "kernel" ], td [] [ text "version, release, hostname, uptime_s, load1_x100, mem_total_kb, mem_free_kb." ] ]
                         , tr [] [ td [ class "name" ] [ text "net" ], td [] [ text "iface, addr, mac, state, rx_bytes, tx_bytes." ] ]
                         , tr [] [ td [ class "name" ] [ text "env" ], td [] [ text "key, value." ] ]
                         ]
