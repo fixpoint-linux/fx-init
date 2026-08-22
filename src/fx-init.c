@@ -41,6 +41,7 @@
  */
 #include "fx.h"            /* enums only: FX_ON_*, FX_PROBE_*, FX_RESTART_* */
 #include "fx_reloc.h"      /* store-relocatability: buildfile root rewrite */
+#include "fx_supervise.h"  /* on=sock connect, backoff, grace-ms (pure, tested) */
 #include "fx_probe.h"
 #include "fx_log.h"
 #include "fxstore.h"
@@ -91,7 +92,7 @@ typedef struct {
     pid_t  pid;             /* 0 = not running */
     int    state;
     int    restarts;
-    int    out_fd, err_fd;  /* read ends of stdout/stderr pipes (-1 none) */
+    int    out_fd;          /* read end of the merged stdout+stderr pipe (-1 none) */
     time_t started_at;
     time_t next_start;      /* earliest restart (backoff) */
     uint32_t cur_backoff;
@@ -117,8 +118,8 @@ static char g_buildfile[1024];
 static char g_dhake[1024];
 static char g_fxstore[1024] = "/bin/fx-activate";
 static char g_hostname[256] = "";
-static time_t g_boot_start;
-static time_t g_boot_deadline;
+static uint64_t g_boot_start_ms;    /* monotonic ms at boot start (CLOCK_MONOTONIC) */
+static uint64_t g_boot_deadline_ms; /* boot grace deadline (ms-precise) */
 static time_t g_next_probe;
 static int g_ctrl_fd = -1;
 static int g_sigpipe[2] = { -1, -1 };
@@ -130,6 +131,15 @@ static int g_boot_failed = 0;
 /* ─── helpers ───────────────────────────────────────────────────────────────── */
 
 static uint32_t now_s(void) { return (uint32_t)time(NULL); }
+
+/* monotonic ms since boot — used for the boot grace deadline + on=time
+ * readiness so sub-second grace / time values are honored (the previous
+ * `time(NULL) - g_boot_start` seconds math truncated sub-second grace). */
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return (uint64_t)time(NULL) * 1000;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 static int mkdirp(const char *path) {
     char buf[1100]; snprintf(buf, sizeof buf, "%s", path);
@@ -317,7 +327,7 @@ static int svc_name_cb(const uint32_t *c, uint8_t ar, void *u) {
     memset(s, 0, sizeof *s);
     strncpy(s->name, name, sizeof s->name - 1);
     s->backoff_ms = 1000; s->restart = FX_RESTART_ALWAYS;
-    s->probe_kind = FX_PROBE_NONE; s->state = ST_PENDING; s->out_fd = s->err_fd = -1;
+    s->probe_kind = FX_PROBE_NONE; s->state = ST_PENDING; s->out_fd = -1;
     return 0;
 }
 
@@ -740,7 +750,7 @@ static int on_ready(Svc *sv) {
         case FX_ON_ALL: return 1;
         case FX_ON_UP: { Svc *d = svc_find(sv->on_arg); return d && d->ready; }
         case FX_ON_TIME: { uint32_t ms = (uint32_t)strtoul(sv->on_arg, NULL, 10);
-            return (uint32_t)((time(NULL) - g_boot_start) * 1000) >= ms; }
+            return (uint32_t)(now_ms() - g_boot_start_ms) >= ms; }
         case FX_ON_NET: { /* probe net for any non-lo iface up */
             dl_iter *it = dl_iter_open(g_rt, "net", NULL, 0);
             int hit = 0;
@@ -751,10 +761,8 @@ static int on_ready(Svc *sv) {
             } dl_iter_close(it); }
             return hit;
         }
-        case FX_ON_SOCK_TCP: case FX_ON_SOCK_UNIX: {
-            /* readiness via successful connect — gated at start time */
-            return 1;  /* handled in start loop retries; treat as startable */
-        }
+        case FX_ON_SOCK_TCP: return fx_sock_ready(1, sv->on_arg);
+        case FX_ON_SOCK_UNIX: return fx_sock_ready(0, sv->on_arg);
     }
     return 1;
 }
@@ -763,23 +771,10 @@ static int on_ready(Svc *sv) {
 static int probe_ready(Svc *sv) {
     if (sv->probe_kind == FX_PROBE_NONE) return 1;
     if (sv->probe_kind == FX_PROBE_FILE) return access(sv->probe_arg, F_OK) == 0;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
-    if (sv->probe_kind == FX_PROBE_UNIX) {
-        strncpy(a.sun_path, sv->probe_arg, sizeof a.sun_path - 1);
-    } else { /* TCP: probe a unix-ish path is wrong; use AF_INET for tcp */
-        close(fd); fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return 0;
-        struct sockaddr_in ai; memset(&ai, 0, sizeof ai);
-        ai.sin_family = AF_INET; ai.sin_port = htons((uint16_t)strtoul(sv->probe_arg, NULL, 10));
-        ai.sin_addr.s_addr = htonl(0x7f000001);  /* 127.0.0.1 */
-        int ok = (connect(fd, (struct sockaddr *)&ai, sizeof ai) == 0);
-        close(fd); return ok;
-    }
-    int ok = (connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
-    close(fd);
-    return ok;
+    /* PROBE_TCP / PROBE_UNIX share the connect contract with on=sock: — a
+     * successful connect means the service is accepting. */
+    if (sv->probe_kind == FX_PROBE_TCP) return fx_sock_ready(1, sv->probe_arg);
+    return fx_sock_ready(0, sv->probe_arg);  /* FX_PROBE_UNIX */
 }
 
 /* fork+setsid+execv a service; stdout/stderr piped to init for log capture.
@@ -859,7 +854,7 @@ static void evaluate_boot_ok(void) {
         if (g_svc[i].state != ST_STARTED && g_svc[i].state != ST_STOPPED) all_started = 0;
         if (g_svc[i].state == ST_FAILED) any_failed = 1;
     }
-    int grace_expired = (time(NULL) >= g_boot_deadline);
+    int grace_expired = fx_boot_grace_expired(now_ms(), g_boot_deadline_ms);
     /* ok requires the FULL grace window to elapse: declaring ok the instant
      * all services are STARTED would race a service that crashes a few hundred
      * ms later still inside the grace window.  Waiting until grace-end lets
@@ -907,7 +902,6 @@ static void reap_children(void) {
         int was_explicit_stop = (sv->state == ST_STOPPED);
         sv->pid = 0;
         if (sv->out_fd >= 0) { close(sv->out_fd); sv->out_fd = -1; }
-        if (sv->err_fd >= 0) { close(sv->err_fd); sv->err_fd = -1; }
         char m[256];
         int restart = 0;
         if (sv->restart == FX_RESTART_ALWAYS) restart = 1;
@@ -915,12 +909,14 @@ static void reap_children(void) {
         if (was_explicit_stop) restart = 0;  /* explicitly stopped */
         if (restart) {
             sv->restarts++;
-            uint32_t bo = sv->cur_backoff ? sv->cur_backoff : sv->backoff_ms;
-            if (bo == 0) bo = 1000;
-            if (bo > 30000) bo = 30000;
-            sv->next_start = time(NULL) + bo;
-            sv->cur_backoff = bo * 2;
-            if (sv->cur_backoff > 30000) sv->cur_backoff = 30000;
+            /* backoff is in MILLISECONDS (backoffMs default 1000, cap 30s);
+             * the previous code added it as SECONDS to next_start (a units
+             * bug: a 200ms backoff waited 200s).  Sleep the computed ms, then
+             * round UP to the next whole second for the second-granular
+             * next_start (so a 200ms backoff waits ~1s, not 200s). */
+            uint32_t bo = fx_backoff_sleep_ms(sv->cur_backoff, sv->backoff_ms);
+            sv->next_start = time(NULL) + (time_t)((bo + 999u) / 1000u);
+            sv->cur_backoff = fx_backoff_next(bo);
             sv->state = ST_BACKOFF;
             snprintf(m, sizeof m, "exited (%s); restart #%d in %ums",
                      exited_ok ? "ok" : "fail", sv->restarts, bo);
@@ -1227,9 +1223,12 @@ static void do_shutdown(void) {
 static int next_timeout(void) {
     time_t now = time(NULL);
     int ms = 1000;  /* default wake-up */
-    /* boot grace deadline */
-    if (!g_boot_decided && g_boot_deadline > now) {
-        long d = (long)(g_boot_deadline - now) * 1000; if (d < ms) ms = (int)d;
+    /* boot grace deadline (ms-precision: honors sub-second grace values) */
+    if (!g_boot_decided) {
+        uint64_t nms = now_ms();
+        if (g_boot_deadline_ms > nms) {
+            long d = (long)(g_boot_deadline_ms - nms); if (d < ms) ms = (int)d;
+        }
     }
     /* probe interval */
     if (g_next_probe > now) { long d = (long)(g_next_probe - now) * 1000; if (d < ms) ms = (int)d; }
@@ -1314,6 +1313,27 @@ static void main_loop(void) {
             }
         }
 
+        /* backoff reset: a service that has been ST_STARTED for >= 60s
+         * without crashing has earned a reset of its accumulated backoff to
+         * base, so a LATER crash restarts promptly (within backoff_ms) instead
+         * of at the doubled value it had reached during a flappy boot.  This
+         * is the design's "reset after 60s stable" — without it a service that
+         * crashed a few times during boot (reaching the 30s cap) would take
+         * 30s between restarts indefinitely.  Only services with an
+         * accumulated backoff (cur_backoff != 0) are touched; a service that
+         * never crashed has nothing to reset.  started_at is reset on each
+         * (re)start, so the 60s window only counts a continuous run. */
+        for (int i = 0; i < g_nsvc; i++) {
+            Svc *sv = &g_svc[i];
+            if (sv->state == ST_STARTED && sv->cur_backoff != 0) {
+                uint32_t stable_ms = (uint32_t)(now - sv->started_at) * 1000u;
+                if (fx_backoff_should_reset(stable_ms)) {
+                    sv->cur_backoff = 0;
+                    log_line(sv->name, "info", "backoff reset (60s stable)");
+                }
+            }
+        }
+
         /* boot-ok evaluation */
         evaluate_boot_ok();
 
@@ -1389,20 +1409,25 @@ int main(int argc, char **argv) {
     fx_probe_refresh(g_rt, g_probe_root, perr, sizeof perr);
     g_next_probe = time(NULL) + g_probe_s;
 
-    /* boot decision + read facts */
-    g_boot_start = time(NULL);
+    /* boot decision + read facts.
+     * g_boot_start_ms is captured BEFORE decide_boot_version (the monotonic
+     * boot clock starts here); the deadline is computed AFTER read_store_facts
+     * so the per-activation boot_grace(ms) fact (which overrides g_grace_ms)
+     * is honored — and in MILLISECONDS so sub-second grace values are not
+     * truncated by a /1000 (1500ms -> 1s bug). */
+    g_boot_start_ms = now_ms();
     uint32_t boot_v = decide_boot_version();
     if (boot_v == 0 || read_store_facts(boot_v) != 0) {
         fprintf(stderr, "fx-init: no generation to boot\n");
         /* still run (control socket up so fxctl can activate) */
         g_boot_version = 0;
-        g_boot_deadline = g_boot_start + (g_grace_ms / 1000);
+        g_boot_deadline_ms = fx_boot_deadline_ms(g_boot_start_ms, g_grace_ms);
     } else {
         g_boot_version = boot_v;
         /* boot_grace(ms) fact (read in read_store_facts) overrides the default
          * grace; compute the deadline AFTER the override so per-activation
-         * bootGraceMs (e.g. config-bad-hang's 2000ms) is honored. */
-        g_boot_deadline = g_boot_start + (g_grace_ms / 1000);
+         * bootGraceMs (e.g. config-bad-hang's 2000ms) is honored, in ms. */
+        g_boot_deadline_ms = fx_boot_deadline_ms(g_boot_start_ms, g_grace_ms);
         bootlog_append(g_current_version, "in-progress", now_s());
         /* materialize rootfs via dhake */
         log_line("fx-init", "info", "materializing rootfs via dhake");

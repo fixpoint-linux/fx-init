@@ -112,14 +112,14 @@ in  { default = "fx-init"
         [ { mapKey = "fx-init"
           , mapValue =
               { deps =
-                  [ "src/fx-init.c", "src/fx_reloc.c", "src/fx_probe.c", "src/fx_log.c"
-                  , "src/fx.h", "src/fx_reloc.h", "src/fx_probe.h", "src/fx_log.h", "fxstore.h"
+                  [ "src/fx-init.c", "src/fx_supervise.c", "src/fx_reloc.c", "src/fx_probe.c", "src/fx_log.c"
+                  , "src/fx.h", "src/fx_supervise.h", "src/fx_reloc.h", "src/fx_probe.h", "src/fx_log.h", "fxstore.h"
                   ]
               , phony = False
               , recipe =
                   [ < Shell =
                         "cosmocc " ++ opt ++ " " ++ def ++ " " ++ inc
-                        ++ " -o fx-init src/fx-init.c src/fx_reloc.c src/fx_probe.c src/fx_log.c "
+                        ++ " -o fx-init src/fx-init.c src/fx_supervise.c src/fx_reloc.c src/fx_probe.c src/fx_log.c "
                         ++ fxstore_sub ++ " " ++ engine ++ " " ++ dafsa
                     >
                   ]
@@ -202,6 +202,14 @@ in  { default = "fx-init"
                   [ < Shell = "sh tests/build_reloctest.sh && ./build-tmp/reloctest" > ]
               }
           }
+        , { mapKey = "supervise-test"
+          , mapValue =
+              { deps = [ "src/fx_supervise.c", "tests/supervise_test.c" ]
+              , phony = True
+              , recipe =
+                  [ < Shell = "sh tests/build_supervise.sh && ./build-tmp/supervise_test" > ]
+              }
+          }
         , { mapKey = "activate-test"
           , mapValue =
               { deps = [ "fx-activate", "fakesvc" ]
@@ -213,7 +221,7 @@ in  { default = "fx-init"
         , { mapKey = "test"
           , mapValue =
               { deps =
-                  [ "config-test", "log-test", "probe-test", "reloc-test", "activate-test" ]
+                  [ "config-test", "log-test", "probe-test", "reloc-test", "supervise-test", "activate-test" ]
               , phony = True
               , recipe = [] : List Action
               }

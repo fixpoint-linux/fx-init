@@ -104,6 +104,31 @@ int main(int argc, char **argv) {
     db = fx_log_open(dbdir);
     OK(db != NULL, "reopen after rotate");
     OK(fx_log_count(db) == 3, "reopen count==3");
+
+    /* larger batch rotation exercises the collect-then-delete path
+     * (collect oldest N tuples into a buffer, then delete in one txn — the
+     * old code deleted inside the dl_iter_next loop).  Emit 100 fresh lines
+     * (ts 200..299) so the DB holds 103; rotate cap=20 -> drop 103/4=25 oldest
+     * => 78 remain.  Then assert the oldest surviving line is ts 222 (the 25
+     * dropped are ts 101,102,103 + 200..221). */
+    for (uint32_t t = 200; t < 300; t++) {
+        char msg[32]; snprintf(msg, sizeof msg, "batch line %u", t);
+        OK(fx_log_emit(db, t, "batch", "info", msg) == 0, "emit batch %u", t);
+    }
+    OK(fx_log_count(db) == 103, "after batch emit count==103 (got %llu)",
+       (unsigned long long)fx_log_count(db));
+    OK(fx_log_rotate(db, 20) == 0, "rotate cap=20 (drop 25)");
+    OK(fx_log_count(db) == 78, "after batch rotate count==78 (got %llu)",
+       (unsigned long long)fx_log_count(db));
+    /* the dropped oldest 25 are ts 101..221; ts 222 should survive */
+    Collect b = {0};
+    long bn = fx_log_grep(db, "batch line 222", collect_cb, &b);
+    OK(bn == 1, "grep ts 222 survived rotate (got %ld)", bn);
+    /* ts 200 (dropped) must be gone */
+    Collect b2 = {0};
+    long bn2 = fx_log_grep(db, "batch line 200", collect_cb, &b2);
+    OK(bn2 == 0, "grep ts 200 dropped by rotate (got %ld)", bn2);
+
     fx_log_close(db);
 
     printf("log_test: %d passed, %d failed\n", passes, fails);

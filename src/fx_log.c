@@ -180,17 +180,32 @@ int fx_log_rotate(struct dl_db *db, uint64_t cap) {
     uint64_t drop = n / 4;  /* oldest quarter */
     if (drop == 0) return 0;
     /* ts is the leading column; ascending lex order == ascending ts order, so
-     * the first `drop` tuples are the oldest.  One txn of deletes. */
+     * the first `drop` tuples are the oldest.
+     *
+     * COLLECT-then-DELETE (same pattern as fx-activate's clear_rel and fx-init's
+     * restore_m4_facts): we first collect the oldest `drop` tuples into a
+     * buffer with the iterator CLOSED, then delete them in one txn.  Deleting
+     * inside the dl_iter_next loop (the old code) mutates the live DAFSA cursor
+     * the iterator is walking — inconsistent with the rest of the codebase and
+     * a latent risk if datalog-dafsa's txn-deferred-delete semantics ever
+     * change.  Collect-then-delete is safe vs the cursor regardless. */
     dl_iter *it = dl_iter_open(db, "log", NULL, 0);
     if (!it) return -1;
-    if (dl_txn_begin(db) != 0) { dl_iter_close(it); return -1; }
-    uint32_t cols[4];
+    uint8_t ar = dl_iter_arity(it);
+    if (ar != 4) { dl_iter_close(it); return -1; }
+    uint32_t *bag = malloc((size_t)drop * ar * sizeof *bag);
+    if (!bag) { dl_iter_close(it); return -1; }
     uint64_t k = 0;
-    while (k < drop && dl_iter_next(it, cols) == 1) {
-        dl_txn_delete_fact(db, "log", cols, 4);
+    uint32_t row[4];
+    while (k < drop && dl_iter_next(it, row) == 1) {
+        memcpy(&bag[k * ar], row, ar * sizeof *row);
         k++;
     }
     dl_iter_close(it);
-    if (dl_txn_commit(db) != 0) { dl_txn_rollback(db); return -1; }
+    if (dl_txn_begin(db) != 0) { free(bag); return -1; }
+    for (uint64_t i = 0; i < k; i++)
+        dl_txn_delete_fact(db, "log", &bag[i * ar], ar);
+    if (dl_txn_commit(db) != 0) { dl_txn_rollback(db); free(bag); return -1; }
+    free(bag);
     return 0;
 }
