@@ -183,6 +183,21 @@ static const char *store_path_of(const PathEntry *es, int ne, const char *name) 
     return path_of(es, ne, name);
 }
 
+/* reconstruct the full on= readiness string from kind + arg, so fx-init can
+ * re-parse the on= condition (the argument is otherwise lost between
+ * activation and boot). */
+static void on_full(FxOnKind k, const char *arg, char *out, size_t cap) {
+    switch (k) {
+        case FX_ON_ALL:      snprintf(out, cap, "all"); break;
+        case FX_ON_UP:       snprintf(out, cap, "up:%s", arg ? arg : ""); break;
+        case FX_ON_SOCK_TCP: snprintf(out, cap, "sock:tcp:%s", arg ? arg : ""); break;
+        case FX_ON_SOCK_UNIX:snprintf(out, cap, "sock:unix:%s", arg ? arg : ""); break;
+        case FX_ON_TIME:     snprintf(out, cap, "time:%s", arg ? arg : ""); break;
+        case FX_ON_NET:      snprintf(out, cap, "net"); break;
+        default:            snprintf(out, cap, "all"); break;
+    }
+}
+
 /* ─── etc content renderers ──────────────────────────────────────────────── */
 
 static int render_passwd(Buf *b, const FxConfig *cfg) {
@@ -368,6 +383,7 @@ static int serialize_generation(Buf *b, const FxConfig *cfg,
             case FX_RESTART_NEVER: rs="never"; break; default: rs="?"; break;
         }
         if (buf_lpstr(b, rs) != 0) { free(sv); return -1; }
+        if (buf_u32(b, s->backoff_ms) != 0) { free(sv); return -1; }
         const char *pk; switch (s->probe_kind) {
             case FX_PROBE_NONE: pk=""; break; case FX_PROBE_TCP: pk="tcp"; break;
             case FX_PROBE_UNIX: pk="unix"; break; case FX_PROBE_FILE: pk="file"; break; default: pk="?"; break;
@@ -424,6 +440,35 @@ static int declare(struct dl_db *db, const char *rel, uint8_t arity, char *err, 
 static int add_fact(struct dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity) {
     /* we intern strings outside and pass sym ids; ints as raw u32 */
     return dl_txn_add_fact(db, rel, cols, arity);
+}
+
+/* delete-all existing tuples of `rel` (collect then delete — safe vs the live
+ * DAFSA cursor).  Must be called inside an open txn.  Used to make each
+ * activation's snapshot self-consistent (only THIS activation's generation/
+ * svc facts) instead of accumulating stale services across activations. */
+static int clear_rel(struct dl_db *db, const char *rel, uint8_t arity) {
+    dl_iter *it = dl_iter_open(db, rel, NULL, 0);
+    if (!it) return 0;
+    if (dl_iter_arity(it) != arity) { dl_iter_close(it); return -1; }
+    size_t cap = 64, n = 0;
+    uint32_t *all = malloc(cap * arity * sizeof *all);
+    if (!all) { dl_iter_close(it); return -1; }
+    uint32_t row[8];
+    while (dl_iter_next(it, row) == 1) {
+        if (n >= cap) {
+            cap *= 2;
+            uint32_t *na = realloc(all, cap * arity * sizeof *all);
+            if (!na) { free(all); dl_iter_close(it); return -1; }
+            all = na;
+        }
+        memcpy(all + n * arity, row, arity * sizeof *all);
+        n++;
+    }
+    dl_iter_close(it);
+    for (size_t i = 0; i < n; i++)
+        dl_txn_delete_fact(db, rel, all + i * arity, arity);
+    free(all);
+    return 0;
 }
 
 /* ─── main activation flow ─────────────────────────────────────────────── */
@@ -603,6 +648,7 @@ int main(int argc, char **argv) {
         declare(db, "svc_env", 3, err, sizeof err) != 0 ||
         declare(db, "svc_probe", 3, err, sizeof err) != 0 ||
         declare(db, "svc_bin", 2, err, sizeof err) != 0 ||
+        declare(db, "svc_backoff", 2, err, sizeof err) != 0 ||
         declare(db, "user", 3, err, sizeof err) != 0 ||
         declare(db, "tool_fxstore", 1, err, sizeof err) != 0) {
         fprintf(stderr, "fx-activate: %s\n", err);
@@ -611,6 +657,24 @@ int main(int argc, char **argv) {
 
     if (dl_txn_begin(db) != 0) {
         fprintf(stderr, "fx-activate: dl_txn_begin failed\n");
+        binlink_free(bin, nbin); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1;
+    }
+
+    /* clear the previous activation's generation/svc/user facts so each
+     * published snapshot is self-consistent (only THIS activation's set).
+     * Without this, a re-activation would accumulate stale services and
+     * fx-init would boot the union of all past service sets. */
+    if (clear_rel(db, "generation", 4) != 0 ||
+        clear_rel(db, "svc", 3) != 0 ||
+        clear_rel(db, "svc_argv", 3) != 0 ||
+        clear_rel(db, "svc_env", 3) != 0 ||
+        clear_rel(db, "svc_probe", 3) != 0 ||
+        clear_rel(db, "svc_bin", 2) != 0 ||
+        clear_rel(db, "svc_backoff", 2) != 0 ||
+        clear_rel(db, "user", 3) != 0 ||
+        clear_rel(db, "tool_fxstore", 1) != 0) {
+        fprintf(stderr, "fx-activate: clear old facts failed\n");
+        dl_txn_rollback(db);
         binlink_free(bin, nbin); etcitem_free(etc, netc); paths_free(es, ne); fx_store_close(s); fx_config_free(&cfg); fx_packageset_free(&ps); return 1;
     }
 
@@ -633,17 +697,16 @@ int main(int argc, char **argv) {
     for (int i = 0; i < cfg.nservices; i++) {
         FxService *sv = &cfg.services[i];
         uint32_t sn = dl_intern_str(db, sv->name);
-        const char *on; switch (sv->on_kind) {
-            case FX_ON_ALL: on="all"; break; case FX_ON_UP: on="up"; break;
-            case FX_ON_SOCK_TCP: on="sock:tcp"; break; case FX_ON_SOCK_UNIX: on="sock:unix"; break;
-            case FX_ON_TIME: on="time"; break; case FX_ON_NET: on="net"; break; default: on="all"; break;
-        }
+        char onf[256]; on_full(sv->on_kind, sv->on_arg, onf, sizeof onf);
         const char *rs; switch (sv->restart) {
             case FX_RESTART_ALWAYS: rs="always"; break; case FX_RESTART_ON_FAILURE: rs="on-failure"; break;
             case FX_RESTART_NEVER: rs="never"; break; default: rs="always"; break;
         }
-        uint32_t cols[3] = { sn, dl_intern_str(db, on), dl_intern_str(db, rs) };
+        uint32_t cols[3] = { sn, dl_intern_str(db, onf), dl_intern_str(db, rs) };
         add_fact(db, "svc", cols, 3);
+        /* svc_backoff(name, backoff_ms) */
+        uint32_t cbk[2] = { sn, sv->backoff_ms };
+        add_fact(db, "svc_backoff", cbk, 2);
         /* svc_argv(name, idx, arg) */
         for (int a = 0; a < sv->nargv; a++) {
             uint32_t c[3] = { sn, (uint32_t)a, dl_intern_str(db, sv->argv[a]) };
