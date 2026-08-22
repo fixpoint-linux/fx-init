@@ -85,7 +85,7 @@ in  { packages =
                     recipe =
                       [ < Shell =
                             "cp -a \"$FX_SRC\"/. . && cosmocc " ++ opt ++ " " ++ def
-                          ++ " " ++ inc ++ " -o fx-init src/fx-init.c src/fx_reloc.c "
+                          ++ " " ++ inc ++ " -o fx-init src/fx-init.c src/fx_supervise.c src/fx_reloc.c "
                           ++ "src/fx_probe.c src/fx_log.c vendor/fxstore/store.c "
                           ++ "vendor/fxstore/closure.c vendor/fxstore/build.c "
                           ++ "vendor/fxstore/packageset.c " ++ engine ++ " " ++ dafsa
