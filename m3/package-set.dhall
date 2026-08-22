@@ -121,5 +121,14 @@ in  { packages =
                             "cp -a \"$FX_SRC\"/. . && cosmocc -std=c11 -O2 -g -Wall -Wextra "
                           ++ "-o fakesvc tests/fixtures/fakesvc/fakesvc.c"
                         > ] } }
+      , { name = "fake-service-daemon", version = "0.1.0", src = < Path = ".." >,
+          deps = [] : List Text,
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          build = { target = "fakesvc_daemon",
+                    recipe =
+                      [ < Shell =
+                            "cp -a \"$FX_SRC\"/. . && cosmocc -std=c11 -O2 -g -Wall -Wextra "
+                          ++ "-o fakesvc_daemon tests/fixtures/fakesvc_daemon/fakesvc_daemon.c"
+                        > ] } }
       ] }
   : PackageSet

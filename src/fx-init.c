@@ -39,6 +39,7 @@
  *              [--grace-ms N] [--probe-fixture-root DIR]
  * GUARD: runs only if getpid()==1 or env FX_INIT_FORCE=1.
  */
+#define _GNU_SOURCE   /* expose prctl(3) + PR_SET_CHILD_SUBREAPER */
 #include "fx.h"            /* enums only: FX_ON_*, FX_PROBE_*, FX_RESTART_* */
 #include "fx_reloc.h"      /* store-relocatability: buildfile root rewrite */
 #include "fx_supervise.h"  /* on=sock connect, backoff, grace-ms (pure, tested) */
@@ -56,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -893,7 +895,7 @@ static void reap_children(void) {
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         Svc *sv = NULL;
         for (int i = 0; i < g_nsvc; i++) if (g_svc[i].pid == pid) { sv = &g_svc[i]; break; }
-        if (!sv) continue;  /* unknown child (e.g. dhake handled separately) */
+        if (!sv) continue;  /* adopted orphan reaped here; dhake is waited for synchronously in run_dhake() */
         int exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
         /* fxctl stop sets sv->state = ST_STOPPED before killing the child; a
          * service reaped in that state was explicitly stopped (not a crash) and
@@ -1385,7 +1387,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* signal handlers + self-pipe */
+    /* signal handlers + self-pipe.
+     *
+     * PID1 signal semantics worth noting: the kernel does NOT deliver signals
+     * with a default-terminate disposition (SIGTERM/SIGINT/etc.) to PID1 unless
+     * a handler is installed.  The SIGTERM/SIGINT handlers below are exactly
+     * what enables a clean shutdown when fx-init is genuine PID1, so no extra
+     * handlers are required for the real-PID1 path (fxinit_pid1 harness). */
     if (pipe(g_sigpipe) != 0) { fprintf(stderr, "fx-init: pipe: %s\n", strerror(errno)); return 1; }
     fcntl(g_sigpipe[0], F_SETFL, fcntl(g_sigpipe[0], F_GETFL) | O_NONBLOCK);
     fcntl(g_sigpipe[1], F_SETFL, fcntl(g_sigpipe[1], F_GETFL) | O_NONBLOCK);
@@ -1393,6 +1401,21 @@ int main(int argc, char **argv) {
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; sigaction(SIGCHLD, &sa, NULL);
     sa.sa_handler = sigterm_handler; sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Adopt orphaned grandchildren (PR_SET_CHILD_SUBREAPER).  A service that
+     * double-forks a daemon grandchild and exits leaves that orphan reparented
+     * to the outermost init of its PID namespace.  When fx-init is NOT itself
+     * PID1 (e.g. under the bwrap harness, where bwrap holds PID1), that orphan
+     * would be reparented OUTSIDE fx-init and the waitpid(-1) drain in
+     * reap_children() could never reap it — a zombie leak.  Making fx-init a
+     * subreaper adopts such orphans so they are reaped.  When already PID1 this
+     * is a harmless no-op (orphans already reparent to PID1).  Non-fatal: some
+     * kernels/namespaces may refuse it, and it is only a leak-mitigation aid. */
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "fx-init: warning: PR_SET_CHILD_SUBREAPER failed: %s "
+                        "(orphaned daemon grandchildren may not be reaped)\n",
+                strerror(errno));
+    }
 
     /* runtime + log DBs (held for life) */
     mkdirp(g_run);
