@@ -23,8 +23,11 @@
  *   9. txn: generation_current(v), boot_status(v,in-progress)
  *   10. build on= readiness graph, validate, enter main loop
  *
- * Supervision is START-ONLY: boot-ok = all services reached STARTED within
- * bootGraceMs; health/probe gates restart-in-place but never roll back.
+ * Supervision is START-ONLY: boot-ok is decided at grace-end — every service
+ * must have reached STARTED and none may have exited during the grace window
+ * (a service that crashes during boot is a start-failure, pinned failed in
+ * reap_children; health regressions AFTER boot-ok restart in place and never
+ * roll back).  A hang (service never starts) fails via the grace timeout.
  *
  * Link set: src/fx-init.c + fx_probe.c + fx_log.c + store.c + closure.c +
  * build.c + datalog-dafsa + dafsa — NO dhall-c, NO config.c.
@@ -696,7 +699,21 @@ static void drain_pipe(Svc *sv) {
     while (tok) { log_line(sv->name, "info", tok); tok = strtok_r(NULL, "\n", &save); }
 }
 
-/* evaluate the START-ONLY boot-ok rule (once, at grace expiry or all-started) */
+/* evaluate the START-ONLY boot-ok rule (once, at grace expiry).
+ *
+ * Boot reaches 'ok' only when the FULL grace window has elapsed with every
+ * service STARTED and none having exited during the window.  A service that
+ * exits during the grace window is a start-failure: reap_children() pins boot
+ * failed (and sets g_boot_decided) the moment it reaps such an exit, so by the
+ * time we declare ok here we know no service died during boot.  This closes
+ * the boot-ok semantics gap where fx-init marked a crasher STARTED on
+ * fork+exec success and boot 'ok' the instant all services reached STARTED,
+ * even though the crasher kept dying within the grace window.  After boot-ok
+ * is decided, health regressions restart in place without touching
+ * boot_status.  Distinguishes the two intended failure modes cleanly:
+ *   - config-bad-exit (crasher exits during grace) -> failed via reap pin;
+ *   - config-bad-hang (gate never ready, service never starts) -> failed via
+ *     the grace-timeout branch below. */
 static void evaluate_boot_ok(void) {
     if (g_boot_decided) return;
     int all_started = 1, any_failed = 0;
@@ -705,7 +722,11 @@ static void evaluate_boot_ok(void) {
         if (g_svc[i].state == ST_FAILED) any_failed = 1;
     }
     int grace_expired = (time(NULL) >= g_boot_deadline);
-    if (all_started && !any_failed && g_nsvc > 0) {
+    /* ok requires the FULL grace window to elapse: declaring ok the instant
+     * all services are STARTED would race a service that crashes a few hundred
+     * ms later still inside the grace window.  Waiting until grace-end lets
+     * reap_children() pin any in-window exit as failed before we can say ok. */
+    if (grace_expired && all_started && !any_failed && g_nsvc > 0) {
         rt_txn_begin();
         rt_set_boot(g_current_version, "ok");
         rt_txn_commit();
@@ -741,6 +762,11 @@ static void reap_children(void) {
         for (int i = 0; i < g_nsvc; i++) if (g_svc[i].pid == pid) { sv = &g_svc[i]; break; }
         if (!sv) continue;  /* unknown child (e.g. dhake handled separately) */
         int exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        /* fxctl stop sets sv->state = ST_STOPPED before killing the child; a
+         * service reaped in that state was explicitly stopped (not a crash) and
+         * must NOT count as a boot start-failure.  Capture before we clear the
+         * pid / mutate state below. */
+        int was_explicit_stop = (sv->state == ST_STOPPED);
         sv->pid = 0;
         if (sv->out_fd >= 0) { close(sv->out_fd); sv->out_fd = -1; }
         if (sv->err_fd >= 0) { close(sv->err_fd); sv->err_fd = -1; }
@@ -748,7 +774,7 @@ static void reap_children(void) {
         int restart = 0;
         if (sv->restart == FX_RESTART_ALWAYS) restart = 1;
         else if (sv->restart == FX_RESTART_ON_FAILURE) restart = !exited_ok;
-        if (sv->state == ST_STOPPED) restart = 0;  /* explicitly stopped */
+        if (was_explicit_stop) restart = 0;  /* explicitly stopped */
         if (restart) {
             sv->restarts++;
             uint32_t bo = sv->cur_backoff ? sv->cur_backoff : sv->backoff_ms;
@@ -774,6 +800,27 @@ static void reap_children(void) {
             else if (probe_ready(sv)) rt_set_ready(sv, 1);
         }
         rt_txn_commit();
+
+        /* BOOT-OK SEMANTICS: a service that exits during the boot grace
+         * window (before boot-ok is decided) is a start-failure.  Pin boot
+         * failed + append .bootlog + set g_boot_decided so evaluate_boot_ok()
+         * can never flip it to ok — matching the boot-status pin already
+         * applied on dhake-materialization failure.  This is what makes
+         * config-bad-exit (crasher, restart=always) fail the boot instead of
+         * reaching ok the instant the crasher is STARTED.  The service keeps
+         * restarting per its restart policy (system stays running, fxctl-
+         * inspectable; rollback happens on the NEXT boot).  An explicitly
+         * stopped service is excluded.  After boot-ok is decided, exits
+         * restart in place and never touch boot_status. */
+        if (!g_boot_decided && !was_explicit_stop) {
+            rt_txn_begin();
+            rt_set_boot(g_current_version, "failed");
+            rt_txn_commit();
+            bootlog_append(g_current_version, "failed", now_s());
+            log_line("fx-init", "error", "boot failed: service exited during grace window");
+            g_boot_decided = 1;
+            g_boot_failed = 1;
+        }
     }
 }
 
