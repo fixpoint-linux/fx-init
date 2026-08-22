@@ -383,9 +383,9 @@ static int svc_probe_cb(const uint32_t *c, uint8_t ar, void *u) {
     (void)ar; ProbeCtx *p = (ProbeCtx *)u;
     const char *k = dl_intern_str_of(p->db, c[1]);
     const char *a = dl_intern_str_of(p->db, c[2]);
-    if (!strcmp(k, "tcp")) p->kind = FX_PROBE_TCP;
-    else if (!strcmp(k, "unix")) p->kind = FX_PROBE_UNIX;
-    else if (!strcmp(k, "file")) p->kind = FX_PROBE_FILE;
+    if (k && !strcmp(k, "tcp")) p->kind = FX_PROBE_TCP;
+    else if (k && !strcmp(k, "unix")) p->kind = FX_PROBE_UNIX;
+    else if (k && !strcmp(k, "file")) p->kind = FX_PROBE_FILE;
     free(p->arg); p->arg = strdup(a ? a : "");
     p->got = 1; return 0;
 }
@@ -864,7 +864,7 @@ static void evaluate_boot_ok(void) {
      * all services are STARTED would race a service that crashes a few hundred
      * ms later still inside the grace window.  Waiting until grace-end lets
      * reap_children() pin any in-window exit as failed before we can say ok. */
-    if (grace_expired && all_started && !any_failed && g_nsvc > 0) {
+    if (grace_expired && all_started && !any_failed) {
         rt_txn_begin();
         rt_set_boot(g_current_version, "ok");
         rt_txn_commit();
@@ -1102,8 +1102,16 @@ static void handle_request(FILE *o, char *line) {
         uint32_t txn = g_txn_id++;
         rt_txn_begin(); rt_control(txn, cmd, arg); rt_txn_commit();
         if (!strcmp(cmd, "activate")) {
-            char av[1100]; snprintf(av, sizeof av, "%s --store %s --config %s", g_fxstore, g_store, arg);
-            int rc = system(av);
+            /* run the activator with an argv array — NEVER shell system(): the
+             * path comes from the control socket and must not be shell-interpreted. */
+            pid_t pid = fork();
+            if (pid == 0) {
+                char *av[] = { g_fxstore, "--store", g_store, "--config", arg, NULL };
+                execv(av[0], av);
+                _exit(127);
+            }
+            int rc = -1;
+            if (pid > 0) { int st = 0; waitpid(pid, &st, 0); rc = WIFEXITED(st) ? WEXITSTATUS(st) : 1; }
             if (rc != 0) { rt_txn_begin(); rt_effect(txn, "activate", "failed"); rt_txn_commit(); resp_err(o, "activate failed"); return; }
             /* re-read CURRENT + facts */
             char e2[1024]; FxStore *s = fx_store_open(g_store, e2, sizeof e2);
