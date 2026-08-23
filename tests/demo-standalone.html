@@ -14,7 +14,7 @@
   Serve the fx-init repo root over a static server (python3 -m http.server,
   or the site's Caddy) and open /tests/demo-standalone.html.
 
-  The module resolves all its assets (xterm.js/css, fx-shell.cjs + .wasm,
+  The module resolves all its assets (xterm.js/css, fx-shell.js + .wasm,
   demo-files.js) relative to import.meta.url, so it works wherever the repo is
   served. The <script type="module"> below is itself relative to this page,
   i.e. ../shell/mfe/fx-init-demo.js (from tests/ up to the repo root, then

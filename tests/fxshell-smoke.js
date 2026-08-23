@@ -1,5 +1,5 @@
 // tests/fxshell-smoke.js — FULL browser-boot smoke for the fx-shell wasm module
-// (U2). Boots createFxShell from shell/wasm/fx-shell.cjs, then runs the EXACT
+// (U2). Boots createFxShell from shell/wasm/fx-shell.js, then runs the EXACT
 // lifecycle the browser demo will run over MEMFS, asserting on real tool output:
 //
 //   1. write demo/package-set.dhall + demo/config.dhall into MEMFS cwd and
@@ -18,21 +18,31 @@
 //
 // Run:  node tests/fxshell-smoke.js     (from the fx-init repo root)
 //
-// The wasm artifact is emitted as `fx-shell.cjs` (NOT .js): fx-init's
-// package.json has "type": "module", so a `.js` file would be treated as ESM
-// and the emscripten MODULARIZE output's `module.exports = createFxShell`
-// (CommonJS) would never run. `.cjs` forces CommonJS regardless of the
-// package type, so `createRequire` + `require` returns the factory function —
-// mirroring shen/tests/wasm-smoke.cjs. In the browser the same artifact is
-// loaded as a CLASSIC <script>, where `exports`/`module` are undefined so
-// `createFxShell` becomes a global (shen pattern).
+// The deployed wasm artifact is `fx-shell.js` (NOT .cjs). The BROWSER loads it
+// as a CLASSIC <script>: `exports`/`module` are undefined there, so the
+// emscripten MODULARIZE output's `var createFxShell = (()=>{...})()` becomes a
+// GLOBAL — and Caddy serves `.js` as a JS MIME type (a `.cjs` file would be
+// served text/plain and the browser would refuse to execute it under strict
+// MIME checking). For THIS NODE smoke, fx-init's package.json has
+// "type":"module", so Node would treat `fx-shell.js` as ESM and the CommonJS
+// `module.exports = createFxShell` would never run. We copy it to a temp
+// `.cjs` file (the extension forces CommonJS regardless of package type) and
+// `require` that — mirroring shen/tests/wasm-smoke.cjs.
 import { createRequire } from 'module';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs, { copyFileSync, mkdtempSync } from 'node:fs';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
-const createFxShell = require('../shell/wasm/fx-shell.cjs');
+// Copy BOTH the .js and its colocated .wasm into a temp dir, naming the js
+// copy `.cjs` so `require` treats it as CommonJS (emscripten locates
+// fx-shell.wasm next to the module via `__filename`).
+const tmpDir = mkdtempSync(join(tmpdir(), 'fxsh-'));
+copyFileSync(new URL('../shell/wasm/fx-shell.js', import.meta.url), join(tmpDir, 'fx-shell.cjs'));
+copyFileSync(new URL('../shell/wasm/fx-shell.wasm', import.meta.url), join(tmpDir, 'fx-shell.wasm'));
+const createFxShell = require(join(tmpDir, 'fx-shell.cjs'));
 
 // Single source of truth: read the demo dhall sources straight from the repo
 // (the browser boot inlines these; reading the files keeps the smoke runnable

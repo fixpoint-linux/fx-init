@@ -11,10 +11,12 @@
 // How it works (mirrors shen/shell/mfe/shen-playground.js — the org's existing
 // xterm + wasm terminal MFE):
 //   1. Loads the vendored xterm.js (classic <script> -> global `Terminal`) and
-//      the compiled emscripten module shell/wasm/fx-shell.cjs (classic
+//      the compiled emscripten module shell/wasm/fx-shell.js (classic
 //      <script> -> global `createFxShell`; it is CommonJS-emitted so in the
 //      browser `exports`/`module` are undefined and the factory lands as a
-//      global — reviewer-confirmed contract).
+//      global — reviewer-confirmed contract). The artifact is `.js` because
+//      Caddy serves `.js` as a JS MIME type (a `.cjs` classic <script> would be
+//      refused as text/plain under strict MIME checking).
 //   2. Boots the module once (module-level cache; ONE MEMFS = ONE virtual
 //      machine for the whole page session, so /fx/store persists across
 //      re-mounts) and runs the EXACT browser-boot smoke sequence from
@@ -37,12 +39,12 @@ import { PACKAGE_SET, CONFIG } from '../wasm/demo-files.js';
 const BASE = new URL('..', import.meta.url).href;
 const XTERM_JS = `${BASE}vendor/xterm/xterm.js`;
 const XTERM_CSS = `${BASE}vendor/xterm/xterm.css`;
-const FX_SHELL = `${BASE}wasm/fx-shell.cjs`; // .wasm is colocated, derive by currentScript.src
+const FX_SHELL = `${BASE}wasm/fx-shell.js`; // .wasm is colocated, derive by currentScript.src
 
 // --- script loading (classic, cached per URL) ------------------------------
 // The emscripten factory captures `document.currentScript.src` AT LOAD to
 // derive scriptDirectory for locateFile("fx-shell.wasm") (see the top of
-// fx-shell.cjs: `_scriptName=globalThis.document?.currentScript?.src`). It MUST
+// fx-shell.js: `_scriptName=globalThis.document?.currentScript?.src`). It MUST
 // therefore be loaded as a real <script src> tag (never fetch+eval, which
 // leaves currentScript null) and the .wasm must sit next to the .js in
 // shell/wasm/. Same constraint the dafsa-playground documents.

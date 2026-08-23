@@ -60,7 +60,7 @@ EM_CONFIG="$EMCONF" $EMCC $CFLAGS \
   -s EXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToUTF8,UTF8ToString,FS,HEAPU8 \
   -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s TOTAL_STACK=8388608 \
   -s FORCE_FILESYSTEM=1 -s INVOKE_RUN=0 -s EXIT_RUNTIME=0 \
-  -o "$OUT/fx-shell.cjs" \
+  -o "$OUT/fx-shell.js" \
   src/fx-shell-wasm.c \
   $BUILD/fxstore_main.o $BUILD/fx_activate_main.o $BUILD/fxctl_main.o $BUILD/dhall_main.o \
   $FXS/packageset.c $FXS/derivation.c $FXS/closure.c $FXS/store.c $FXS/build.c \
@@ -85,4 +85,4 @@ fi
 
 # 4. smoke test (node; also the CI-able regression gate)
 node tests/fxshell-smoke.js
-ls -la "$OUT/fx-shell.cjs" "$OUT/fx-shell.wasm"
+ls -la "$OUT/fx-shell.js" "$OUT/fx-shell.wasm"
