@@ -138,6 +138,13 @@ int main(int argc, char **argv) {
     if (fd < 0) {
         if (errno == ENOENT || errno == ECONNREFUSED)
             fprintf(stderr, "fxctl: fx-init not running (%s)\n", path);
+        else if (errno == EAFNOSUPPORT || errno == ENOTSUP ||
+                 errno == EPROTONOSUPPORT)
+            fprintf(stderr,
+                "fxctl: cannot connect to %s: Unix-domain sockets are not "
+                "supported on this platform (browser wasm) — fx-init's PID1 "
+                "control.sock is not running here\n",
+                path);
         else
             fprintf(stderr, "fxctl: connect %s: %s\n", path, strerror(errno));
         return 1;
