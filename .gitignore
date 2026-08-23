@@ -13,6 +13,7 @@ vendor/@mfe/
 
 # build scratch
 build-tmp/
+build-wasm/
 *.build.*
 
 # local runtime artifacts (never commit)

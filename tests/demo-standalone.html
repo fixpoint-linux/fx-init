@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fx-init demo — standalone terminal (no site framework)</title>
+<!--
+  Standalone browser-verification page for the fx-init in-browser userland
+  demo (Unit U3). This is NOT the @mfe shell page — it imports the same MFE
+  module (shell/mfe/fx-init-demo.js) directly, creates a container, and calls
+  mount(container), so the terminal + wasm boot can be verified WITHOUT the
+  full fx-init site framework (no importmap, no createApp, no SSG).
+
+  Serve the fx-init repo root over a static server (python3 -m http.server,
+  or the site's Caddy) and open /tests/demo-standalone.html.
+
+  The module resolves all its assets (xterm.js/css, fx-shell.cjs + .wasm,
+  demo-files.js) relative to import.meta.url, so it works wherever the repo is
+  served. The <script type="module"> below is itself relative to this page,
+  i.e. ../shell/mfe/fx-init-demo.js (from tests/ up to the repo root, then
+  shell/mfe/).
+-->
+<style>
+  body{margin:0;background:#0b0e11;color:#d8dee6;
+       font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .frame{max-width:980px;margin:0 auto;padding:24px}
+  .frame h1{font-size:26px;letter-spacing:-0.02em;margin:0 0 4px}
+  .frame .note{font-family:"SFMono-Regular",Menlo,Consolas,monospace;font-size:13px;
+       color:#7d8794;margin:0 0 16px}
+  #container{min-height:420px}
+</style>
+</head>
+<body>
+<div class="frame">
+  <h1>fx-init in-browser demo — standalone</h1>
+  <p class="note">This page mounts shell/mfe/fx-init-demo.js directly (no @mfe shell).</p>
+  <div id="container"></div>
+</div>
+
+<script type="module">
+  import fxInitDemo from '../shell/mfe/fx-init-demo.js';
+
+  const container = document.getElementById('container');
+  try {
+    await fxInitDemo.mount(container);
+  } catch (err) {
+    container.textContent = `mount failed: ${err && err.stack ? err.stack : err}`;
+  }
+</script>
+</body>
+</html>

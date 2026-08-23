@@ -2,12 +2,19 @@ module Main exposing (main)
 
 {-| The fx-init documentation site as a plain `Browser.element` app.
 
-This module renders all 6 pages (landing, boot, supervise, activate, fxctl,
-logs) using the shared `Fixpoint.*` design package. It mirrors the
+This module renders the 6 content pages (landing, boot, supervise, activate,
+fxctl, logs) using the shared `Fixpoint.*` design package. It mirrors the
 shen / visage / datalog-dafsa docs site structure exactly: one Elm bundle, one
 MFE module (`shell/mfe/fx-init-page.js`), and a `{ pathname }` flag that
-selects which page to render. The site is content-only — there is no browser
-playground (an init system needs no in-browser demo).
+selects which page to render.
+
+The `/fx-init/demo` page is different: its terminal is the NON-Elm @mfe module
+`shell/mfe/fx-init-demo.js` (real fxstore/fx-activate/fxctl/dhall compiled to
+WebAssembly over an in-memory /fx/store), mounted by the shell router into the
+page's `[data-mfe="fx-init-demo"]` slot entirely client-side — that page is
+never Elm-rendered and is not pre-rendered by the SSG. The `Demo` page below
+exists so a stray Elm render of that path (and the nav link, which is Elm) has
+an honest page to show instead of silently falling back to the landing page.
 
 -}
 
@@ -47,6 +54,7 @@ type Page
     | Activate
     | Fxctl
     | Logs
+    | Demo
 
 
 type alias Model =
@@ -105,6 +113,9 @@ parsePage path =
         "logs" ->
             Logs
 
+        "demo" ->
+            Demo
+
         _ ->
             Landing
 
@@ -162,6 +173,7 @@ navView =
             , docLink "/activate" "Activate"
             , docLink "/fxctl" "fxctl"
             , docLink "/logs" "Logs"
+            , docLink "/demo" "Demo"
             ]
         , extra =
             [ a [ class "home", href "https://fixpointlinux.org/", attribute "data-mfe-route" "/" ] [ text "fixpoint-linux" ]
@@ -189,6 +201,9 @@ pageView model =
 
         Logs ->
             logsView
+
+        Demo ->
+            demoView
 
 
 footerView : Html Msg
@@ -915,6 +930,61 @@ logsView =
                     ]
                 , Fixpoint.Callout.note
                     [ text "The log DB rotates: when it exceeds the cap (default 100 000 tuples) fx-init drops the oldest quarter by timestamp, so the log stays bounded without losing recent history."
+                    ]
+                ]
+            }
+        ]
+
+
+
+-- Demo
+
+
+{-| The `/fx-init/demo` page. The interactive terminal on the live site is NOT
+Elm — it is the non-Elm @mfe module `shell/mfe/fx-init-demo.js`, mounted
+client-side into the page's `[data-mfe="fx-init-demo"]` slot (interactive
+WASM, so this page is never pre-rendered by the SSG). This Elm view is the
+static story: what the terminal really runs, and where to read the details.
+-}
+demoView : Html Msg
+demoView =
+    div []
+        [ Fixpoint.Hero.view
+            { prompt =
+                [ Fixpoint.Hero.hash
+                , text " fx-init "
+                , Fixpoint.Hero.dollar
+                , text " fxstore timeline"
+                , Fixpoint.Hero.blink
+                ]
+            , title = [ text "In your browser" ]
+            , tagline =
+                [ text "the real fxstore · fx-activate · fxctl · dhall, compiled to WebAssembly over an in-memory /fx/store"
+                ]
+            }
+        , Fixpoint.Section.view
+            { id = "terminal"
+            , title = "A terminal, not a mockup"
+            , hint = "// client-side WASM — the VM boots when the page loads"
+            , children =
+                [ p []
+                    [ text "The terminal on this page mounts at load time and builds a real store in a real virtual machine in this tab: it writes the demo package-set, runs "
+                    , Fixpoint.Code.inline "fxstore build"
+                    , text " and "
+                    , Fixpoint.Code.inline "fx-activate"
+                    , text ", activates a second generation from a changed config, publishes store snapshots, rolls one back, normalizes a Dhall expression — and lets "
+                    , Fixpoint.Code.inline "fxctl"
+                    , text " fail honestly, because there is no PID1 and no control socket in a browser."
+                    ]
+                , p []
+                    [ text "One module is one MEMFS — one virtual machine — so "
+                    , Fixpoint.Code.inline "/fx/store"
+                    , text " genuinely persists across the commands you type. The story behind each command:"
+                    ]
+                , ul []
+                    [ li [] [ docLink "/activate" "Activate", text " — config.dhall → closure → generation → store snapshot." ]
+                    , li [] [ docLink "/boot" "Boot", text " — the boot sequence the activation feeds: boot_status, roll-forward rollback." ]
+                    , li [] [ docLink "/fxctl" "fxctl", text " — the control/query plane the demo's fxctl cannot reach — and why." ]
                     ]
                 ]
             }

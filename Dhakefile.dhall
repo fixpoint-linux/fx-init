@@ -235,8 +235,9 @@ in  { default = "fx-init"
         --   vendor/mfe-framework -> vendor/@mfe -> dist/elm.js -> dist/index.html
         --
         -- The `dist/index.html` target produces the full multi-route site
-        -- (dist/index.html + the five sub-page index.html files). Run it
-        -- explicitly with `dhake dist/index.html`.
+        -- (dist/index.html + the six sub-page index.html files, incl. the
+        -- client-only /fx-init/demo shell page). Run it explicitly with
+        -- `dhake dist/index.html`.
         , { mapKey = "mfe-framework"
           , mapValue =
               { deps = [] : List Text
@@ -287,7 +288,9 @@ in  { default = "fx-init"
                   , "shell/templates/fx-init-activate.html"
                   , "shell/templates/fx-init-fxctl.html"
                   , "shell/templates/fx-init-logs.html"
+                  , "shell/templates/fx-init-demo.html"
                   , "shell/mfe/fx-init-page.js"
+                  , "shell/mfe/fx-init-demo.js"
                   , "scripts/ssg.mjs"
                   ]
               , phony = False
