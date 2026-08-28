@@ -244,8 +244,78 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(fxctl_check);
 
+    // ─── UNIT 5: fx-activate (build-time activation) ──────────────────────
+    //
+    // fxstore_c: the vendored C store core (packageset/derivation/closure/
+    // store/build — the same source lists as tests/build_activate.sh) plus
+    // the dhall-c 13, as ONE static lib linking fxengine (the dl_* symbols
+    // store.c needs).  The activate port drives it through the extern block
+    // in activate.zig; config.c is NOT in the lib (config.zig replaces it —
+    // the log.zig "C engine stays C" pattern).
+    const fxc_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fxc_mod.addIncludePath(b.path("../vendor/fxstore"));
+    fxc_mod.addIncludePath(b.path("../vendor/datalog-dafsa/src"));
+    fxc_mod.addIncludePath(b.path("../vendor/datalog-dafsa/vendor"));
+    fxc_mod.addIncludePath(b.path("../vendor/dafsa"));
+    fxc_mod.addIncludePath(b.path("../vendor/dhall-c/src"));
+    fxc_mod.addCSourceFiles(.{
+        .root = b.path(".."),
+        .files = &.{
+            "vendor/fxstore/packageset.c",
+            "vendor/fxstore/derivation.c",
+            "vendor/fxstore/closure.c",
+            "vendor/fxstore/store.c",
+            "vendor/fxstore/build.c",
+            "vendor/dhall-c/src/arena.c",
+            "vendor/dhall-c/src/lexer.c",
+            "vendor/dhall-c/src/parser.c",
+            "vendor/dhall-c/src/ast.c",
+            "vendor/dhall-c/src/normalize.c",
+            "vendor/dhall-c/src/typecheck.c",
+            "vendor/dhall-c/src/builtins.c",
+            "vendor/dhall-c/src/serialize.c",
+            "vendor/dhall-c/src/import.c",
+            "vendor/dhall-c/src/bignum.c",
+            "vendor/dhall-c/src/sha256.c",
+            "vendor/dhall-c/src/ssrf.c",
+            "vendor/dhall-c/src/http.c",
+        },
+        // gnu11 (POSIX decls) + the store.c stage3-path default.
+        // -Ddhall_arena=c_dhall_arena: config.zig's dhall Zig core exports a
+        // C-ABI global `dhall_arena` (dhall-c zig arena.zig:48) — rename the C
+        // core's global so the two dhall cores (Zig for config, C for
+        // packageset) link side-by-side without colliding.
+        .flags = &.{ "-std=gnu11", "-O2", "-fno-stack-check", "-DFXSTORE_STAGE3_PATH=\"/fx/store/share/stage3\"", "-Ddhall_arena=c_dhall_arena" },
+    });
+    fxc_mod.linkLibrary(engine);
+    const fxstore_c = b.addLibrary(.{
+        .linkage = .static,
+        .name = "fxstore_c",
+        .root_module = fxc_mod,
+    });
+
+    // activate: the port CLI (activate_diff.sh execs it against the C oracle
+    // built from UNMODIFIED src/fx-activate.c + src/config.c); its test
+    // module runs the extern-struct round-trip through the real C loader.
+    const activate_mod = b.createModule(.{
+        .root_source_file = b.path("src/activate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "config", .module = config_mod },
+        },
+    });
+    activate_mod.linkLibrary(fxstore_c);
+    const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
+    b.installArtifact(activate_exe);
+
     // config.zig unit tests (on grammar, validation, extraEtc path rules),
-    // plus the reloc/supervise/log/probe/fxctl module tests.
+    // plus the reloc/supervise/log/probe/fxctl/activate module tests.
     const cfg_tests = b.addTest(.{ .root_module = config_mod });
     const run_cfg_tests = b.addRunArtifact(cfg_tests);
     const reloc_tests = b.addTest(.{ .root_module = reloc_mod });
@@ -258,6 +328,8 @@ pub fn build(b: *std.Build) void {
     const run_probe_tests = b.addRunArtifact(probe_tests);
     const fxctl_tests = b.addTest(.{ .root_module = fxctl_mod });
     const run_fxctl_tests = b.addRunArtifact(fxctl_tests);
+    const activate_tests = b.addTest(.{ .root_module = activate_mod });
+    const run_activate_tests = b.addRunArtifact(activate_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_cfg_tests.step);
     test_step.dependOn(&run_reloc_tests.step);
@@ -265,4 +337,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_probe_tests.step);
     test_step.dependOn(&run_fxctl_tests.step);
+    test_step.dependOn(&run_activate_tests.step);
 }
