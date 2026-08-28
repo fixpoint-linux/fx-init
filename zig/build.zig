@@ -314,6 +314,27 @@ pub fn build(b: *std.Build) void {
     const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
     b.installArtifact(activate_exe);
 
+    // ─── UNIT 6: fx-init (PID1/supervisor) ───────────────────────────────
+    //
+    // init: the port CLI (init_diff.sh execs it against the C oracle built
+    // from UNMODIFIED src/fx-init.c + its C twins), importing the ported
+    // log/probe/reloc/supervise modules and linking fxstore_c + fxengine.
+    const init_mod = b.createModule(.{
+        .root_source_file = b.path("src/init.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "log", .module = log_mod },
+            .{ .name = "probe", .module = probe_mod },
+            .{ .name = "reloc", .module = reloc_mod },
+            .{ .name = "supervise", .module = supervise_mod },
+        },
+    });
+    init_mod.linkLibrary(fxstore_c);
+    const init_exe = b.addExecutable(.{ .name = "fx-init", .root_module = init_mod });
+    b.installArtifact(init_exe);
+
     // config.zig unit tests (on grammar, validation, extraEtc path rules),
     // plus the reloc/supervise/log/probe/fxctl/activate module tests.
     const cfg_tests = b.addTest(.{ .root_module = config_mod });
@@ -330,6 +351,8 @@ pub fn build(b: *std.Build) void {
     const run_fxctl_tests = b.addRunArtifact(fxctl_tests);
     const activate_tests = b.addTest(.{ .root_module = activate_mod });
     const run_activate_tests = b.addRunArtifact(activate_tests);
+    const init_tests = b.addTest(.{ .root_module = init_mod });
+    const run_init_tests = b.addRunArtifact(init_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_cfg_tests.step);
     test_step.dependOn(&run_reloc_tests.step);
@@ -338,4 +361,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_probe_tests.step);
     test_step.dependOn(&run_fxctl_tests.step);
     test_step.dependOn(&run_activate_tests.step);
+    test_step.dependOn(&run_init_tests.step);
 }

@@ -17,11 +17,14 @@
 # Env:
 #   FXSTORE     path to a built fxstore binary  (REQUIRED)
 #   FX_ACTIVATE path to the fx-activate under test (REQUIRED)
+#   FX_INIT_BIN path to the fx-init under test (default: the store-built C
+#               fx-init; pass the Zig port or a custom C build to diff)
 #   BWRAP       path to bwrap (default: bwrap from PATH)
 set -u
 
 FXSTORE="${FXSTORE:-}"
 FX_ACTIVATE="${FX_ACTIVATE:-}"
+FX_INIT_BIN="${FX_INIT_BIN:-}"
 BWRAP="${BWRAP:-bwrap}"
 
 fail() { echo "fxinit-boot: FAIL: $*" >&2; exit 1; }
@@ -45,18 +48,28 @@ mkdir -p "$STORE" "$ROOT/run/fx"
 echo "=== fxinit-boot: building closure into $STORE ==="
 ( cd "$REPO/m3" && "$FXSTORE" build --store "$STORE" ) || fail "fxstore build failed"
 
-# locate the built fx-init + fxctl APEs in the store (content-addressed dirs)
-FXINIT_BIN=$(ls "$STORE"/*-fx-init/fx-init 2>/dev/null | head -1)
+# locate the built fx-init + fxctl APEs in the store (content-addressed dirs).
+# FX_INIT_BIN (optional) overrides the fx-init under test with an arbitrary
+# host-side binary (e.g. the Zig port): it is copied into the store so the
+# chroot boot can exec it at a chroot-visible path, and the host-side guard
+# step execs it directly.
+if [ -n "$FX_INIT_BIN" ]; then
+    [ -x "$FX_INIT_BIN" ] || skip "FX_INIT_BIN not executable: $FX_INIT_BIN"
+    cp "$FX_INIT_BIN" "$STORE/.fx-init-under-test"
+    FXINIT_BIN="$STORE/.fx-init-under-test"
+    FXINIT_CHROOT="/fx/store/.fx-init-under-test"
+else
+    FXINIT_BIN=$(ls "$STORE"/*-fx-init/fx-init 2>/dev/null | head -1)
+    [ -n "$FXINIT_BIN" ] || fail "fx-init not found in store ($STORE/*-fx-init/fx-init)"
+    # The path to fx-init AS SEEN INSIDE the bwrap chroot.  bwrap execs the
+    # given path inside the new mount namespace, where only / (=$ROOT) and
+    # /fx/store (=$STORE) are bound — the HOST path $STORE/<hash>-fx-init/
+    # fx-init does not exist there.  (fxctl runs host-side against the bound
+    # control socket, so it keeps the host path.)
+    FXINIT_CHROOT="/fx/store/$(basename "$(dirname "$FXINIT_BIN")")/fx-init"
+fi
 FXCTL_BIN=$(ls "$STORE"/*-fxctl/fxctl 2>/dev/null | head -1)
-[ -n "$FXINIT_BIN" ] || fail "fx-init not found in store ($STORE/*-fx-init/fx-init)"
 [ -n "$FXCTL_BIN" ] || fail "fxctl not found in store ($STORE/*-fxctl/fxctl)"
-
-# The path to fx-init AS SEEN INSIDE the bwrap chroot.  bwrap execs the given
-# path inside the new mount namespace, where only / (=$ROOT) and /fx/store
-# (=$STORE) are bound — the HOST path $STORE/<hash>-fx-init/fx-init does not
-# exist there.  (fxctl runs host-side against the bound control socket, so it
-# keeps the host path.)
-FXINIT_CHROOT="/fx/store/$(basename "$(dirname "$FXINIT_BIN")")/fx-init"
 
 # fxctl helper: connect to the chroot's control socket from the host.
 # $ROOT/run/fx is bound into the bwrap at /run/fx; the unix socket inode is
