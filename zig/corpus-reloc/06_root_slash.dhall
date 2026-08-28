@@ -1,0 +1,2 @@
+let GEN = "/abc-system-generation"
+< Symlink = { from = "/def-fx-init", to = "/bin/init" } >
