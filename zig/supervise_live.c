@@ -1,20 +1,39 @@
-/* supervise_live.c — live fx_sock_ready differential: drives the C
- * fx_sock_ready (src/fx_supervise.c) and the Zig fx_sock_ready
- * (zig/src/supervise.zig, linked from its object export) against the SAME
- * real listening AF_INET 127.0.0.1 + AF_UNIX sockets and asserts they
- * return the SAME 1/0 in every state — listening, after close (TCP) /
- * close+unlink (UNIX), NULL/empty/nonexistent args.
+/* supervise_live.c — live fx_sock_ready regression driver for the Zig port
+ * (zig/src/supervise.zig, linked from its object export).
+ *
+ * Formerly a C-vs-Zig differential (the C fx_sock_ready lived in
+ * src/fx_supervise.c, now removed).  It now drives ONLY the Zig
+ * fx_sock_ready against real AF_INET 127.0.0.1 + AF_UNIX sockets and
+ * asserts the ABSOLUTE 1/0 contract — every surviving expectation is a
+ * state that is deterministic by construction:
+ *
+ *   - pure-input cases (NULL/empty/nonexistent)          -> 0
+ *   - port-0 resolvers ("65536" truncation, "notaport")  -> 0
+ *   - with the harness's OWN 65535 listener held: the strtoul-overflow
+ *     resolvers ("999...", "-1", "-18446...617") all land on port 65535
+ *     (uint16_t cast; ERANGE->ULONG_MAX with the negation skip) and MUST
+ *     connect                                           -> 1
+ *   - unix listening -> 1; after close+unlink             -> 0
+ *   - a >107-char unix arg must reach an exactly-107-char listener
+ *     (truncation length)                                -> 1
+ *   - tcp listening (ephemeral port)                      -> 1
+ *
+ * Dropped relative to the differential era, per the reasoning recorded
+ * when the C oracle was removed:
+ *   - "tcp after close": a racing re-bind can flip the bit (was an
+ *     agreement-only check); now an unconstrained smoke call.
+ *   - "80junk"/"+80"/" 80": resolve to port 80, so the result depends on
+ *     unrelated host state; the port-math fidelity they pinned is already
+ *     covered by the 65535-resolver + port-0 cases above.
  *
  * The Zig fx_sock_ready is reached through a tiny wrapper object
  * (zig/zig-out/supervise_extern.o) exposing `zig_fx_sock_ready` — built by
  * supervise_diff.sh BEFORE this program compiles.
  *
- * Sandboxed (rattan) runs may block socket() entirely (EPERM): like
- * tests/supervise_test.c, the listening-socket assertions are gated on a
- * socket() probe and the pure-input cases always run.
+ * Sandboxed (rattan) runs may block socket() entirely (EPERM): the
+ * listening-socket assertions are gated on a socket() probe and the
+ * pure-input cases always run.
  */
-#include "fx_supervise.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,15 +46,24 @@
 /* the Zig port, exposed via the wrapper object */
 extern int zig_fx_sock_ready(int tcp, const char *arg);
 
-static int fails = 0;
+static int checks = 0, fails = 0;
 
-static void same(const char *what, int c, int z) {
-    if (c == z) {
-        printf("    OK %s: c=%d zig=%d\n", what, c, z);
+static void expect(const char *what, int got, int want) {
+    checks++;
+    if (got == want) {
+        printf("    OK %s: %d\n", what, got);
     } else {
-        printf("    FAIL %s: c=%d zig=%d\n", what, c, z);
+        printf("    FAIL %s: got %d, want %d\n", what, got, want);
         fails++;
     }
+}
+
+/* unconstrained run: must return without hanging/crashing; value printed
+ * only (kept as a smoke call where the old differential was
+ * agreement-only because the value is environment-dependent) */
+static void smoke(const char *what, int got) {
+    checks++;
+    printf("    OK %s: (unconstrained) %d\n", what, got);
 }
 
 static int listen_tcp(uint16_t *port_out) {
@@ -52,20 +80,23 @@ static int listen_tcp(uint16_t *port_out) {
 }
 
 /* listen on a SPECIFIC port (65535): makes the strtoul overflow cases
- * discriminating — those all map to port 65535 (see below), so with this
- * listener up both sides must return 1; a fix that probed port 1 instead
- * would return 0 and FAIL.  -1 if bind fails (port taken / no sockets). */
+ * POSITIVE probes — those all map to port 65535 after the (uint16_t)
+ * cast (glibc strtoul: "-1" magnitude-wrap, ERANGE->ULONG_MAX with the
+ * negation skip), so with this listener up they must all return 1; a
+ * port-math regression (e.g. negating when it should skip) would hit
+ * port 1 and return 0 instead.  -1 if bind fails (port taken / no
+ * sockets): the overflow cases are then skipped (see caller). */
 static int listen_tcp_port(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(0x7f000001u); a.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
-    /* backlog 128: each 65535-probing call leaves a COMPLETED connection in
-     * the accept queue (we never accept it), and both sides probe this port
-     * repeatedly — with the default 4 the queue fills and later probes
-     * SYN-drop+timeout, breaking agreement on queue position, not on port
-     * math (observed: C 5th queued connect -> 1, Zig 6th -> 0). */
+    /* backlog 128: each probing call leaves a COMPLETED connection in the
+     * accept queue (we never accept it) and we probe this port repeatedly —
+     * with the default 4 the queue fills and later probes
+     * SYN-drop+timeout, flipping results on queue position, not port math
+     * (observed during the C-vs-Zig era). */
     if (listen(fd, 128) != 0) { close(fd); return -1; }
     return fd;
 }
@@ -92,48 +123,37 @@ int main(void) {
         printf("  (skip: socket() blocked in this sandbox; "
                "listening-socket assertions run on the host)\n");
 
-    /* pure-input cases (no listener needed; agree everywhere) */
-    same("tcp NULL arg", fx_sock_ready(1, NULL), zig_fx_sock_ready(1, NULL));
-    same("tcp empty arg", fx_sock_ready(1, ""), zig_fx_sock_ready(1, ""));
-    same("unix NULL arg", fx_sock_ready(0, NULL), zig_fx_sock_ready(0, NULL));
-    same("unix nonexistent path",
-         fx_sock_ready(0, "/run/fx/does-not-exist-xyz"),
-         zig_fx_sock_ready(0, "/run/fx/does-not-exist-xyz"));
+    /* pure-input cases (no listener needed; deterministic everywhere) */
+    expect("tcp NULL arg", zig_fx_sock_ready(1, NULL), 0);
+    expect("tcp empty arg", zig_fx_sock_ready(1, ""), 0);
+    expect("unix NULL arg", zig_fx_sock_ready(0, NULL), 0);
+    expect("unix nonexistent path",
+           zig_fx_sock_ready(0, "/run/fx/does-not-exist-xyz"), 0);
 
-    /* WEIRD-ARG agreement (review2): pins the (uint16_t)strtoul port-cast
-     * fidelity.  Both sides compute the same port, so they agree regardless
-     * of listener state.  With the 65535 listener up, the overflow cases
-     * become POSITIVE probes: glibc strtoul maps -1 (magnitude 1, negated
-     * wrap), positive 21-digit overflow (ERANGE -> ULONG_MAX) and the
-     * negative-overflow boundary -18446744073709551617 (ERANGE -> ULONG_MAX
-     * and the sign negation is SKIPPED) all to port 65535 after the uint16_t
-     * cast — the negation-skip is exactly what fix-2 pins; a port that
-     * negated instead would hit port 1 and return 0 here. */
+    /* port-0 resolvers: (uint16_t)65536 == 0, strtoul("notaport") == 0 —
+     * connect(2) to port 0 never succeeds -> deterministic 0 */
+    expect("tcp 65536 (casts to port 0)", zig_fx_sock_ready(1, "65536"), 0);
+    expect("tcp no digits", zig_fx_sock_ready(1, "notaport"), 0);
+
+    /* strtoul-overflow port math, pinned POSITIVE against our own 65535
+     * listener (deterministic while the listener is held) */
     int bfd = have_sockets ? listen_tcp_port(65535) : -1;
-    same("tcp 21-digit overflow",
-         fx_sock_ready(1, "999999999999999999999"),
-         zig_fx_sock_ready(1, "999999999999999999999"));
-    same("tcp -1", fx_sock_ready(1, "-1"), zig_fx_sock_ready(1, "-1"));
-    same("tcp 65536 (casts to port 0)",
-         fx_sock_ready(1, "65536"), zig_fx_sock_ready(1, "65536"));
-    same("tcp trailing junk", fx_sock_ready(1, "80junk"), zig_fx_sock_ready(1, "80junk"));
-    same("tcp no digits", fx_sock_ready(1, "notaport"), zig_fx_sock_ready(1, "notaport"));
-    same("tcp plus prefix", fx_sock_ready(1, "+80"), zig_fx_sock_ready(1, "+80"));
-    same("tcp leading space", fx_sock_ready(1, " 80"), zig_fx_sock_ready(1, " 80"));
-    same("tcp negative-overflow boundary -18446744073709551617",
-         fx_sock_ready(1, "-18446744073709551617"),
-         zig_fx_sock_ready(1, "-18446744073709551617"));
-    if (bfd >= 0) close(bfd);
-    else
-        printf("  (note: 65535 not bindable; overflow cases assert agreement only)\n");
+    if (bfd >= 0) {
+        expect("tcp 21-digit overflow (-> 65535)",
+               zig_fx_sock_ready(1, "999999999999999999999"), 1);
+        expect("tcp -1 (magnitude wrap -> 65535)", zig_fx_sock_ready(1, "-1"), 1);
+        expect("tcp negative-overflow boundary -18446744073709551617 (negation skip -> 65535)",
+               zig_fx_sock_ready(1, "-18446744073709551617"), 1);
+        close(bfd);
+    } else {
+        printf("  (skip: 65535 not bindable; overflow resolvers unpinned this run)\n");
+    }
 
-    /* unix arg longer than sun_path-1 (107): both sides truncate to 107
-     * bytes over a zeroed sockaddr (strncpy / @min len), so they agree on
-     * the same (here nonexistent) path.  When sockets work, ALSO pin the
-     * truncation length for real: a listener at an exactly-107-char path
-     * must be REACHED through the >107-char arg by BOTH sides — a
-     * truncation off-by-one would land one byte short (ENOENT) and fail
-     * exactly one side. */
+    /* unix arg longer than sun_path-1 (107): truncated to 107 bytes over a
+     * zeroed sockaddr (@min len) — nonexistent without a listener -> 0;
+     * with a listener at an exactly-107-char path the >107-char arg must
+     * still REACH it (a truncation off-by-one would land one byte short,
+     * ENOENT, 0). */
     {
         char base[108];
         int blen = snprintf(base, sizeof base, "/tmp/fxlong-%d", (int)getpid());
@@ -143,41 +163,41 @@ int main(void) {
         int ll = snprintf(longarg, sizeof longarg, "%s", base);
         while (ll < 207) longarg[ll++] = 'b';
         longarg[ll] = '\0';  /* 207 chars: well past the 107-byte window */
-        same("unix >107-char path (no listener)",
-             fx_sock_ready(0, longarg), zig_fx_sock_ready(0, longarg));
+        expect("unix >107-char path (no listener)",
+               zig_fx_sock_ready(0, longarg), 0);
         if (have_sockets) {
             int lufd = listen_unix(base);
             if (lufd >= 0) {
-                same("unix >107-char arg reaches 107-char listener",
-                     fx_sock_ready(0, longarg), zig_fx_sock_ready(0, longarg));
+                expect("unix >107-char arg reaches 107-char listener",
+                       zig_fx_sock_ready(0, longarg), 1);
                 close(lufd); unlink(base);
+            } else {
+                printf("  (skip: 107-char unix listener not bindable)\n");
             }
         }
     }
 
-    /* TCP: ready while listening, same 1/0 for both. */
+    /* TCP: ready while listening (ephemeral port).  After close the value
+     * is racy (a re-bind can flip it) — smoke call only. */
     uint16_t port = 0; int lfd = have_sockets ? listen_tcp(&port) : -1;
     if (lfd >= 0) {
         char ps[16]; snprintf(ps, sizeof ps, "%u", (unsigned)port);
-        same("tcp listening", fx_sock_ready(1, ps), zig_fx_sock_ready(1, ps));
+        expect("tcp listening", zig_fx_sock_ready(1, ps), 1);
         close(lfd);
-        /* after close: ECONNREFUSED on loopback — assert AGREEMENT, not a
-         * specific value (a racing re-bind could flip the bit for both). */
-        same("tcp after close",
-             fx_sock_ready(1, ps), zig_fx_sock_ready(1, ps));
+        smoke("tcp after close (racy)", zig_fx_sock_ready(1, ps));
     }
 
-    /* AF_UNIX: ready while listening, 0 for both after close+unlink. */
+    /* AF_UNIX: ready while listening, deterministic 0 after close+unlink
+     * (the path is ours, pid-suffixed: nothing can re-bind it). */
     char upath[128]; snprintf(upath, sizeof upath, "/tmp/fxsock-zig-%d.sock", (int)getpid());
     int ufd = have_sockets ? listen_unix(upath) : -1;
     if (ufd >= 0) {
-        same("unix listening", fx_sock_ready(0, upath), zig_fx_sock_ready(0, upath));
+        expect("unix listening", zig_fx_sock_ready(0, upath), 1);
         close(ufd); unlink(upath);
-        same("unix after close+unlink",
-             fx_sock_ready(0, upath), zig_fx_sock_ready(0, upath));
+        expect("unix after close+unlink", zig_fx_sock_ready(0, upath), 0);
     }
 
     if (fails) { printf("supervise_live: %d FAIL\n", fails); return 1; }
-    printf("supervise_live: PASS\n");
+    printf("supervise_live: %d checks PASS\n", checks);
     return 0;
 }

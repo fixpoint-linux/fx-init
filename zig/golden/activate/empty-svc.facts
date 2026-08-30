@@ -1,0 +1,8 @@
+boot_grace 30000
+current 3
+generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
+tool_fxstore /bin/fx-activate
+user root 0 root
+version 1
+version 2
+version 3

@@ -1,0 +1,1 @@
+fx-config-dump: config must be a record { hostname, packages, users, services, ... }

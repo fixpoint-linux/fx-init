@@ -1,0 +1,1 @@
+fx-config-dump: extraEtc path 'a/../../etc/passwd' must be a clean relative path under etc/

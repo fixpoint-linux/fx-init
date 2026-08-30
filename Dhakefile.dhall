@@ -1,23 +1,30 @@
--- Dhakefile.dhall — self-hosting build of the fixpoint-linux M4 init system.
+-- Dhakefile.dhall — build of the fixpoint-linux M4 init system (Zig).
 --
---   ./dhake/dhake.com            # default target: fx-init
---   ./dhake/dhake.com fx-activate fxctl fakesvc   # the other binaries
---   ./dhake/dhake.com test        # build + run the in-sandbox unit tests
---   ./dhake/dhake.com clean       # remove the built binaries
+--   ./vendor/dhake/dhake.com            # default target: all (build + test)
+--   ./vendor/dhake/dhake.com fx-init    # the Zig build (also fx-activate/fxctl/fakesvc)
+--   ./vendor/dhake/dhake.com test       # zig unit tests + the 7 diff harnesses
+--   ./vendor/dhake/dhake.com clean      # remove build outputs
 --
--- Four cosmocc APE binaries live in this repo:
---   fx-init      — lean PID1/supervisor (U-C1); links fxstore(store,closure,build,
---                  packageset) + datalog-dafsa + dafsa, NO dhall-c.  -ffunction-
---                  sections -Wl,--gc-sections drops packageset's unused dhall-c
---                  runtime calls (fx_packageset_load) so no dhall-c link is needed.
---   fx-activate  — activation tool (U-B); links config.c + fx-activate.c + fxstore
---                  (full) + datalog-dafsa + dafsa + dhall-c (config.dhall eval).
---   fxctl        — pure-POSIX control/query client (U-D); links ONLY src/fxctl.c.
---   fakesvc      — test fixture service; links ONLY tests/fixtures/fakesvc/fakesvc.c.
+-- The C oracles (src/fx-init.c, src/fx-activate.c, src/fxctl.c, src/config.c
+-- and the fx_log/fx_probe/fx_reloc/fx_supervise twins) were removed after
+-- their Zig ports were verified byte-identical by live differential
+-- harnesses; those harnesses now regression-test the Zig implementations
+-- against the pinned goldens in zig/golden/ (captured from the verified C
+-- behavior, see each zig/*_diff.sh header).  The production binaries are
+-- the Zig build (zig/build.zig):
 --
--- NOTE: this repo vendors dafsa as a TOP-LEVEL submodule (vendor/dafsa/), NOT
--- under vendor/datalog-dafsa/vendor/ as fxstore does — the dafsa source paths
--- below reflect that.  cosmocc must be on PATH.
+--   fx-init      — lean PID1/supervisor (U-C1); links fxstore_c (vendored C
+--                  fxstore + dhall-c core) + the datalog-dafsa/dafsa engine,
+--                  NO dhall-c link beyond what packageset needs.
+--   fx-activate  — activation tool (U-B); drives fxstore_c through the
+--                  extern block in activate.zig.
+--   fxctl        — pure-POSIX control/query client (U-D).
+--   fakesvc      — test fixture service (tests/fixtures/fakesvc/fakesvc.c,
+--                  kept C — it is a fixture the harness compiles, not an
+--                  oracle).
+--
+-- NOTE: this repo vendors dafsa as a TOP-LEVEL submodule (vendor/dafsa/),
+-- NOT under vendor/datalog-dafsa/vendor/ as fxstore does.
 
 let Action =
       < Shell : Text
@@ -35,122 +42,34 @@ let Action =
 
 let Target = { deps : List Text, phony : Bool, recipe : List Action }
 
--- shared compile flags / include dirs
-let inc =
-      "-I src -I vendor/fxstore -I vendor/datalog-dafsa/src "
-      ++ "-I vendor/datalog-dafsa/vendor -I vendor/dafsa -I vendor/dhall-c/src"
+-- the Zig port build (all production binaries land in zig/zig-out/bin/)
+let zig_build = "cd zig && zig build -Doptimize=ReleaseSafe"
 
-let def = "-DFXSTORE_STAGE3_PATH=\\\"/fx/store/share/stage3\\\""
+-- the zig module unit tests (config/reloc/supervise/log/probe/fxctl/
+-- activate/init test blocks in build.zig)
+let zig_test = "cd zig && zig build test"
 
-let opt = "-std=c11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections"
-
--- datalog-dafsa engine sources (mirror fxstore/Dhakefile.dhall:146-166)
-let engine =
-      "vendor/datalog-dafsa/src/intern.c "
-      ++ "vendor/datalog-dafsa/src/termstore.c "
-      ++ "vendor/datalog-dafsa/src/relation.c "
-      ++ "vendor/datalog-dafsa/src/vrelation.c "
-      ++ "vendor/datalog-dafsa/src/tupleset.c "
-      ++ "vendor/datalog-dafsa/src/parser.c "
-      ++ "vendor/datalog-dafsa/src/compiler.c "
-      ++ "vendor/datalog-dafsa/src/vm.c "
-      ++ "vendor/datalog-dafsa/src/snapshot.c "
-      ++ "vendor/datalog-dafsa/src/regexwalk.c "
-      ++ "vendor/datalog-dafsa/src/permindex.c "
-      ++ "vendor/datalog-dafsa/src/util.c "
-      ++ "vendor/datalog-dafsa/src/dl.c "
-      ++ "vendor/datalog-dafsa/src/iter.c "
-      ++ "vendor/datalog-dafsa/src/magic.c "
-      ++ "vendor/datalog-dafsa/src/topdown.c "
-      ++ "vendor/datalog-dafsa/src/analyze.c "
-      ++ "vendor/datalog-dafsa/src/schema.c "
-      ++ "vendor/datalog-dafsa/src/typecheck.c "
-      ++ "vendor/datalog-dafsa/src/json.c "
-      ++ "vendor/datalog-dafsa/src/txnwal.c "
-      ++ "vendor/datalog-dafsa/src/index.c"
-
--- dafsa sources (TOP-LEVEL vendor/dafsa submodule in THIS repo)
-let dafsa =
-      "vendor/dafsa/dafsa.c "
-      ++ "vendor/dafsa/dafsa_state.c "
-      ++ "vendor/dafsa/dafsa_core.c "
-      ++ "vendor/dafsa/dafsa_persist.c "
-      ++ "vendor/dafsa/dafsa_view.c "
-      ++ "vendor/dafsa/dafsa_crc32.c "
-      ++ "vendor/dafsa/dafsa_wal.c "
-      ++ "vendor/dafsa/dafsa_build.c "
-      ++ "vendor/dafsa/dafsa_rank.c "
-      ++ "vendor/dafsa/dafsa_view_rank.c"
-
--- dhall-c interpreter core (linked by fx-activate for config.dhall eval)
-let dhallc =
-      "vendor/dhall-c/src/arena.c "
-      ++ "vendor/dhall-c/src/lexer.c "
-      ++ "vendor/dhall-c/src/parser.c "
-      ++ "vendor/dhall-c/src/ast.c "
-      ++ "vendor/dhall-c/src/normalize.c "
-      ++ "vendor/dhall-c/src/typecheck.c "
-      ++ "vendor/dhall-c/src/builtins.c "
-      ++ "vendor/dhall-c/src/serialize.c "
-      ++ "vendor/dhall-c/src/import.c "
-      ++ "vendor/dhall-c/src/bignum.c "
-      ++ "vendor/dhall-c/src/sha256.c "
-      ++ "vendor/dhall-c/src/ssrf.c "
-      ++ "vendor/dhall-c/src/http.c"
-
--- fxstore C library (vendored, read-only).  fx-init links the subset it needs
--- (store+closure+build+packageset); fx-activate links the full set (+derivation).
-let fxstore_sub =
-      "vendor/fxstore/store.c vendor/fxstore/closure.c "
-      ++ "vendor/fxstore/build.c vendor/fxstore/packageset.c"
-let fxstore_full =
-      "vendor/fxstore/packageset.c vendor/fxstore/derivation.c "
-      ++ "vendor/fxstore/closure.c vendor/fxstore/store.c vendor/fxstore/build.c"
-
-in  { default = "fx-init"
+in  { default = "all"
     , targets =
         [ { mapKey = "fx-init"
           , mapValue =
-              { deps =
-                  [ "src/fx-init.c", "src/fx_supervise.c", "src/fx_reloc.c", "src/fx_probe.c", "src/fx_log.c"
-                  , "src/fx.h", "src/fx_supervise.h", "src/fx_reloc.h", "src/fx_probe.h", "src/fx_log.h", "fxstore.h"
-                  ]
+              { deps = [ "zig/src/init.zig", "zig/src/activate.zig", "zig/src/fxctl.zig" ]
               , phony = False
-              , recipe =
-                  [ < Shell =
-                        "cosmocc " ++ opt ++ " " ++ def ++ " " ++ inc
-                        ++ " -o fx-init src/fx-init.c src/fx_supervise.c src/fx_reloc.c src/fx_probe.c src/fx_log.c "
-                        ++ fxstore_sub ++ " " ++ engine ++ " " ++ dafsa
-                    >
-                  ]
+              , recipe = [ < Shell = "${zig_build}" > ]
               }
           }
         , { mapKey = "fx-activate"
           , mapValue =
-              { deps =
-                  [ "src/fx-activate.c", "src/config.c", "src/fx.h", "fxstore.h"
-                  ]
+              { deps = [ "zig/src/activate.zig" ]
               , phony = False
-              , recipe =
-                  [ < Shell =
-                        "cosmocc " ++ opt ++ " " ++ def ++ " " ++ inc
-                        ++ " -o fx-activate src/config.c src/fx-activate.c "
-                        ++ fxstore_full ++ " " ++ engine ++ " " ++ dafsa
-                        ++ " " ++ dhallc
-                    >
-                  ]
+              , recipe = [ < Shell = "${zig_build}" > ]
               }
           }
         , { mapKey = "fxctl"
           , mapValue =
-              { deps = [ "src/fxctl.c" ]
+              { deps = [ "zig/src/fxctl.zig" ]
               , phony = False
-              , recipe =
-                  [ < Shell =
-                        "cosmocc -std=c11 -O2 -g -Wall -Wextra -I src "
-                        ++ "-o fxctl src/fxctl.c"
-                    >
-                  ]
+              , recipe = [ < Shell = "${zig_build}" > ]
               }
           }
         , { mapKey = "fakesvc"
@@ -159,69 +78,82 @@ in  { default = "fx-init"
               , phony = False
               , recipe =
                   [ < Shell =
-                        "cosmocc -std=c11 -O2 -g -Wall -Wextra "
+                        "zig cc -std=gnu11 -O2 -g -Wall -Wextra "
                         ++ "-o fakesvc tests/fixtures/fakesvc/fakesvc.c"
-                    >
+                  >
                   ]
               }
           }
 
-        -- ─── tests ──────────────────────────────────────────────────────────
-        , { mapKey = "config-test"
+        -- ─── tests: zig unit tests + the 7 diff/regression harnesses ─────
+        , { mapKey = "zig-test"
           , mapValue =
-              { deps = [ "src/config.c", "tests/config_test.c" ]
+              { deps = [ "zig/build.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell =
-                        "sh tests/build_unit.sh && ./build-tmp/config_test"
-                    >
-                  ]
+              , recipe = [ < Shell = "${zig_test}" > ]
               }
           }
-        , { mapKey = "log-test"
+        , { mapKey = "config-diff"
           , mapValue =
-              { deps = [ "src/fx_log.c", "tests/log_test.c" ]
+              { deps = [ "zig/config_diff.sh", "zig/src/config.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell = "sh tests/build_log.sh && ./build-tmp/log_test" > ]
+              , recipe = [ < Shell = "sh zig/config_diff.sh" > ]
               }
           }
-        , { mapKey = "probe-test"
+        , { mapKey = "reloc-diff"
           , mapValue =
-              { deps = [ "src/fx_probe.c", "tests/probe_test.c" ]
+              { deps = [ "zig/reloc_diff.sh", "zig/src/reloc.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell = "sh tests/build_probe.sh && ./build-tmp/probe_test" > ]
+              , recipe = [ < Shell = "sh zig/reloc_diff.sh" > ]
               }
           }
-        , { mapKey = "reloc-test"
+        , { mapKey = "supervise-diff"
           , mapValue =
-              { deps = [ "src/fx_reloc.c", "tests/reloctest.c" ]
+              { deps = [ "zig/supervise_diff.sh", "zig/src/supervise.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell = "sh tests/build_reloctest.sh && ./build-tmp/reloctest" > ]
+              , recipe = [ < Shell = "sh zig/supervise_diff.sh" > ]
               }
           }
-        , { mapKey = "supervise-test"
+        , { mapKey = "fxctl-diff"
           , mapValue =
-              { deps = [ "src/fx_supervise.c", "tests/supervise_test.c" ]
+              { deps = [ "zig/fxctl_diff.sh", "zig/src/fxctl.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell = "sh tests/build_supervise.sh && ./build-tmp/supervise_test" > ]
+              , recipe = [ < Shell = "sh zig/fxctl_diff.sh" > ]
               }
           }
-        , { mapKey = "activate-test"
+        , { mapKey = "log-probe-diff"
           , mapValue =
-              { deps = [ "fx-activate", "fakesvc" ]
+              { deps = [ "zig/log_probe_diff.sh", "zig/src/log.zig", "zig/src/probe.zig" ]
               , phony = True
-              , recipe =
-                  [ < Shell = "sh tests/activate.sh ./fx-activate ./build-tmp/fakesvc" > ]
+              , recipe = [ < Shell = "sh zig/log_probe_diff.sh" > ]
+              }
+          }
+        , { mapKey = "activate-diff"
+          , mapValue =
+              { deps = [ "zig/activate_diff.sh", "zig/src/activate.zig" ]
+              , phony = True
+              , recipe = [ < Shell = "sh zig/activate_diff.sh" > ]
+              }
+          }
+        , { mapKey = "init-diff"
+          , mapValue =
+              { deps = [ "zig/init_diff.sh", "zig/src/init.zig" ]
+              , phony = True
+              , recipe = [ < Shell = "sh zig/init_diff.sh" > ]
               }
           }
         , { mapKey = "test"
           , mapValue =
               { deps =
-                  [ "config-test", "log-test", "probe-test", "reloc-test", "supervise-test", "activate-test" ]
+                  [ "zig-test"
+                  , "config-diff"
+                  , "reloc-diff"
+                  , "supervise-diff"
+                  , "fxctl-diff"
+                  , "log-probe-diff"
+                  , "activate-diff"
+                  , "init-diff"
+                  ]
               , phony = True
               , recipe = [] : List Action
               }
@@ -295,15 +227,21 @@ in  { default = "fx-init"
               }
           }
 
-        -- ─── clean ──────────────────────────────────────────────────────────
+        -- ─── all / clean ────────────────────────────────────────────────────
+        , { mapKey = "all"
+          , mapValue =
+              { deps = [ "fx-init", "test" ]
+              , phony = True
+              , recipe = [] : List Action
+              }
+          }
         , { mapKey = "clean"
           , mapValue =
               { deps = [] : List Text
               , phony = True
               , recipe =
-                  [ < Rm = "fx-init" >
-                  , < Rm = "fx-activate" >
-                  , < Rm = "fxctl" >
+                  [ < Rm = { path = "build-tmp", recursive = True } >
+                  , < Rm = { path = "zig/zig-out", recursive = True } >
                   , < Rm = "fakesvc" >
                   ]
               }

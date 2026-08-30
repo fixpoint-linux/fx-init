@@ -1,0 +1,4 @@
+OK 78
+let GEN = "/g-system-generation"
+from = "/aa-1" from = "/bb-2" from = "/cc-3"
+

@@ -1,0 +1,5 @@
+OK 103
+let GEN = "/fx/store/g-system-generation"
+from = "/fx/store/p-1"
+text = "a\\"b" tail = "/fx/store/p-2"
+

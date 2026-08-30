@@ -14,11 +14,6 @@
  *      flags { pathname: page.path } and reads back innerHTML.
  *   4. Wraps the markup in a full HTML document (import map + the page's slot).
  *   5. Copies shell/ -> dist/ and vendor/@mfe -> dist/vendor/@mfe (if present).
- *      shell/ also carries the in-browser demo's assets (the wasm build in
- *      shell/wasm + the xterm vendor in shell/vendor/xterm + the non-Elm demo
- *      MFE in shell/mfe). The demo has no page on this site — those assets
- *      are deployed here so the main landing page's embed can load them from
- *      /fx-init/shell/...
  *
  * Run from the repo root:  node scripts/ssg.mjs
  */

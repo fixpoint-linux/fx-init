@@ -1,0 +1,42 @@
+boot_grace 4000
+current 3
+generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
+svc gated up:heartbeat on-failure
+svc heartbeat all always
+svc netty net on-failure
+svc ready sock:tcp:4053 on-failure
+svc timed time:250 never
+svc unixy sock:unix:/run/x.sock never
+svc_argv gated 0 fakesvc
+svc_argv gated 1 gated
+svc_argv heartbeat 0 fakesvc
+svc_argv heartbeat 1 ok
+svc_argv netty 0 /bin/true
+svc_argv ready 0 /bin/sh
+svc_argv ready 1 -c
+svc_argv ready 2 echo hi
+svc_argv timed 0 /bin/true
+svc_argv unixy 0 fakesvc
+svc_argv unixy 1 unix
+svc_backoff gated 1000
+svc_backoff heartbeat 500
+svc_backoff netty 1000
+svc_backoff ready 1000
+svc_backoff timed 1000
+svc_backoff unixy 250
+svc_bin gated H-fakesvc/fakesvc
+svc_bin heartbeat H-fakesvc/fakesvc
+svc_bin netty /bin/true
+svc_bin ready /bin/sh
+svc_bin timed /bin/true
+svc_bin unixy H-fakesvc/fakesvc
+svc_env unixy K V
+svc_probe netty tcp 7
+svc_probe ready file /run/ready
+svc_probe unixy unix /run/x.sock
+tool_fxstore /bin/fx-activate
+user al 1000 wheel,root
+user root 0 root
+version 1
+version 2
+version 3

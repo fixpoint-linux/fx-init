@@ -1,0 +1,5 @@
+OK 76
+let GEN = "/g-system-generation"
+from = "/p-1"
+text = "a\\"b" tail = "/p-2"
+

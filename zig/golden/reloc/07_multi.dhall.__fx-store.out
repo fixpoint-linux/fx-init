@@ -1,0 +1,4 @@
+OK 98
+let GEN = "/fx/store/x-system-generation"
+from = "/fx/store/a-fx-init" from = "/fx/store/b-fxctl"
+

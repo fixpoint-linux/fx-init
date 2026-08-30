@@ -1,0 +1,5 @@
+usage: fxctl <subcommand> [args]
+  status | q <rel> [vals..] | start|stop|restart <svc> | probe
+  activate <config> | rollback <ver> | shutdown
+  grep <regex> | search <term> [term..]
+env: FX_RUN (default /run/fx), FX_SOCKET (override control.sock path)

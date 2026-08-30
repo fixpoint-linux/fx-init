@@ -95,70 +95,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(supervise_check);
 
-    // ─── UNIT 3: fx_log + fx_probe (the C engine stays C) ─────────────────
+    // ─── UNIT 3: fx_log + fx_probe ─────────────────────────────────────────
     //
-    // fxengine: the vendored datalog-dafsa + dafsa engines as ONE static lib
-    // (the same source lists as tests/build_log.sh / build_probe.sh), linked
-    // by the live driver once.  The Zig ports declare the dl_*/aux_*/
-    // tokenize/regex_* entry points as externs — the fx-core libdatalog FFI
-    // pattern.
-    const engine_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    engine_mod.addIncludePath(b.path("../vendor/datalog-dafsa/src"));
-    engine_mod.addIncludePath(b.path("../vendor/datalog-dafsa/vendor"));
-    engine_mod.addIncludePath(b.path("../vendor/dafsa"));
-    engine_mod.addCSourceFiles(.{
-        .root = b.path(".."),
-        .files = &.{
-            "vendor/datalog-dafsa/src/intern.c",
-            "vendor/datalog-dafsa/src/termstore.c",
-            "vendor/datalog-dafsa/src/relation.c",
-            "vendor/datalog-dafsa/src/vrelation.c",
-            "vendor/datalog-dafsa/src/tupleset.c",
-            "vendor/datalog-dafsa/src/parser.c",
-            "vendor/datalog-dafsa/src/compiler.c",
-            "vendor/datalog-dafsa/src/vm.c",
-            "vendor/datalog-dafsa/src/snapshot.c",
-            "vendor/datalog-dafsa/src/regexwalk.c",
-            "vendor/datalog-dafsa/src/permindex.c",
-            "vendor/datalog-dafsa/src/util.c",
-            "vendor/datalog-dafsa/src/dl.c",
-            "vendor/datalog-dafsa/src/iter.c",
-            "vendor/datalog-dafsa/src/magic.c",
-            "vendor/datalog-dafsa/src/topdown.c",
-            "vendor/datalog-dafsa/src/analyze.c",
-            "vendor/datalog-dafsa/src/schema.c",
-            "vendor/datalog-dafsa/src/typecheck.c",
-            "vendor/datalog-dafsa/src/json.c",
-            "vendor/datalog-dafsa/src/txnwal.c",
-            "vendor/datalog-dafsa/src/index.c",
-            "vendor/dafsa/dafsa.c",
-            "vendor/dafsa/dafsa_state.c",
-            "vendor/dafsa/dafsa_core.c",
-            "vendor/dafsa/dafsa_persist.c",
-            "vendor/dafsa/dafsa_view.c",
-            "vendor/dafsa/dafsa_crc32.c",
-            "vendor/dafsa/dafsa_wal.c",
-            "vendor/dafsa/dafsa_build.c",
-            "vendor/dafsa/dafsa_rank.c",
-            "vendor/dafsa/dafsa_view_rank.c",
-        },
-        // gnu11 not c11: the engines use POSIX decls (zig cc c11 hides them).
-        .flags = &.{ "-std=gnu11", "-O2", "-fno-stack-check" },
-    });
-    const engine = b.addLibrary(.{
-        .linkage = .static,
-        .name = "fxengine",
-        .root_module = engine_mod,
-    });
+    // The datalog-dafsa + dafsa engine is no longer compiled from the stale
+    // vendored C sources: the dl_*/aux_*/tokenize/regex_* externs the Zig
+    // ports (and the vendored fxstore C core) declare are resolved against the
+    // Zig-built libdatalog.so in the sibling ../../datalog-dafsa checkout
+    // (linkDatalog, below).  The C headers are still vendored so the C driver
+    // log_probe_live.c and vendor/fxstore/store.c keep compiling unchanged.
 
     // log_port / probe_port: the Zig ports as objects exposing zig_log_* /
     // zig_probe_* to the C live driver (the supervise_extern.o pattern, now
     // inside zig build).  Objects carry no linkage; the driver's final link
-    // resolves the dl_* externs against fxengine.
+    // resolves the dl_* externs against libdatalog.so.
     const log_mod = b.createModule(.{
         .root_source_file = b.path("src/log.zig"),
         .target = target,
@@ -167,14 +116,14 @@ pub fn build(b: *std.Build) void {
     });
     const log_obj = b.addObject(.{ .name = "log_port", .root_module = log_mod });
     // dedicated test module: linking the engine into log_mod itself would
-    // pull fxengine twice into the live driver (duplicate symbols)
+    // pull the dl_* objects twice into the live driver (duplicate symbols)
     const log_test_mod = b.createModule(.{
         .root_source_file = b.path("src/log.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    log_test_mod.linkLibrary(engine);
+    linkDatalog(b, log_test_mod);
     const probe_mod = b.createModule(.{
         .root_source_file = b.path("src/probe.zig"),
         .target = target,
@@ -188,30 +137,28 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    probe_test_mod.linkLibrary(engine);
+    linkDatalog(b, probe_test_mod);
 
-    // log_probe_live: the one-process differential driver (C), linking the
-    // C originals (src/fx_log.c + src/fx_probe.c), both Zig port objects and
-    // the shared engine lib.
+    // log_probe_live: the one-process regression driver (C), linking the
+    // Zig port objects and libdatalog.so.  (It used to link the C originals
+    // src/fx_log.c + src/fx_probe.c for a live C-vs-Zig diff; the C oracle
+    // was removed and the driver now compares against pinned goldens.)
     const live_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    live_mod.addIncludePath(b.path("../src"));
     live_mod.addIncludePath(b.path("../vendor/datalog-dafsa/src"));
     live_mod.addCSourceFiles(.{
         .root = b.path(".."),
         .files = &.{
             "zig/log_probe_live.c",
-            "src/fx_log.c",
-            "src/fx_probe.c",
         },
         .flags = &.{ "-std=gnu11", "-O2", "-fno-stack-check" },
     });
     live_mod.addObject(log_obj);
     live_mod.addObject(probe_obj);
-    live_mod.linkLibrary(engine);
+    linkDatalog(b, live_mod);
     const live = b.addExecutable(.{ .name = "log_probe_live", .root_module = live_mod });
     b.installArtifact(live);
 
@@ -248,10 +195,11 @@ pub fn build(b: *std.Build) void {
     //
     // fxstore_c: the vendored C store core (packageset/derivation/closure/
     // store/build — the same source lists as tests/build_activate.sh) plus
-    // the dhall-c 13, as ONE static lib linking fxengine (the dl_* symbols
-    // store.c needs).  The activate port drives it through the extern block
-    // in activate.zig; config.c is NOT in the lib (config.zig replaces it —
-    // the log.zig "C engine stays C" pattern).
+    // the dhall-c 13, as ONE static lib.  Its dl_* externs (store.c) are
+    // resolved against libdatalog.so at the activate/init final links.  The
+    // activate port drives it through the extern block in activate.zig;
+    // config.c is NOT in the lib (config.zig replaces it — the log.zig
+    // "C engine stays C" pattern).
     const fxc_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -291,7 +239,6 @@ pub fn build(b: *std.Build) void {
         // packageset) link side-by-side without colliding.
         .flags = &.{ "-std=gnu11", "-O2", "-fno-stack-check", "-DFXSTORE_STAGE3_PATH=\"/fx/store/share/stage3\"", "-Ddhall_arena=c_dhall_arena" },
     });
-    fxc_mod.linkLibrary(engine);
     const fxstore_c = b.addLibrary(.{
         .linkage = .static,
         .name = "fxstore_c",
@@ -311,6 +258,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     activate_mod.linkLibrary(fxstore_c);
+    linkDatalog(b, activate_mod);
     const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
     b.installArtifact(activate_exe);
 
@@ -318,7 +266,7 @@ pub fn build(b: *std.Build) void {
     //
     // init: the port CLI (init_diff.sh execs it against the C oracle built
     // from UNMODIFIED src/fx-init.c + its C twins), importing the ported
-    // log/probe/reloc/supervise modules and linking fxstore_c + fxengine.
+    // log/probe/reloc/supervise modules and linking fxstore_c + libdatalog.so.
     const init_mod = b.createModule(.{
         .root_source_file = b.path("src/init.zig"),
         .target = target,
@@ -332,6 +280,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     init_mod.linkLibrary(fxstore_c);
+    linkDatalog(b, init_mod);
     const init_exe = b.addExecutable(.{ .name = "fx-init", .root_module = init_mod });
     b.installArtifact(init_exe);
 
@@ -362,4 +311,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_fxctl_tests.step);
     test_step.dependOn(&run_activate_tests.step);
     test_step.dependOn(&run_init_tests.step);
+}
+
+// Link the Zig-built datalog-dafsa engine .so (sibling ../../datalog-dafsa
+// checkout, since the build root is zig/) into `m`.  The library path and the
+// baked rpath are both the .so's absolute directory, so linked binaries/tests
+// resolve it at runtime from any cwd.
+fn linkDatalog(b: *std.Build, m: *std.Build.Module) void {
+    m.linkSystemLibrary("datalog", .{});
+    m.addLibraryPath(b.path("../../datalog-dafsa/zig-out/lib"));
+    m.addRPath(b.path("../../datalog-dafsa/zig-out/lib"));
 }

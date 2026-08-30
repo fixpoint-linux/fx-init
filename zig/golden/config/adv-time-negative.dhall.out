@@ -1,0 +1,11 @@
+hostname=x
+service[0].name=a
+service[0].argv[0]=x
+service[0].pkg=-
+service[0].on_kind=FX_ON_TIME
+service[0].on_arg=-1
+service[0].restart=FX_RESTART_ALWAYS
+service[0].backoff_ms=1000
+service[0].probe_kind=FX_PROBE_NONE
+service[0].probe_arg=-
+grace_ms=30000

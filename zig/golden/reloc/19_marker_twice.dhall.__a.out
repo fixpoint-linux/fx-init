@@ -1,0 +1,5 @@
+OK 90
+let GEN = "/a/aaa-system-generation"
+junk = "let GEN = \"/second/t/bbb\""
+from = "/a/p-1"
+

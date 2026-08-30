@@ -1,0 +1,4 @@
+OK 71
+let GEN = "/x-system-generation"
+from = "/a-fx-init" from = "/b-fxctl"
+

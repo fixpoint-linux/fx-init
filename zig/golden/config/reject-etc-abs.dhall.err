@@ -1,0 +1,1 @@
+fx-config-dump: extraEtc path '/etc/host.conf' must be a clean relative path under etc/

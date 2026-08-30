@@ -1,0 +1,5 @@
+OK 104
+let GEN = "/fx/store/aaa-system-generation"
+junk = "let GEN = \"/second/t/bbb\""
+from = "/fx/store/p-1"
+

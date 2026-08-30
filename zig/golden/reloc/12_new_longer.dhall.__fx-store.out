@@ -1,0 +1,4 @@
+OK 114
+let GEN = "/fx/store/g-system-generation"
+from = "/fx/store/aa-1" from = "/fx/store/bb-2" from = "/fx/store/cc-3"
+

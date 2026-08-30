@@ -1,0 +1,4 @@
+OK 66
+let GEN = "/a/g-system-generation" s = "a\"b\\"c"
+from = "/a/p-1"
+

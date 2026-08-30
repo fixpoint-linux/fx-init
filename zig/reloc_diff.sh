@@ -1,12 +1,17 @@
 #!/bin/sh
-# reloc_diff.sh — differential harness: run the Zig port (reloc_check)
-# against the C oracle (reloc_dump) on every corpus buildfile × a fixed set
-# of new_store values; fail on ANY difference in stdout, stderr, or exit
-# code.  (The dafsa/dhall-c *_diff.sh pattern, like config_diff.sh.)
+# reloc_diff.sh — regression harness for the Zig buildfile store-root
+# rewrite (zig/src/reloc_check.zig) over every corpus buildfile
+# (zig/corpus-reloc/) × a fixed set of new_store values; fails on ANY
+# difference in stdout, stderr, or exit code against the pinned golden
+# files (zig/golden/reloc/).
 #
-# Builds both binaries first:
-#   - oracle: zig cc (gnu11) zig/reloc_dump.c + src/fx_reloc.c
-#   - port:   zig build -Doptimize=ReleaseSafe
+# Golden provenance: this was a LIVE differential against the C oracle
+# (zig/reloc_dump.c + src/fx_reloc.c) — the last pre-deletion live run
+# (2026-08-29, C oracle still present) passed 104/104 byte-identical, and
+# the goldens were then captured from the Zig side, i.e. golden == the C
+# oracle's verified behavior.  `--pin` re-captures goldens from the Zig
+# side (for corpus changes); it is NOT a C oracle rebuild — the C oracle
+# no longer exists in this repo.
 #
 # Corpus (zig/corpus-reloc/): all 8 reloctest.c cases (basic, no-marker,
 # GEN-with-no-slash, unterminated, escaped-quote, root-"/" verbatim, multi)
@@ -18,16 +23,15 @@
 # stress, CRLF text, no-occurrence body.
 set -e
 cd "$(dirname "$0")/.."
-
-echo "== building C oracle =="
-zig cc -std=gnu11 -O2 -Wall -Wextra \
-    -I src -o zig/zig-out/reloc_dump zig/reloc_dump.c src/fx_reloc.c
-echo "reloc_dump built"
+GOLDEN=zig/golden/reloc
+PIN=0
+[ "${1:-}" = "--pin" ] && PIN=1
 
 echo "== building Zig port =="
 ( cd zig && zig build -Doptimize=ReleaseSafe )
-DUMP=zig/zig-out/reloc_dump
 CHECK=zig/zig-out/bin/reloc_check
+
+mkdir -p "$GOLDEN"
 
 # new_store sweep: grow, shrink, equal-ish, empty, single-char
 NEW_STORES="/fx/store /tmp/s /a ''"
@@ -38,24 +42,40 @@ for f in zig/corpus-reloc/*.dhall; do
     for ns in $NEW_STORES; do
         # eval so the quoted empty string stays one (empty) arg
         eval "set -- $ns"
-        dump_rc=0; check_rc=0
+        case "$1" in
+            /fx/store) lbl=fx-store ;;
+            /tmp/s) lbl=tmp-s ;;
+            /a) lbl=a ;;
+            "") lbl=empty ;;
+            *) lbl=other ;;
+        esac
+        gname="$name.__$lbl"
+        check_rc=0
 
-        "$DUMP" "$f" "$1" >"/tmp/reloc_dump.$name.out" 2>"/tmp/reloc_dump.$name.err" || dump_rc=$?
         "$CHECK" "$f" "$1" >"/tmp/reloc_check.$name.out" 2>"/tmp/reloc_check.$name.err" || check_rc=$?
 
+        if [ "$PIN" = 1 ]; then
+            cp "/tmp/reloc_check.$name.out" "$GOLDEN/$gname.out"
+            cp "/tmp/reloc_check.$name.err" "$GOLDEN/$gname.err"
+            echo "$check_rc" > "$GOLDEN/$gname.rc"
+            echo "PIN $name ns='$1' (rc=$check_rc)"
+            pass=$((pass + 1))
+            continue
+        fi
+
         ok=1
-        cmp -s "/tmp/reloc_dump.$name.out" "/tmp/reloc_check.$name.out" || ok=0
-        cmp -s "/tmp/reloc_dump.$name.err" "/tmp/reloc_check.$name.err" || ok=0
-        [ "$dump_rc" = "$check_rc" ] || ok=0
+        diff -u "$GOLDEN/$gname.out" "/tmp/reloc_check.$name.out" >"/tmp/reloc.d.out" 2>&1 || ok=0
+        diff -u "$GOLDEN/$gname.err" "/tmp/reloc_check.$name.err" >"/tmp/reloc.d.err" 2>&1 || ok=0
+        [ "$check_rc" = "$(cat "$GOLDEN/$gname.rc")" ] || ok=0
 
         if [ "$ok" = 1 ]; then
             pass=$((pass + 1))
-            echo "PASS $name ns='$1' (rc=$dump_rc)"
+            echo "PASS $name ns='$1' (rc=$check_rc)"
         else
             fail=$((fail + 1))
-            echo "FAIL $name ns='$1' (dump rc=$dump_rc, check rc=$check_rc)"
-            diff -u "/tmp/reloc_dump.$name.out" "/tmp/reloc_check.$name.out" | sed 's/^/    out: /'
-            diff -u "/tmp/reloc_dump.$name.err" "/tmp/reloc_check.$name.err" | sed 's/^/    err: /'
+            echo "FAIL $name ns='$1' (golden rc=$(cat "$GOLDEN/$gname.rc"), check rc=$check_rc)"
+            sed 's/^/    out: /' /tmp/reloc.d.out
+            sed 's/^/    err: /' /tmp/reloc.d.err
         fi
     done
 done

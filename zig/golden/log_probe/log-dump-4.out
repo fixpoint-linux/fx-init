@@ -1,0 +1,394 @@
+log	106	svcB	warn	starting up
+log	107	svcC	info	Multi Word Tokens: hello_world 42
+log	108	svcD	info	!@# $%^ &*()
+log	109	svcE	info	
+log	222	batch	info	batch line 222
+log	223	batch	info	batch line 223
+log	224	batch	info	batch line 224
+log	225	batch	info	batch line 225
+log	226	batch	info	batch line 226
+log	227	batch	info	batch line 227
+log	228	batch	info	batch line 228
+log	229	batch	info	batch line 229
+log	230	batch	info	batch line 230
+log	231	batch	info	batch line 231
+log	232	batch	info	batch line 232
+log	233	batch	info	batch line 233
+log	234	batch	info	batch line 234
+log	235	batch	info	batch line 235
+log	236	batch	info	batch line 236
+log	237	batch	info	batch line 237
+log	238	batch	info	batch line 238
+log	239	batch	info	batch line 239
+log	240	batch	info	batch line 240
+log	241	batch	info	batch line 241
+log	242	batch	info	batch line 242
+log	243	batch	info	batch line 243
+log	244	batch	info	batch line 244
+log	245	batch	info	batch line 245
+log	246	batch	info	batch line 246
+log	247	batch	info	batch line 247
+log	248	batch	info	batch line 248
+log	249	batch	info	batch line 249
+log	250	batch	info	batch line 250
+log	251	batch	info	batch line 251
+log	252	batch	info	batch line 252
+log	253	batch	info	batch line 253
+log	254	batch	info	batch line 254
+log	255	batch	info	batch line 255
+log	256	batch	info	batch line 256
+log	257	batch	info	batch line 257
+log	258	batch	info	batch line 258
+log	259	batch	info	batch line 259
+log	260	batch	info	batch line 260
+log	261	batch	info	batch line 261
+log	262	batch	info	batch line 262
+log	263	batch	info	batch line 263
+log	264	batch	info	batch line 264
+log	265	batch	info	batch line 265
+log	266	batch	info	batch line 266
+log	267	batch	info	batch line 267
+log	268	batch	info	batch line 268
+log	269	batch	info	batch line 269
+log	270	batch	info	batch line 270
+log	271	batch	info	batch line 271
+log	272	batch	info	batch line 272
+log	273	batch	info	batch line 273
+log	274	batch	info	batch line 274
+log	275	batch	info	batch line 275
+log	276	batch	info	batch line 276
+log	277	batch	info	batch line 277
+log	278	batch	info	batch line 278
+log	279	batch	info	batch line 279
+log	280	batch	info	batch line 280
+log	281	batch	info	batch line 281
+log	282	batch	info	batch line 282
+log	283	batch	info	batch line 283
+log	284	batch	info	batch line 284
+log	285	batch	info	batch line 285
+log	286	batch	info	batch line 286
+log	287	batch	info	batch line 287
+log	288	batch	info	batch line 288
+log	289	batch	info	batch line 289
+log	290	batch	info	batch line 290
+log	291	batch	info	batch line 291
+log	292	batch	info	batch line 292
+log	293	batch	info	batch line 293
+log	294	batch	info	batch line 294
+log	295	batch	info	batch line 295
+log	296	batch	info	batch line 296
+log	297	batch	info	batch line 297
+log	298	batch	info	batch line 298
+log	299	batch	info	batch line 299
+__postings__	101	100
+__postings__	103	102
+__postings__	105	104
+__postings__	107	106
+__postings__	109	108
+__postings__	111	110
+__postings__	113	112
+__postings__	115	114
+__postings__	117	116
+__postings__	119	118
+__postings__	12	11
+__postings__	121	120
+__postings__	123	122
+__postings__	125	124
+__postings__	127	126
+__postings__	129	128
+__postings__	13	11
+__postings__	131	130
+__postings__	133	132
+__postings__	135	134
+__postings__	137	136
+__postings__	139	138
+__postings__	14	100
+__postings__	14	102
+__postings__	14	104
+__postings__	14	106
+__postings__	14	108
+__postings__	14	110
+__postings__	14	112
+__postings__	14	114
+__postings__	14	116
+__postings__	14	118
+__postings__	14	120
+__postings__	14	122
+__postings__	14	124
+__postings__	14	126
+__postings__	14	128
+__postings__	14	130
+__postings__	14	132
+__postings__	14	134
+__postings__	14	136
+__postings__	14	138
+__postings__	14	140
+__postings__	14	142
+__postings__	14	144
+__postings__	14	146
+__postings__	14	148
+__postings__	14	15
+__postings__	14	150
+__postings__	14	152
+__postings__	14	154
+__postings__	14	156
+__postings__	14	158
+__postings__	14	160
+__postings__	14	162
+__postings__	14	164
+__postings__	14	166
+__postings__	14	168
+__postings__	14	170
+__postings__	14	172
+__postings__	14	174
+__postings__	14	176
+__postings__	14	178
+__postings__	14	18
+__postings__	14	180
+__postings__	14	182
+__postings__	14	184
+__postings__	14	186
+__postings__	14	188
+__postings__	14	190
+__postings__	14	192
+__postings__	14	194
+__postings__	14	196
+__postings__	14	198
+__postings__	14	20
+__postings__	14	200
+__postings__	14	202
+__postings__	14	204
+__postings__	14	206
+__postings__	14	208
+__postings__	14	210
+__postings__	14	212
+__postings__	14	214
+__postings__	14	22
+__postings__	14	24
+__postings__	14	26
+__postings__	14	28
+__postings__	14	30
+__postings__	14	32
+__postings__	14	34
+__postings__	14	36
+__postings__	14	38
+__postings__	14	40
+__postings__	14	42
+__postings__	14	44
+__postings__	14	46
+__postings__	14	48
+__postings__	14	50
+__postings__	14	52
+__postings__	14	54
+__postings__	14	56
+__postings__	14	58
+__postings__	14	60
+__postings__	14	62
+__postings__	14	64
+__postings__	14	66
+__postings__	14	68
+__postings__	14	70
+__postings__	14	72
+__postings__	14	74
+__postings__	14	76
+__postings__	14	78
+__postings__	14	80
+__postings__	14	82
+__postings__	14	84
+__postings__	14	86
+__postings__	14	88
+__postings__	14	90
+__postings__	14	92
+__postings__	14	94
+__postings__	14	96
+__postings__	14	98
+__postings__	141	140
+__postings__	143	142
+__postings__	145	144
+__postings__	147	146
+__postings__	149	148
+__postings__	151	150
+__postings__	153	152
+__postings__	155	154
+__postings__	157	156
+__postings__	159	158
+__postings__	16	100
+__postings__	16	102
+__postings__	16	104
+__postings__	16	106
+__postings__	16	108
+__postings__	16	110
+__postings__	16	112
+__postings__	16	114
+__postings__	16	116
+__postings__	16	118
+__postings__	16	120
+__postings__	16	122
+__postings__	16	124
+__postings__	16	126
+__postings__	16	128
+__postings__	16	130
+__postings__	16	132
+__postings__	16	134
+__postings__	16	136
+__postings__	16	138
+__postings__	16	140
+__postings__	16	142
+__postings__	16	144
+__postings__	16	146
+__postings__	16	148
+__postings__	16	15
+__postings__	16	150
+__postings__	16	152
+__postings__	16	154
+__postings__	16	156
+__postings__	16	158
+__postings__	16	160
+__postings__	16	162
+__postings__	16	164
+__postings__	16	166
+__postings__	16	168
+__postings__	16	170
+__postings__	16	172
+__postings__	16	174
+__postings__	16	176
+__postings__	16	178
+__postings__	16	18
+__postings__	16	180
+__postings__	16	182
+__postings__	16	184
+__postings__	16	186
+__postings__	16	188
+__postings__	16	190
+__postings__	16	192
+__postings__	16	194
+__postings__	16	196
+__postings__	16	198
+__postings__	16	20
+__postings__	16	200
+__postings__	16	202
+__postings__	16	204
+__postings__	16	206
+__postings__	16	208
+__postings__	16	210
+__postings__	16	212
+__postings__	16	214
+__postings__	16	22
+__postings__	16	24
+__postings__	16	26
+__postings__	16	28
+__postings__	16	30
+__postings__	16	32
+__postings__	16	34
+__postings__	16	36
+__postings__	16	38
+__postings__	16	40
+__postings__	16	42
+__postings__	16	44
+__postings__	16	46
+__postings__	16	48
+__postings__	16	50
+__postings__	16	52
+__postings__	16	54
+__postings__	16	56
+__postings__	16	58
+__postings__	16	60
+__postings__	16	62
+__postings__	16	64
+__postings__	16	66
+__postings__	16	68
+__postings__	16	70
+__postings__	16	72
+__postings__	16	74
+__postings__	16	76
+__postings__	16	78
+__postings__	16	80
+__postings__	16	82
+__postings__	16	84
+__postings__	16	86
+__postings__	16	88
+__postings__	16	90
+__postings__	16	92
+__postings__	16	94
+__postings__	16	96
+__postings__	16	98
+__postings__	161	160
+__postings__	163	162
+__postings__	165	164
+__postings__	167	166
+__postings__	169	168
+__postings__	17	15
+__postings__	171	170
+__postings__	173	172
+__postings__	175	174
+__postings__	177	176
+__postings__	179	178
+__postings__	181	180
+__postings__	183	182
+__postings__	185	184
+__postings__	187	186
+__postings__	189	188
+__postings__	19	18
+__postings__	191	190
+__postings__	193	192
+__postings__	195	194
+__postings__	197	196
+__postings__	199	198
+__postings__	201	200
+__postings__	203	202
+__postings__	205	204
+__postings__	207	206
+__postings__	209	208
+__postings__	21	20
+__postings__	211	210
+__postings__	213	212
+__postings__	215	214
+__postings__	219	218
+__postings__	220	218
+__postings__	221	218
+__postings__	222	218
+__postings__	223	218
+__postings__	224	218
+__postings__	23	22
+__postings__	25	24
+__postings__	27	26
+__postings__	29	28
+__postings__	31	30
+__postings__	33	32
+__postings__	35	34
+__postings__	37	36
+__postings__	39	38
+__postings__	4	3
+__postings__	41	40
+__postings__	43	42
+__postings__	45	44
+__postings__	47	46
+__postings__	49	48
+__postings__	5	3
+__postings__	51	50
+__postings__	53	52
+__postings__	55	54
+__postings__	57	56
+__postings__	59	58
+__postings__	61	60
+__postings__	63	62
+__postings__	65	64
+__postings__	67	66
+__postings__	69	68
+__postings__	7	6
+__postings__	71	70
+__postings__	73	72
+__postings__	75	74
+__postings__	77	76
+__postings__	79	78
+__postings__	8	6
+__postings__	81	80
+__postings__	83	82
+__postings__	85	84
+__postings__	87	86
+__postings__	89	88
+__postings__	91	90
+__postings__	93	92
+__postings__	95	94
+__postings__	97	96
+__postings__	99	98

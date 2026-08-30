@@ -1,0 +1,4 @@
+OK 80
+let GEN = "/fx/store/g-system-generation" s = "a\"b\\"c"
+from = "/fx/store/p-1"
+

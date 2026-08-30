@@ -1,29 +1,41 @@
 #!/bin/sh
-# fxctl_diff.sh — differential harness for src/fxctl.c vs its Zig port
-# (zig/src/fxctl.zig).  Two parts:
+# fxctl_diff.sh — regression harness for the fxctl port (zig/src/fxctl.zig).
+# Two parts:
 #
-#   1. REQUEST-LINE DIFF: the C oracle (zig/fxctl_dump.c — a labeled verbatim
-#      copy of the request builder + usage, which live INLINE in fxctl.c's
-#      main()) and the Zig twin (zig/src/fxctl_check.zig) sweep a corpus of
-#      argv vectors; stdout+stderr+rc must be byte-identical.
-#   2. LIVE CLIENT DIFF: the UNMODIFIED C client (built from src/fxctl.c)
-#      vs the Zig client (zig/zig-out/bin/fxctl), both exec'd against a fake
-#      fx-init AF_UNIX server (zig/fxctl_live.c): request echoed back / data
-#      + OK / ERR variants / close-without-reply / not-running / no-args.
-#      This pins the REAL C main()'s request bytes and the response
-#      streaming end-to-end, covering any drift between the oracle copy and
-#      fxctl.c.
+#   1. REQUEST-LINE DIFF (still live): the self-contained fixture oracle
+#      (zig/fxctl_dump.c — a labeled verbatim copy of the request builder +
+#      usage, which live INLINE in fxctl.c's main()) and the Zig twin
+#      (zig/src/fxctl_check.zig) sweep a corpus of argv vectors; stdout+
+#      stderr+rc must be byte-identical.  fxctl_dump.c is harness fixture C
+#      under zig/, NOT the removed C oracle — it needs nothing from src/.
+#   2. LIVE CLIENT CONTRACT vs goldens: the client (zig/zig-out/bin/fxctl)
+#      is exec'd against a fake fx-init AF_UNIX server (zig/fxctl_live.c):
+#      request echoed back / data + OK / ERR variants / close-without-reply
+#      / not-running / no-args; stdout+stderr+rc must match the pinned
+#      goldens (zig/golden/fxctl-live/).
 #
-# Builds all binaries first (oracle+client+driver: zig cc gnu11; port: zig
-# build), like the other *_diff.sh harnesses.
+# Golden provenance (part 2): pinned ONCE from the REAL C client
+# (src/fxctl.c, since removed) with `--pin` after the last pre-deletion
+# live C-vs-Zig client diff passed 13/13 byte-identical (2026-08-29) — the
+# goldens are the C client's verified behavior, including its request
+# bytes end-to-end.  `--pin` re-pins from a client binary you name; it can
+# no longer rebuild the C oracle (it is gone from this repo).
 set -e
 cd "$(dirname "$0")/.."
+GOLDEN=zig/golden/fxctl-live
+PIN=0
+PINBIN=""
+if [ "${1:-}" = "--pin" ]; then
+    PIN=1
+    PINBIN="${2:-}"
+    [ -n "$PINBIN" ] || { echo "usage: fxctl_diff.sh --pin <client-binary>" >&2; exit 2; }
+    [ -x "$PINBIN" ] || { echo "fxctl_diff: pin client not executable: $PINBIN" >&2; exit 2; }
+fi
 
-echo "== building C oracle + C client + live driver =="
+echo "== building fixture oracle (fxctl_dump) + live driver =="
 zig cc -std=gnu11 -O2 -Wall -Wextra -o zig/zig-out/fxctl_dump zig/fxctl_dump.c
-zig cc -std=gnu11 -O2 -Wall -Wextra -o zig/zig-out/fxctl_c src/fxctl.c
 zig cc -std=gnu11 -O2 -Wall -Wextra -o zig/zig-out/fxctl_live zig/fxctl_live.c
-echo "fxctl_dump / fxctl_c / fxctl_live built"
+echo "fxctl_dump / fxctl_live built"
 
 echo "== building Zig port =="
 ( cd zig && zig build -Doptimize=ReleaseSafe )
@@ -75,16 +87,30 @@ LONG=$(head -c 5000 /dev/zero | tr '\0' 'x')
 run q users "$LONG"
 run status "$LONG" "$LONG"
 
-# ── part 2: live client diff — real C binary vs Zig binary, fake server ──
-echo "== live client diff (C vs Zig vs fake fx-init server) =="
-if "$LIVE" zig/zig-out/fxctl_c zig/zig-out/bin/fxctl >"/tmp/fxctl_live.out" 2>&1; then
-    pass=$((pass + 1))
-    echo "PASS live client diff (real C client vs Zig client, 13 cases)"
-    sed 's/^/    /' "/tmp/fxctl_live.out"
+# ── part 2: live client contract — client binary vs pinned goldens ────────
+mkdir -p "$GOLDEN"
+if [ "$PIN" = 1 ]; then
+    echo "== pinning live client contract from $PINBIN =="
+    if "$LIVE" pin "$PINBIN" "$GOLDEN" >"/tmp/fxctl_live.out" 2>&1; then
+        pass=$((pass + 1))
+        echo "PIN live client contract ($(grep -c '    PIN ' /tmp/fxctl_live.out) cases)"
+        sed 's/^/    /' /tmp/fxctl_live.out
+    else
+        fail=$((fail + 1))
+        echo "FAIL live client pin"
+        sed 's/^/    /' /tmp/fxctl_live.out
+    fi
 else
-    fail=$((fail + 1))
-    echo "FAIL live client diff"
-    sed 's/^/    /' "/tmp/fxctl_live.out"
+    echo "== live client contract (zig fxctl vs C-pinned goldens) =="
+    if "$LIVE" check zig/zig-out/bin/fxctl "$GOLDEN" >"/tmp/fxctl_live.out" 2>&1; then
+        pass=$((pass + 1))
+        echo "PASS live client contract (zig fxctl vs C-pinned goldens, 13 cases)"
+        sed 's/^/    /' "/tmp/fxctl_live.out"
+    else
+        fail=$((fail + 1))
+        echo "FAIL live client contract"
+        sed 's/^/    /' /tmp/fxctl_live.out
+    fi
 fi
 
 echo "fxctl_diff: $pass passed, $fail failed"

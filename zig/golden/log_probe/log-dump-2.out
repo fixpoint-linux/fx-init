@@ -1,0 +1,9 @@
+log	101	svcA	info	heartbeat ok
+log	102	svcB	error	heartbeat ok
+log	103	svcA	info	shutting down
+__postings__	12	11
+__postings__	13	11
+__postings__	4	3
+__postings__	5	3
+__postings__	7	6
+__postings__	8	6

@@ -1,0 +1,21 @@
+OK 845
+let Action =
+      < Copy : { from : Text, to : Text } | Symlink : { from : Text, to : Text } >
+let Target = { deps : List Text, phony : Bool, recipe : List Action }
+let GEN = "/abc123-system-generation"
+in  { default = "rootfs"
+    , targets =
+        [ { mapKey = "dirs"
+          , mapValue = { deps = [] : List Text, phony = True
+              , recipe = [ < Symlink = { from = "/deadbeef-fx-init"
+                                         , to = "/bin/init" } > ] } }
+        , { mapKey = "etc"
+          , mapValue = { deps = ["dirs"], phony = True
+              , recipe = [ < Copy = { from = GEN ++ "/etc/hostname"
+                                     , to = "/etc/hostname" } > ] } }
+        , { mapKey = "rootfs"
+          , mapValue = { deps = ["etc","dirs"], phony = True
+              , recipe = [] : List Action } }
+        ]
+    }
+

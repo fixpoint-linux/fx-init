@@ -1,0 +1,10 @@
+process	1	0	0	init	S	400
+process	100	1	1000	worker process	R	1024
+fs	/
+fs	/run
+file	/etc/hostname	7	33184	1000	1000
+device	eth0	0	2	net	0
+device	lo	0	1	net	0
+kernel	ov-a71865	12345	42	2048	1024
+net	eth0	aa:bb:cc:dd:ee:ff	aa:bb:cc:dd:ee:ff	up	9999	1111
+net	lo	00:00:00:00:00:00	00:00:00:00:00:00	unknown	1234	5678

@@ -1,0 +1,4 @@
+OK 74
+let GEN = "/tmp/s/g-system-generation" s = "a\"b\\"c"
+from = "/tmp/s/p-1"
+

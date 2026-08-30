@@ -1,0 +1,1 @@
+fx-config-dump: service 'a': invalid on= 'garbage' (expected all | up:<svc> | sock:tcp:<port> | sock:unix:<path> | time:<ms> | net)

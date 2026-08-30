@@ -1,58 +1,61 @@
 #!/bin/sh
-# init_diff.sh — unit-6 differential harness for src/fx-init.c vs its Zig port
-# (zig/src/init.zig).  L1 in-sandbox smoke diff (no cosmocc, no bwrap, no
-# fxstore binary): it builds a fixture store via the ZIG fx-activate (unit 5)
-# + the activate_paths helper, installs a zig-cc-built fakesvc at its svc_bin
-# target and a FAKE dhake (cats its -f arg to stdout, exit 0 or FAKE_DHAKE_EXIT),
-# then boots each binary HOST-side with FX_INIT_FORCE=1 and byte-compares a
-# NORMALIZED transcript (fxctl status + q service_runtime + q boot_status +
-# grep heartbeat + grep 'let GEN' + .bootlog; epochs/pids/restarts/store-path
-# sed-normalized).
+# init_diff.sh — unit-6 regression harness for the Zig fx-init PID1/
+# supervisor port (zig/src/init.zig).  L1 in-sandbox smoke vs pinned
+# goldens (zig/golden/init/, no cosmocc, no bwrap, no fxstore binary): it
+# builds a fixture store via the ZIG fx-activate (unit 5) + the
+# activate_paths helper, installs a zig-cc-built fakesvc at its svc_bin
+# target and a FAKE dhake (cats its -f arg to stdout, exit 0 or
+# FAKE_DHAKE_EXIT), then boots the Zig fx-init HOST-side with
+# FX_INIT_FORCE=1 and compares a NORMALIZED transcript (fxctl status +
+# q service_runtime + q boot_status + grep heartbeat + grep 'let GEN' +
+# .bootlog; epochs/pids/restarts/store-path sed-normalized) against the
+# goldens.
 #
-# The store is activated into $WORK/pre (so the buildfile bakes the HOST root
-# $WORK/pre) then MOVED to $WORK/store before boot: run_dhake must reloc-rewrite
-# $WORK/pre -> $WORK/store, so `grep 'let GEN'` pins the fx_reloc wiring (the
-# rewritten GEN line, not the activation-time root).
+# Golden provenance: this was a LIVE differential against the C oracle
+# (src/fx-init.c + its C twins, since removed) — the last pre-deletion
+# live runs (2026-08-29) booted the C and the Zig PID1 side by side and
+# byte-matched the normalized transcripts (good/crasher/dhake-fail/stop+
+# start; 3 of 4 runs fully green, one run flaked only on the crasher
+# case's instantaneous service state — see below); the goldens were then
+# captured from the Zig side, i.e. golden == the C oracle's verified
+# behavior.
 #
-# The two sides run SEQUENTIALLY against the SAME store path (fresh per side):
-# dl_open holds a process-lifetime exclusive lock, and the per-package
-# derivation hash is store-root-dependent, so the genhash is comparable only
-# when both sides activate into the same root.
+# CRASHER-CASE NOTE: for the crasher service the instantaneous
+# service_runtime state token (backoff|started) depends on where the
+# status poll lands inside the crash/restart cycle — it is unassertable
+# by construction (that race is what the one flaky live run hit).  For
+# that case only, the state token is normalized to CYCLE; the crash
+# cycle HISTORY stays fully asserted via .bootlog + the grep lines.
+#
+# The store is activated into $WORK/pre (so the buildfile bakes the HOST
+# root $WORK/pre) then MOVED to $WORK/store before boot: run_dhake must
+# reloc-rewrite $WORK/pre -> $WORK/store, so `grep 'let GEN'` pins the
+# fx_reloc wiring (the rewritten GEN line, not the activation-time root).
 set -u
 cd "$(dirname "$0")/.."
 
 CORPUS=zig/corpus/init
 PKGSET=zig/corpus/activate/package-set.dhall
 ROOTS="dhake fx-init fxctl fx-activate fakesvc"
+GOLDEN=zig/golden/init
+PIN=0
+[ "${1:-}" = "--pin" ] && PIN=1
 
-ENGINE="vendor/datalog-dafsa/src/intern.c vendor/datalog-dafsa/src/termstore.c vendor/datalog-dafsa/src/relation.c vendor/datalog-dafsa/src/vrelation.c vendor/datalog-dafsa/src/tupleset.c vendor/datalog-dafsa/src/parser.c vendor/datalog-dafsa/src/compiler.c vendor/datalog-dafsa/src/vm.c vendor/datalog-dafsa/src/snapshot.c vendor/datalog-dafsa/src/regexwalk.c vendor/datalog-dafsa/src/permindex.c vendor/datalog-dafsa/src/util.c vendor/datalog-dafsa/src/dl.c vendor/datalog-dafsa/src/iter.c vendor/datalog-dafsa/src/magic.c vendor/datalog-dafsa/src/topdown.c vendor/datalog-dafsa/src/analyze.c vendor/datalog-dafsa/src/schema.c vendor/datalog-dafsa/src/typecheck.c vendor/datalog-dafsa/src/json.c vendor/datalog-dafsa/src/txnwal.c vendor/datalog-dafsa/src/index.c"
-DAFSA="vendor/dafsa/dafsa.c vendor/dafsa/dafsa_state.c vendor/dafsa/dafsa_core.c vendor/dafsa/dafsa_persist.c vendor/dafsa/dafsa_view.c vendor/dafsa/dafsa_crc32.c vendor/dafsa/dafsa_wal.c vendor/dafsa/dafsa_build.c vendor/dafsa/dafsa_rank.c vendor/dafsa/dafsa_view_rank.c"
-FXSTORE="vendor/fxstore/store.c vendor/fxstore/closure.c vendor/fxstore/build.c vendor/fxstore/packageset.c"
-INC="-I src -I vendor/fxstore -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/dafsa -I vendor/dhall-c/src"
-# -DPATH_MAX: fx-init.c uses PATH_MAX but does not include <limits.h>; glibc
-# only exposes it transitively under cosmocc (tests/build_fxinit.sh), so the
-# zig-cc oracle pins the Linux value 4096.
-DEF='-DFXSTORE_STAGE3_PATH="/fx/store/share/stage3" -DPATH_MAX=4096'
-GC="-ffunction-sections -fdata-sections -Wl,--gc-sections"
-
-echo "== building C oracle (fx-init) + C fxctl + fakesvc + fake dhake =="
-zig cc -std=gnu11 -O2 $GC $DEF $INC -o zig/zig-out/init_c \
-    src/fx-init.c src/fx_supervise.c src/fx_reloc.c src/fx_probe.c src/fx_log.c \
-    $FXSTORE $ENGINE $DAFSA
-zig cc -std=gnu11 -O2 -o zig/zig-out/init_fxctl src/fxctl.c
+echo "== building fixtures (fakesvc + fake dhake) + activate helpers =="
 zig cc -std=gnu11 -O2 -o zig/zig-out/init_fakesvc tests/fixtures/fakesvc/fakesvc.c
 zig cc -std=gnu11 -O2 -o zig/zig-out/init_dhake zig/dhake_smoke.c
 
 echo "== building Zig port + activate helpers =="
 ( cd zig && zig build -Doptimize=ReleaseSafe )
 
-INIT_C=zig/zig-out/init_c
 INIT_Z=zig/zig-out/bin/fx-init
-FXCTL=zig/zig-out/init_fxctl
+FXCTL=zig/zig-out/bin/fxctl
 FAKESVC=zig/zig-out/init_fakesvc
 DHAKE=zig/zig-out/init_dhake
 PATHS=zig/zig-out/activate_paths
 ACT_Z=zig/zig-out/bin/fx-activate
+
+mkdir -p "$GOLDEN"
 
 WORK="$(mktemp -d -t init_diff.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -86,53 +89,59 @@ normalize() {
         -e 's/\t[0-9][0-9]*$/\tN/'
 }
 
-# run_side SIDE BIN CFG DHAKE_EXIT GREPTERM — fresh store, boot, capture
-# the (normalized) transcript.
+# cycle_normalize — crasher-case only: the instantaneous service state
+# token is cycle-phase, not behavior (see header).
+cycle_normalize() {
+    sed -e 's/\tbackoff\t/\tCYCLE\t/g' -e 's/\tstarted\t/\tCYCLE\t/g'
+}
+
+# run_side CASE CFG DHAKE_EXIT GREPTERM — fresh store, boot, capture the
+# (normalized) transcript.
 run_side() {
-    side=$1 bin=$2 cfg=$3 dhexit=$4 grepterm=$5
+    case_name=$1 cfg=$2 dhexit=$3 grepterm=$4
 
     rm -rf "$PRE" "$STORE" "$RUN"
     mkdir -p "$PRE"
 
     rels=$("$PATHS" --store "$PRE" --package-set "$PKGSET" $ROOTS) \
-        || fail "activate_paths failed ($side)"
+        || fail "activate_paths failed ($case_name)"
     for d in $rels; do
         mkdir -p "$PRE/$d" && echo built > "$PRE/$d/payload"
     done
 
     "$ACT_Z" --store "$PRE" --package-set "$PKGSET" --config "$CORPUS/$cfg" \
-        >"$WORK/$side.act.out" 2>"$WORK/$side.act.err" \
-        || fail "fx-activate failed ($side): $(tail -1 "$WORK/$side.act.err")"
+        >"$WORK/act.out" 2>"$WORK/act.err" \
+        || fail "fx-activate failed ($case_name): $(tail -1 "$WORK/act.err")"
 
     # install the compiled fixtures at their svc_bin / dhake targets.  The
     # target FILE does not exist yet, so `cp src dir/*-x/file` would not glob;
     # resolve the content-addressed dir first, then copy into it.
     set -- "$PRE"/*-fakesvc
     fdir=$1
-    [ -d "$fdir" ] || fail "fakesvc install failed ($side) — no *-fakesvc dir?"
+    [ -d "$fdir" ] || fail "fakesvc install failed ($case_name) — no *-fakesvc dir?"
     cp "$FAKESVC" "$fdir/fakesvc"
     set -- "$PRE"/*-dhake
     ddir=$1
-    [ -d "$ddir" ] || fail "dhake install failed ($side) — no *-dhake dir?"
+    [ -d "$ddir" ] || fail "dhake install failed ($case_name) — no *-dhake dir?"
     cp "$DHAKE" "$ddir/dhake.com"
     mv "$PRE" "$STORE"
 
     mkdir -p "$RUN"
-    FX_INIT_FORCE=1 FAKE_DHAKE_EXIT="$dhexit" "$bin" \
+    FX_INIT_FORCE=1 FAKE_DHAKE_EXIT="$dhexit" "$INIT_Z" \
         --store "$STORE" --run-dir "$RUN" --grace-ms 1500 --probe-interval-s 100000 \
-        >"$WORK/$side.boot.out" 2>&1 &
+        >"$WORK/boot.out" 2>&1 &
     BPID=$!
 
     wait_status "$RUN" || {
-        echo "--- $side boot.out ---" >&2
-        sed 's/^/    /' "$WORK/$side.boot.out" >&2
-        fail "boot_status never reached ok/failed ($side)"
+        echo "--- boot.out ---" >&2
+        sed 's/^/    /' "$WORK/boot.out" >&2
+        fail "boot_status never reached ok/failed ($case_name)"
     }
 
-    FX_RUN="$RUN" "$FXCTL" status            | normalize >"$WORK/$side.status" 2>&1
-    FX_RUN="$RUN" "$FXCTL" q service_runtime | normalize >"$WORK/$side.sr" 2>&1
-    FX_RUN="$RUN" "$FXCTL" grep "$grepterm"  | head -1 | normalize >"$WORK/$side.grep" 2>&1
-    FX_RUN="$RUN" "$FXCTL" grep 'let GEN'    | head -1 | normalize >"$WORK/$side.gen" 2>&1
+    FX_RUN="$RUN" "$FXCTL" status            | normalize >"$WORK/n.status" 2>&1
+    FX_RUN="$RUN" "$FXCTL" q service_runtime | normalize >"$WORK/n.sr" 2>&1
+    FX_RUN="$RUN" "$FXCTL" grep "$grepterm"  | head -1 | normalize >"$WORK/n.grep" 2>&1
+    FX_RUN="$RUN" "$FXCTL" grep 'let GEN'    | head -1 | normalize >"$WORK/n.gen" 2>&1
 
     FX_RUN="$RUN" "$FXCTL" shutdown >/dev/null 2>&1
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -142,34 +151,48 @@ run_side() {
     kill "$BPID" 2>/dev/null
     wait "$BPID" 2>/dev/null
 
-    normalize < "$STORE/.bootlog" > "$WORK/$side.bootlog"
-    [ -s "$WORK/$side.bootlog" ] || fail ".bootlog empty after boot ($side)"
+    normalize < "$STORE/.bootlog" > "$WORK/n.bootlog"
+    [ -s "$WORK/n.bootlog" ] || fail ".bootlog empty after boot ($case_name)"
+
+    # crasher case: the instantaneous service state is cycle-phase
+    if [ "$case_name" = "crasher" ]; then
+        cycle_normalize < "$WORK/n.status" > "$WORK/n.status.tmp" && mv "$WORK/n.status.tmp" "$WORK/n.status"
+        cycle_normalize < "$WORK/n.sr" > "$WORK/n.sr.tmp" && mv "$WORK/n.sr.tmp" "$WORK/n.sr"
+    fi
 }
 
 pass=0; fail=0
 
+# check_one CASE KIND — compare/golden one transcript artifact
+check_one() {
+    case_name=$1 kind=$2
+    g="$GOLDEN/$case_name.$kind"
+    if [ "$PIN" = 1 ]; then
+        cp "$WORK/n.$kind" "$g" || { echo "    pin failed [$kind]"; return 1; }
+        return 0
+    fi
+    diff -u "$g" "$WORK/n.$kind" > "/tmp/init.d.$kind" 2>&1 && return 0
+    echo "    diff [$kind]:"
+    sed 's/^/      /' "/tmp/init.d.$kind" | head -12
+    return 1
+}
+
 run_case() {
-    name=$1; cfg=$2; dhexit=$3; grepterm=$4
+    case_name=$1; cfg=$2; dhexit=$3; grepterm=$4
 
-    run_side c "$INIT_C" "$cfg" "$dhexit" "$grepterm"
-    run_side z "$INIT_Z" "$cfg" "$dhexit" "$grepterm"
+    run_side "$case_name" "$cfg" "$dhexit" "$grepterm"
 
-    ok=1; why=""
+    ok=1
     for f in status sr grep gen bootlog; do
-        if ! diff -u "$WORK/c.$f" "$WORK/z.$f" >"$WORK/d.$f" 2>&1; then
-            ok=0; why="$why $f"
-        fi
+        check_one "$case_name" "$f" || ok=0
     done
 
     if [ "$ok" = 1 ]; then
         pass=$((pass + 1))
-        echo "PASS $name"
+        if [ "$PIN" = 1 ]; then echo "PIN $case_name"; else echo "PASS $case_name"; fi
     else
         fail=$((fail + 1))
-        echo "FAIL $name ($why)"
-        for f in status sr grep gen bootlog; do
-            [ -s "$WORK/d.$f" ] && sed 's/^/    /' "$WORK/d.$f"
-        done
+        echo "FAIL $case_name"
     fi
 }
 
@@ -182,7 +205,7 @@ run_case dhake-fail    good.dhall    3 heartbeat
 
 # ── stop/start via fxctl (control-socket supervision path) ────────────────
 echo "== stop/start case =="
-run_side c "$INIT_C" good.dhall 0 heartbeat
+run_side stopstart good.dhall 0 heartbeat
 FX_RUN="$RUN" "$FXCTL" stop heartbeat >/dev/null 2>&1
 i=1
 while [ "$i" -le 50 ]; do
@@ -190,7 +213,7 @@ while [ "$i" -le 50 ]; do
     echo "$sr" | grep -q '^heartbeat.*stopped' && break
     sleep 0.2; i=$((i+1))
 done
-echo "$sr" | normalize > "$WORK/c.stop"
+echo "$sr" | normalize > "$WORK/n.stop"
 FX_RUN="$RUN" "$FXCTL" start heartbeat >/dev/null 2>&1
 i=1
 while [ "$i" -le 50 ]; do
@@ -198,39 +221,19 @@ while [ "$i" -le 50 ]; do
     echo "$sr" | grep -q '^heartbeat.*started' && break
     sleep 0.2; i=$((i+1))
 done
-echo "$sr" | normalize > "$WORK/c.start"
+echo "$sr" | normalize > "$WORK/n.start"
 FX_RUN="$RUN" "$FXCTL" shutdown >/dev/null 2>&1
 sleep 1
 
-run_side z "$INIT_Z" good.dhall 0 heartbeat
-FX_RUN="$RUN" "$FXCTL" stop heartbeat >/dev/null 2>&1
-i=1
-while [ "$i" -le 50 ]; do
-    sr=$(FX_RUN="$RUN" "$FXCTL" q service_runtime 2>/dev/null)
-    echo "$sr" | grep -q '^heartbeat.*stopped' && break
-    sleep 0.2; i=$((i+1))
-done
-echo "$sr" | normalize > "$WORK/z.stop"
-FX_RUN="$RUN" "$FXCTL" start heartbeat >/dev/null 2>&1
-i=1
-while [ "$i" -le 50 ]; do
-    sr=$(FX_RUN="$RUN" "$FXCTL" q service_runtime 2>/dev/null)
-    echo "$sr" | grep -q '^heartbeat.*started' && break
-    sleep 0.2; i=$((i+1))
-done
-echo "$sr" | normalize > "$WORK/z.start"
-FX_RUN="$RUN" "$FXCTL" shutdown >/dev/null 2>&1
-sleep 1
-
-if diff -u "$WORK/c.stop" "$WORK/z.stop" >"$WORK/d.stop" 2>&1 \
-   && diff -u "$WORK/c.start" "$WORK/z.start" >"$WORK/d.start" 2>&1; then
+ok=1
+check_one stopstart stop || ok=0
+check_one stopstart start || ok=0
+if [ "$ok" = 1 ]; then
     pass=$((pass + 1))
-    echo "PASS stop/start"
+    if [ "$PIN" = 1 ]; then echo "PIN stop/start"; else echo "PASS stop/start"; fi
 else
     fail=$((fail + 1))
     echo "FAIL stop/start"
-    [ -s "$WORK/d.stop" ]  && sed 's/^/    /' "$WORK/d.stop"
-    [ -s "$WORK/d.start" ] && sed 's/^/    /' "$WORK/d.start"
 fi
 
 echo "init_diff: $pass passed, $fail failed"
