@@ -99,10 +99,10 @@ pub fn build(b: *std.Build) void {
     //
     // The datalog-dafsa + dafsa engine is no longer compiled from the stale
     // vendored C sources: the dl_*/aux_*/tokenize/regex_* externs the Zig
-    // ports (and the vendored fxstore C core) declare are resolved against the
-    // Zig-built libdatalog.so in the sibling ../../datalog-dafsa checkout
-    // (linkDatalog, below).  The C headers are still vendored so the C driver
-    // log_probe_live.c and vendor/fxstore/store.c keep compiling unchanged.
+    // ports declare are resolved against the Zig-built libdatalog.so in the
+    // sibling ../../datalog-dafsa checkout (linkDatalog, below).  The C
+    // headers are still vendored so the C driver log_probe_live.c keeps
+    // compiling unchanged.
 
     // log_port / probe_port: the Zig ports as objects exposing zig_log_* /
     // zig_probe_* to the C live driver (the supervise_extern.o pattern, now
@@ -193,61 +193,89 @@ pub fn build(b: *std.Build) void {
 
     // ─── UNIT 5: fx-activate (build-time activation) ──────────────────────
     //
-    // fxstore_c: the vendored C store core (packageset/derivation/closure/
-    // store/build — the same source lists as tests/build_activate.sh) plus
-    // the dhall-c 13, as ONE static lib.  Its dl_* externs (store.c) are
-    // resolved against libdatalog.so at the activate/init final links.  The
-    // activate port drives it through the extern block in activate.zig;
-    // config.c is NOT in the lib (config.zig replaces it — the log.zig
-    // "C engine stays C" pattern).
-    const fxc_mod = b.createModule(.{
+    // The fxstore store core is NO LONGER compiled from the vendored C (the
+    // 5-file store core + the dhall-c interpreter): it is the fxstore Zig
+    // port in the sibling ../fxstore checkout (fxstore/zig/src/{packageset,
+    // derivation,closure,store,build}.zig), imported as modules and composed
+    // exactly as fxstore's own build.zig composes them — ONE shared
+    // packageset module so every unit sees a single Package type.  The dl_*
+    // externs those modules declare resolve against libdatalog.so at the
+    // activate/init final links.  config.zig and the fxstore modules share
+    // the SAME dhall Zig core (dhall_mod), so the single `dhall_arena`
+    // global replaces the C's renamed `c_dhall_arena` (the C dhall core is
+    // gone).
+    const packageset_mod = b.createModule(.{
+        .root_source_file = b.path("../../fxstore/zig/src/packageset.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    });
-    fxc_mod.addIncludePath(b.path("../vendor/fxstore"));
-    fxc_mod.addIncludePath(b.path("../vendor/datalog-dafsa/src"));
-    fxc_mod.addIncludePath(b.path("../vendor/datalog-dafsa/vendor"));
-    fxc_mod.addIncludePath(b.path("../vendor/dafsa"));
-    fxc_mod.addIncludePath(b.path("../vendor/dhall-c/src"));
-    fxc_mod.addCSourceFiles(.{
-        .root = b.path(".."),
-        .files = &.{
-            "vendor/fxstore/packageset.c",
-            "vendor/fxstore/derivation.c",
-            "vendor/fxstore/closure.c",
-            "vendor/fxstore/store.c",
-            "vendor/fxstore/build.c",
-            "vendor/dhall-c/src/arena.c",
-            "vendor/dhall-c/src/lexer.c",
-            "vendor/dhall-c/src/parser.c",
-            "vendor/dhall-c/src/ast.c",
-            "vendor/dhall-c/src/normalize.c",
-            "vendor/dhall-c/src/typecheck.c",
-            "vendor/dhall-c/src/builtins.c",
-            "vendor/dhall-c/src/serialize.c",
-            "vendor/dhall-c/src/import.c",
-            "vendor/dhall-c/src/bignum.c",
-            "vendor/dhall-c/src/sha256.c",
-            "vendor/dhall-c/src/ssrf.c",
-            "vendor/dhall-c/src/http.c",
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
         },
-        // gnu11 (POSIX decls) + the store.c stage3-path default.
-        // -Ddhall_arena=c_dhall_arena: config.zig's dhall Zig core exports a
-        // C-ABI global `dhall_arena` (dhall-c zig arena.zig:48) — rename the C
-        // core's global so the two dhall cores (Zig for config, C for
-        // packageset) link side-by-side without colliding.
-        .flags = &.{ "-std=gnu11", "-O2", "-fno-stack-check", "-DFXSTORE_STAGE3_PATH=\"/fx/store/share/stage3\"", "-Ddhall_arena=c_dhall_arena" },
     });
-    const fxstore_c = b.addLibrary(.{
-        .linkage = .static,
-        .name = "fxstore_c",
-        .root_module = fxc_mod,
+    const derivation_mod = b.createModule(.{
+        .root_source_file = b.path("../../fxstore/zig/src/derivation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    const closure_mod = b.createModule(.{
+        .root_source_file = b.path("../../fxstore/zig/src/closure.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    // closure unit tests open LIVE dbs (the dedicated-test-module pattern).
+    linkDatalog(b, closure_mod);
+    const build_mod = b.createModule(.{
+        .root_source_file = b.path("../../fxstore/zig/src/build.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+        },
+    });
+    const store_mod = b.createModule(.{
+        .root_source_file = b.path("../../fxstore/zig/src/store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "packageset", .module = packageset_mod },
+            .{ .name = "derivation", .module = derivation_mod },
+            .{ .name = "closure", .module = closure_mod },
+            .{ .name = "build", .module = build_mod },
+        },
+    });
+    linkDatalog(b, store_mod);
+
+    // fxstore: the facade re-exporting the surface activate.zig + init.zig
+    // use, with one consistent DlDb opaque type across the port.
+    const fxstore_mod = b.createModule(.{
+        .root_source_file = b.path("src/fxstore.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dhall", .module = dhall_mod },
+            .{ .name = "packageset", .module = packageset_mod },
+            .{ .name = "derivation", .module = derivation_mod },
+            .{ .name = "closure", .module = closure_mod },
+            .{ .name = "store", .module = store_mod },
+        },
     });
 
-    // activate: the port CLI (activate_diff.sh execs it against the C oracle
-    // built from UNMODIFIED src/fx-activate.c + src/config.c); its test
-    // module runs the extern-struct round-trip through the real C loader.
+    // activate: the port CLI (activate_diff.sh execs it and compares the
+    // output against pinned goldens captured from the C oracle's verified
+    // behavior).  Its test module round-trips a real package-set load.
     const activate_mod = b.createModule(.{
         .root_source_file = b.path("src/activate.zig"),
         .target = target,
@@ -255,18 +283,19 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "config", .module = config_mod },
+            .{ .name = "fxstore", .module = fxstore_mod },
         },
     });
-    activate_mod.linkLibrary(fxstore_c);
     linkDatalog(b, activate_mod);
     const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
     b.installArtifact(activate_exe);
 
     // ─── UNIT 6: fx-init (PID1/supervisor) ───────────────────────────────
     //
-    // init: the port CLI (init_diff.sh execs it against the C oracle built
-    // from UNMODIFIED src/fx-init.c + its C twins), importing the ported
-    // log/probe/reloc/supervise modules and linking fxstore_c + libdatalog.so.
+    // init: the port CLI (init_diff.sh execs it and compares against pinned
+    // goldens captured from the C oracle's verified behavior), importing the
+    // ported log/probe/reloc/supervise modules and the fxstore Zig facade
+    // (which pulls the store core) + libdatalog.so.
     const init_mod = b.createModule(.{
         .root_source_file = b.path("src/init.zig"),
         .target = target,
@@ -277,9 +306,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "probe", .module = probe_mod },
             .{ .name = "reloc", .module = reloc_mod },
             .{ .name = "supervise", .module = supervise_mod },
+            .{ .name = "fxstore", .module = fxstore_mod },
         },
     });
-    init_mod.linkLibrary(fxstore_c);
     linkDatalog(b, init_mod);
     const init_exe = b.addExecutable(.{ .name = "fx-init", .root_module = init_mod });
     b.installArtifact(init_exe);

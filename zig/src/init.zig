@@ -21,6 +21,7 @@ const log_mod = @import("log");
 const probe_mod = @import("probe");
 const reloc_mod = @import("reloc");
 const sup = @import("supervise");
+const fx = @import("fxstore");
 
 const gpa_alloc = std.heap.c_allocator;
 
@@ -130,7 +131,6 @@ var g_boot_failed: c_int = 0;
 
 pub const dl_db = opaque {};
 pub const dl_iter = opaque {};
-pub const FxStore = opaque {};
 
 const dl_tuple_cb = *const fn (cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
 
@@ -154,11 +154,52 @@ extern fn dl_query_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, cb
 extern fn dl_query_bound_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, leading: [*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 extern fn dl_snapshot_versions(db: *const dl_db, out: [*]u32, cap: usize) c_long;
 
-extern fn fx_store_open(root: [*:0]const u8, err: ?[*]u8, errcap: usize) ?*FxStore;
-extern fn fx_store_close(s: ?*FxStore) void;
-extern fn fx_store_db(s: *FxStore) *dl_db;
-extern fn fx_store_current_version(s: *const FxStore, out: *u32, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_store_rollback(s: *FxStore, version: u32, hard: c_int, err: ?[*]u8, errcap: usize) c_int;
+// The fxstore Zig port's store core (store.zig): fx_store_open/close/db/
+// current_version/rollback.  Its db handle is closure.zig's DlDb opaque type;
+// cast at the boundary (both are plain opaque pointers over libdatalog.so).
+var g_io: std.Io = undefined;
+
+fn fx_store_open_wrap(root: [*:0]const u8, err: ?[*]u8, errcap: usize) ?*fx.Store {
+    var e = fx.store.ErrBuf{};
+    const s = fx.fx_store_open(g_io, std.mem.span(root), &e) catch {
+        copyErr(&e, err, errcap);
+        return null;
+    };
+    return s;
+}
+
+fn fx_store_current_version_wrap(s: *const fx.Store, out: *u32, err: ?[*]u8, errcap: usize) c_int {
+    var e = fx.store.ErrBuf{};
+    fx.fx_store_current_version(g_io, s, out, &e) catch {
+        copyErr(&e, err, errcap);
+        return -1;
+    };
+    return 0;
+}
+
+fn fx_store_rollback_wrap(s: *fx.Store, version: u32, hard: bool, err: ?[*]u8, errcap: usize) c_int {
+    var e = fx.store.ErrBuf{};
+    fx.fx_store_rollback(s, version, hard, &e) catch {
+        copyErr(&e, err, errcap);
+        return -1;
+    };
+    return 0;
+}
+
+/// store.zig's db handle (closure.zig's DlDb opaque) cast to this file's
+/// dl_db opaque type — both are plain opaque pointers over libdatalog.so.
+fn store_db(s: *fx.Store) *dl_db {
+    return @ptrCast(fx.fx_store_db(s).?);
+}
+
+/// Copy a port module's ErrBuf message into the C-style (err, errcap) buffer.
+fn copyErr(eb: anytype, err: ?[*]u8, errcap: usize) void {
+    const m = eb.slice();
+    if (err == null or errcap == 0) return;
+    const n = @min(m.len, errcap - 1);
+    @memcpy(err.?[0..n], m[0..n]);
+    err.?[n] = 0;
+}
 
 // ─── libc externs (std.posix gaps; the supervise.zig/probe.zig pattern) ──
 
@@ -520,10 +561,10 @@ fn bootlog_newest_ok_below(v: u32, out: *u32) c_int {
 
 fn version_exists(v: u32) c_int {
     var err: [1024]u8 = undefined;
-    const s = fx_store_open(g_store, &err, err.len) orelse return 0;
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse return 0;
     var vers: [256]u32 = undefined;
-    const n = dl_snapshot_versions(fx_store_db(s), &vers, vers.len);
-    fx_store_close(s);
+    const n = dl_snapshot_versions(store_db(s), &vers, vers.len);
+    fx.fx_store_close(s);
     if (n <= 0) return 0;
     var i: c_long = 0;
     while (i < n and i < 256) : (i += 1) {
@@ -754,11 +795,11 @@ fn grace_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
 
 fn read_store_facts(version: u32) c_int {
     var err: [1024]u8 = undefined;
-    const s = fx_store_open(g_store, &err, err.len) orelse {
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
         errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
         return -1;
     };
-    const db = fx_store_db(s);
+    const db = store_db(s);
 
     var i: c_int = 0;
     while (i < g_nsvc) : (i += 1) {
@@ -774,13 +815,13 @@ fn read_store_facts(version: u32) c_int {
     var gp = GenPick{};
     _ = dl_query_version(db, version, "generation", gen_pick_cb, &gp);
     if (gp.found == 0) {
-        fx_store_close(s);
+        fx.fx_store_close(s);
         return -1;
     }
     const bf = dl_intern_str_of(db, gp.bf);
     const dh = dl_intern_str_of(db, gp.dh);
     if (bf == null or dh == null) {
-        fx_store_close(s);
+        fx.fx_store_close(s);
         return -1;
     }
     _ = snfmt(&g_buildfile, "{s}/{s}", .{ span(g_store), span(bf.?) });
@@ -845,7 +886,7 @@ fn read_store_facts(version: u32) c_int {
         cfree(ac.args);
     }
 
-    fx_store_close(s);
+    fx.fx_store_close(s);
     return 0;
 }
 
@@ -952,18 +993,18 @@ fn restore_m4_facts(db: *dl_db, vok: u32, err: ?[*]u8, errcap: usize) c_int {
 
 fn decide_boot_version() u32 {
     var err: [1024]u8 = undefined;
-    const s = fx_store_open(g_store, &err, err.len) orelse {
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
         errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
         return 0;
     };
     var v: u32 = 0;
-    if (fx_store_current_version(s, &v, &err, err.len) != 0) {
+    if (fx_store_current_version_wrap(s, &v, &err, err.len) != 0) {
         errf("fx-init: no current version: {s}\n", .{span(@ptrCast(&err))});
-        fx_store_close(s);
+        fx.fx_store_close(s);
         return 0;
     }
     g_current_version = v;
-    fx_store_close(s);
+    fx.fx_store_close(s);
 
     var lv: u32 = 0;
     var lstatus: [64]u8 = [_]u8{0} ** 64;
@@ -974,16 +1015,16 @@ fn decide_boot_version() u32 {
         if (bootlog_newest_ok_below(g_current_version, &vok) != 0 and version_exists(vok) != 0) {
             errf("fx-init: stale {s} for v{d}; rolling forward to v{d}\n", .{ span(@ptrCast(&lstatus)), g_current_version, vok });
             var e2: [1024]u8 = undefined;
-            if (fx_store_open(g_store, &e2, e2.len)) |rs| {
-                const restored: c_int = @intFromBool(restore_m4_facts(fx_store_db(rs), vok, &e2, e2.len) == 0);
-                const rb: c_int = if (restored != 0) fx_store_rollback(rs, vok, 0, &e2, e2.len) else -1;
-                _ = fx_store_current_version(rs, &g_current_version, &e2, e2.len);
+            if (fx_store_open_wrap(g_store, &e2, e2.len)) |rs| {
+                const restored: c_int = @intFromBool(restore_m4_facts(store_db(rs), vok, &e2, e2.len) == 0);
+                const rb: c_int = if (restored != 0) fx_store_rollback_wrap(rs, vok, false, &e2, e2.len) else -1;
+                _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
                 if (rb == 0) {
                     log_line("fx-init", "info", "rolled forward to known-good generation");
                 } else {
                     errf("fx-init: roll-forward failed (m4-restore={d}): {s}\n", .{ restored, span(@ptrCast(&e2)) });
                 }
-                fx_store_close(rs);
+                fx.fx_store_close(rs);
             }
             return g_current_version;
         }
@@ -1553,12 +1594,12 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 return;
             }
             var e2: [1024]u8 = undefined;
-            const s = fx_store_open(g_store, &e2, e2.len) orelse {
+            const s = fx_store_open_wrap(g_store, &e2, e2.len) orelse {
                 resp_err(o, "store open after activate");
                 return;
             };
-            _ = fx_store_current_version(s, &g_current_version, &e2, e2.len);
-            fx_store_close(s);
+            _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
+            fx.fx_store_close(s);
             _ = read_store_facts(g_current_version);
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
@@ -1572,19 +1613,19 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
         } else {
             const v: u32 = @truncate(strtoul(arg, null, 10));
             var e2: [1024]u8 = undefined;
-            const s = fx_store_open(g_store, &e2, e2.len) orelse {
+            const s = fx_store_open_wrap(g_store, &e2, e2.len) orelse {
                 resp_err(o, "store open");
                 return;
             };
-            if (restore_m4_facts(fx_store_db(s), v, &e2, e2.len) != 0 or
-                fx_store_rollback(s, v, 0, &e2, e2.len) != 0)
+            if (restore_m4_facts(store_db(s), v, &e2, e2.len) != 0 or
+                fx_store_rollback_wrap(s, v, false, &e2, e2.len) != 0)
             {
-                fx_store_close(s);
+                fx.fx_store_close(s);
                 resp_err(o, @ptrCast(&e2));
                 return;
             }
-            _ = fx_store_current_version(s, &g_current_version, &e2, e2.len);
-            fx_store_close(s);
+            _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
+            fx.fx_store_close(s);
             _ = read_store_facts(g_current_version);
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
@@ -1890,6 +1931,7 @@ fn usage(o: *FILE) void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    g_io = init.io;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {

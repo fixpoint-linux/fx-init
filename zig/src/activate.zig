@@ -1,8 +1,9 @@
 // activate.zig — faithful Zig port of src/fx-activate.c (U-B, unit 5): the
 // build-time activation CLI.  Evaluates config.dhall + package-set.dhall,
-// computes the closure through the VENDORED C core (packageset/derivation/
-// closure/store — the `fxstore_c` static lib in build.zig, the log.zig FFI
-// pattern), then renders + publishes the per-generation buildfile and facts.
+// computes the closure through the fxstore ZIG port (packageset/derivation/
+// closure/store in the sibling ../fxstore checkout, re-exported via the
+// fxstore.zig facade — the C store core is no longer linked), then renders +
+// publishes the per-generation buildfile and facts.
 //
 // Mirrored 1:1 section-for-section (CLI/usage -> Buf + dhall escaper ->
 // PathEntry/compute_paths -> render_passwd/group -> on_full/base_name ->
@@ -16,10 +17,11 @@
 // Fidelity notes:
 //   - the C threads `char err[ERR_CAP=4096]` through every call; the Zig side
 //     uses config.ErrBuf (2048 cap, unit-1 precedent) for its own fx_err-style
-//     messages and a plain [4096]u8 for the C callees' buffers — divergence
-//     only for >2047-byte config error strings (unreachable in the corpus).
-//   - config strings are Zig slices; every string crossing into C
-//     (dl_intern_str, fx_find_package, closure roots) is dupeZ'd.
+//     messages and a plain [4096]u8 for the store-core modules' error buffers
+//     (each module's ErrBuf is copied in via cerrCopy) — divergence only for
+//     >2047-byte error strings (unreachable in the corpus).
+//   - config strings are Zig slices; every string crossing into the dl_*
+//     engine ABI (dl_intern_str) is dupeZ'd.
 //   - the C's free-everything error unwinding is dropped (config.zig
 //     precedent): this is a process-lifetime CLI, exits make frees moot.
 //   - libc snprintf sites (renderers, path joins) go through snfmt/snfmtz,
@@ -27,6 +29,7 @@
 //     semantics, byte-identical output.
 const std = @import("std");
 const cfg_mod = @import("config");
+const fx = @import("fxstore");
 
 const FxConfig = cfg_mod.FxConfig;
 const FxService = cfg_mod.FxService;
@@ -35,93 +38,19 @@ const FxProbeKind = cfg_mod.FxProbeKind;
 const FxRestart = cfg_mod.FxRestart;
 const ErrBuf = cfg_mod.ErrBuf;
 
+// The fxstore Zig port's types (the vendored C store core, now Zig).
+const Package = fx.Package;
+const PackageSet = fx.PackageSet;
+const SrcKind = fx.SrcKind;
+const Store = fx.Store;
+const DlDb = fx.DlDb;
+const DlIter = fx.DlIter;
+
 // libc is linked; use the C malloc allocator (config.zig pattern — the
-// process-lifetime CLI allocator; C memory returned by the vendored core is
-// malloc'd too).
+// process-lifetime CLI allocator).
 const gpa_alloc = std.heap.c_allocator;
 
-// ─── vendored C API (vendor/fxstore + vendor/datalog-dafsa + dhall-c) ─────
-
-/// fxstore.h ActionKind (ABI: c_int; fields never read here, layout only).
-pub const ActionKind = enum(c_int) { shell, mkdir, rm, touch, move, symlink, chmod, echo, env, run };
-
-/// fxstore.h Action (fxstore.h:54-64) — EXACT field order is ABI.
-pub const Action = extern struct {
-    kind: ActionKind,
-    a: ?[*:0]u8,
-    b: ?[*:0]u8,
-    av: ?*?[*:0]u8,
-    nav: c_int,
-    next: ?*Action,
-};
-
-/// fxstore.h SrcKind.
-pub const SrcKind = enum(c_int) { path, fetch };
-
-/// fxstore.h Src (fxstore.h:85-90) — EXACT field order is ABI.
-pub const Src = extern struct {
-    kind: SrcKind,
-    path: ?[*:0]u8,
-    url: ?[*:0]u8,
-    hash: ?[*:0]u8,
-};
-
-/// fxstore.h Package (fxstore.h:93-107) — EXACT field order is ABI.
-pub const Package = extern struct {
-    name: ?[*:0]u8,
-    version: ?[*:0]u8,
-    src: Src,
-    deps: ?[*]?[*:0]u8,
-    ndeps: c_int,
-    excludes: ?[*]?[*:0]u8,
-    nexcludes: c_int,
-    target: ?[*:0]u8,
-    recipe: ?*Action,
-    next: ?*Package,
-};
-
-/// fxstore.h PackageSet.
-pub const PackageSet = extern struct {
-    head: ?*Package,
-    count: c_int,
-};
-
-pub const FxStore = opaque {};
-pub const dl_db = opaque {};
-pub const dl_iter = opaque {};
-
-extern fn fx_packageset_load(out: *PackageSet, path: [*:0]const u8, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_find_package(ps: *const PackageSet, name: [*:0]const u8) ?*Package;
-extern fn fx_packageset_free(ps: *PackageSet) void;
-extern fn fx_content_hash_dir(dir: [*:0]const u8, excludes: ?[*]const ?[*:0]const u8, nexcludes: c_int, hash_out: [*]u8, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_derivation_hash_ex(p: *const Package, src_hash: ?[*:0]const u8, dep_paths: ?[*]const ?[*:0]const u8, ndeps: c_int, hash_out: [*]u8, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_store_path_of(store_root: [*:0]const u8, hash: [*:0]const u8, name: [*:0]const u8, out: [*]u8, cap: usize) void;
-extern fn fx_store_open(root: [*:0]const u8, err: ?[*]u8, errcap: usize) ?*FxStore;
-extern fn fx_store_close(s: ?*FxStore) void;
-extern fn fx_store_db(s: *FxStore) *dl_db;
-extern fn fx_store_publish(s: *FxStore, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_store_current_version(s: *const FxStore, out: *u32, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_closure_compute(db: *dl_db, ps: *const PackageSet, roots: ?[*]const ?[*:0]const u8, nroots: c_int, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_closure_names(db: *dl_db, names_out: *?[*]?[*:0]u8, n_out: *c_int, err: ?[*]u8, errcap: usize) c_int;
-extern fn fx_topo_order(ps: *const PackageSet, names: ?[*]?[*:0]u8, n: c_int, order_out: *?[*]?*Package, n_out: *c_int, err: ?[*]u8, errcap: usize) c_int;
-// dl.h (log.zig:33-52 pattern).
-extern fn dl_declare_relation(db: *dl_db, name: [*:0]const u8, arity: u8) c_int;
-extern fn dl_txn_begin(db: *dl_db) c_int;
-extern fn dl_txn_add_fact(db: *dl_db, rel: [*:0]const u8, cols: [*]const u32, arity: u8) c_int;
-extern fn dl_txn_delete_fact(db: *dl_db, rel: [*:0]const u8, cols: [*]const u32, arity: u8) c_int;
-extern fn dl_txn_commit(db: *dl_db) c_int;
-extern fn dl_txn_rollback(db: *dl_db) c_int;
-extern fn dl_intern_str(db: *dl_db, str: ?[*:0]const u8) u32;
-extern fn dl_iter_open(db: *dl_db, rel: [*:0]const u8, leading: ?[*]const u32, k: u8) ?*dl_iter;
-extern fn dl_iter_arity(it: *const dl_iter) u8;
-extern fn dl_iter_next(it: *dl_iter, cols_out: [*]u32) c_int;
-extern fn dl_iter_close(it: ?*dl_iter) void;
-/// dhall.h:316 — resolved by the DHALLC sha256.c in the linked lib.
-extern fn sha256_hex(data: ?*const anyopaque, len: usize, out: [*]u8) void;
-
 // libc scratch (log.zig pattern).
-extern fn malloc(size: usize) ?[*]u8;
-extern fn free(ptr: ?*anyopaque) void;
 extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 extern "c" fn getpid() c_int;
 extern "c" fn time(t: ?*i64) i64;
@@ -298,9 +227,9 @@ pub const PathEntry = struct {
 };
 
 /// path_of: store path of a closure package by name (or null).
-fn pathOf(es: []const PathEntry, name: []const u8) ?[*:0]const u8 {
+fn pathOf(es: []const PathEntry, name: []const u8) ?[]const u8 {
     for (es) |*it| {
-        if (std.mem.eql(u8, std.mem.span(it.p.name.?), name)) return it.path.ptr;
+        if (std.mem.eql(u8, it.p.name, name)) return it.path;
     }
     return null;
 }
@@ -313,7 +242,7 @@ fn pathOf(es: []const PathEntry, name: []const u8) ?[*:0]const u8 {
 /// activation).
 fn entryOf(es: []const PathEntry, name: []const u8) ?*const PathEntry {
     for (es) |*it| {
-        if (std.mem.eql(u8, std.mem.span(it.p.name.?), name)) return it;
+        if (std.mem.eql(u8, it.p.name, name)) return it;
     }
     return null;
 }
@@ -321,17 +250,23 @@ fn entryOf(es: []const PathEntry, name: []const u8) ?*const PathEntry {
 /// store_path_of: find the store path of a closure package by name.
 fn storePathOf(es: []const PathEntry, name: []const u8) ?[]const u8 {
     for (es) |*it| {
-        if (std.mem.eql(u8, std.mem.span(it.p.name.?), name)) return it.path;
+        if (std.mem.eql(u8, it.p.name, name)) return it.path;
     }
     return null;
 }
 
-/// free the malloc'd closure-name array returned by fx_closure_names.
-fn freeNames(names: ?[*]?[*:0]u8, n: c_int) void {
-    const arr = names orelse return;
-    var i: usize = 0;
-    while (i < @as(usize, @intCast(n))) : (i += 1) free(arr[i]);
-    free(@ptrCast(arr));
+// the process-lifetime Io for the store core's filesystem ops
+// (fx_content_hash_dir / fx_store_*); main() sets it from init.io.
+var g_io: std.Io = undefined;
+
+/// Copy a port module's ErrBuf message into `cerr` and fail as the C callees
+/// did (the C fx_* fns wrote into the caller's `char err[PATH_MAX]`).
+fn cerrCopy(eb: anytype, cerr: *[PATH_MAX]u8) ComputeError {
+    const m = eb.slice();
+    const n = @min(m.len, cerr.len - 1);
+    @memcpy(cerr[0..n], m[0..n]);
+    cerr[n] = 0;
+    return error.CFailed;
 }
 
 pub const ComputeError = error{ CFailed, FxErr, OutOfMemory };
@@ -339,40 +274,35 @@ pub const ComputeError = error{ CFailed, FxErr, OutOfMemory };
 /// compute_paths — fx_closure_compute -> fx_closure_names -> fx_topo_order,
 /// then per package (topo, deps-first): content-hash the SRC_PATH tree, hash
 /// the derivation over the (already-computed) dep store paths, format the
-/// store path.  C callees report through `cerr` (error.CFailed); the port's
-/// own fx_err-style messages go through `e` (error.FxErr).
+/// store path.  Store-core failures report through `cerr` (error.CFailed);
+/// the port's own fx_err-style messages go through `e` (error.FxErr).
 pub fn computePaths(
     ps: *const PackageSet,
-    db: *dl_db,
-    roots: [*]const ?[*:0]const u8,
-    nroots: usize,
-    store_root: [*:0]const u8,
+    db: *DlDb,
+    roots: []const []const u8,
+    store_root: []const u8,
     cerr: *[PATH_MAX]u8,
     e: *ErrBuf,
 ) ComputeError![]PathEntry {
-    if (fx_closure_compute(db, ps, roots, @intCast(nroots), cerr, cerr.len) != 0) return error.CFailed;
-    var names: ?[*]?[*:0]u8 = null;
-    var nn: c_int = 0;
-    if (fx_closure_names(db, &names, &nn, cerr, cerr.len) != 0) return error.CFailed;
-    var ord: ?[*]?*Package = null;
-    var no: c_int = 0;
-    if (fx_topo_order(ps, names, nn, &ord, &no, cerr, cerr.len) != 0) {
-        freeNames(names, nn);
-        return error.CFailed;
-    }
-    freeNames(names, nn);
-    const n_no: usize = @intCast(no);
+    var ce = fx.closure.ErrBuf{};
+    fx.fx_closure_compute(db, ps, roots, &ce) catch return cerrCopy(&ce, cerr);
+    const names = fx.fx_closure_names(db, &ce) catch return cerrCopy(&ce, cerr);
+    defer fx.free_names(names);
+    const ord = fx.fx_topo_order(ps, names, &ce) catch return cerrCopy(&ce, cerr);
+    defer fx.free_order(ord);
+    const n_no = ord.len;
 
     const es = gpa_alloc.alloc(PathEntry, @max(n_no, 1)) catch {
         eSet(e, "out of memory", .{});
         return error.FxErr;
     };
     const entries = es[0..n_no];
+    var de = fx.derivation.ErrBuf{};
     for (0..n_no) |i| {
-        const p: *Package = ord.?[i].?;
-        var dep_paths: ?[]?[*:0]const u8 = null;
-        if (p.ndeps > 0) {
-            const dp = gpa_alloc.alloc(?[*:0]const u8, @intCast(p.ndeps)) catch {
+        const p: *Package = ord[i];
+        var dep_paths: ?[][]const u8 = null;
+        if (p.deps.len > 0) {
+            const dp = gpa_alloc.alloc([]const u8, p.deps.len) catch {
                 eSet(e, "out of memory", .{});
                 return error.FxErr;
             };
@@ -381,50 +311,39 @@ pub fn computePaths(
         var ok = true;
         if (dep_paths) |dp| {
             for (0..dp.len) |j| {
-                const dep_name = std.mem.span(p.deps.?[j].?);
-                dp[j] = pathOf(entries[0..i], dep_name);
-                if (dp[j] == null) {
-                    eSet(e, "internal: dep '{s}' of '{s}' unresolved", .{ dep_name, std.mem.span(p.name.?) });
+                const dep_name = p.deps[j];
+                dp[j] = pathOf(entries[0..i], dep_name) orelse {
+                    eSet(e, "internal: dep '{s}' of '{s}' unresolved", .{ dep_name, p.name });
                     ok = false;
                     break;
-                }
+                };
             }
         }
         if (ok) {
             var h: [65]u8 = undefined;
-            var src_hash: ?[*:0]const u8 = null;
+            var src_hash: ?[]const u8 = null;
             if (p.src.kind == .path) {
                 var sh: [65]u8 = undefined;
-                if (fx_content_hash_dir(p.src.path.?, p.excludes, p.nexcludes, &sh, cerr, cerr.len) != 0)
-                    return error.CFailed;
-                const own = gpa_alloc.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&sh)))) catch {
+                fx.fx_content_hash_dir(g_io, p.src.path.?, p.excludes, &sh, &de) catch return cerrCopy(&de, cerr);
+                const own = gpa_alloc.dupe(u8, sh[0..64]) catch {
                     eSet(e, "out of memory", .{});
                     return error.FxErr;
                 };
                 entries[i].src_hash = own;
-                src_hash = own.ptr;
+                src_hash = own;
             }
-            if (fx_derivation_hash_ex(
-                p,
-                src_hash,
-                if (dep_paths) |dp| dp.ptr else null,
-                p.ndeps,
-                &h,
-                cerr,
-                cerr.len,
-            ) == 0) {
-                var path: [PATH_MAX]u8 = undefined;
-                fx_store_path_of(store_root, @ptrCast(&h), p.name.?, &path, path.len);
-                entries[i].p = p;
-                entries[i].hash = gpa_alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&h)))) catch {
-                    eSet(e, "out of memory", .{});
-                    return error.FxErr;
-                };
-                entries[i].path = gpa_alloc.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&path)))) catch {
-                    eSet(e, "out of memory", .{});
-                    return error.FxErr;
-                };
-            } else return error.CFailed;
+            fx.fx_derivation_hash_ex(p, src_hash, dep_paths orelse &.{}, &h, &de) catch return cerrCopy(&de, cerr);
+            var path: [PATH_MAX]u8 = undefined;
+            const path_s = fx.fx_store_path_of(store_root, h[0..64], p.name, &path);
+            entries[i].p = p;
+            entries[i].hash = gpa_alloc.dupe(u8, h[0..64]) catch {
+                eSet(e, "out of memory", .{});
+                return error.FxErr;
+            };
+            entries[i].path = gpa_alloc.dupeZ(u8, path_s) catch {
+                eSet(e, "out of memory", .{});
+                return error.FxErr;
+            };
         } else return error.FxErr;
     }
     return entries;
@@ -611,7 +530,7 @@ pub fn serializeGeneration(
     const paths = gpa_alloc.alloc([]const u8, es.len) catch return error.OutOfMemory;
     for (es, 0..) |*it, i| {
         // store-relative form `<hash>-<name>` (see comment above)
-        paths[i] = std.fmt.allocPrint(gpa_alloc, "{s}-{s}", .{ it.hash, std.mem.span(it.p.name.?) }) catch return error.OutOfMemory;
+        paths[i] = std.fmt.allocPrint(gpa_alloc, "{s}-{s}", .{ it.hash, it.p.name }) catch return error.OutOfMemory;
     }
     var pi: usize = 1;
     while (pi < es.len) : (pi += 1) {
@@ -678,42 +597,42 @@ pub fn writeFileP(path: []const u8, content: []const u8, e: *ErrBuf) error{Write
 
 // ─── fact writer (declare + txn_add_fact) ─────────────────────────────────
 
-fn declare(db: *dl_db, rel: [*:0]const u8, arity: u8, e: *ErrBuf) error{DeclareFailed}!void {
+fn declare(db: *DlDb, rel: [*:0]const u8, arity: u8, e: *ErrBuf) error{DeclareFailed}!void {
     // dl_declare_relation is idempotent: re-declaring with the same arity is
     // a no-op returning 0; an arity mismatch or arity>8 returns -1.
-    if (dl_declare_relation(db, rel, arity) != 0) {
+    if (fx.dl_declare_relation(db, rel, arity) != 0) {
         eSet(e, "declare {s}/{d} failed", .{ std.mem.span(rel), arity });
         return error.DeclareFailed;
     }
 }
 
-fn addFact(db: *dl_db, rel: [*:0]const u8, cols: []const u32) void {
+fn addFact(db: *DlDb, rel: [*:0]const u8, cols: []const u32) void {
     // we intern strings outside and pass sym ids; ints as raw u32
-    _ = dl_txn_add_fact(db, rel, cols.ptr, @intCast(cols.len));
+    _ = fx.dl_txn_add_fact(db, rel, cols.ptr, @intCast(cols.len));
 }
 
 /// delete-all existing tuples of `rel` (collect then delete — safe vs the
 /// live DAFSA cursor).  Must be called inside an open txn.  Used to make each
 /// activation's snapshot self-consistent (only THIS activation's generation/
 /// svc facts) instead of accumulating stale services across activations.
-fn clearRel(db: *dl_db, rel: [*:0]const u8, arity: u8) error{ ClearFailed, OutOfMemory }!void {
-    const it = dl_iter_open(db, rel, null, 0) orelse return;
-    if (dl_iter_arity(it) != arity) {
-        dl_iter_close(it);
+fn clearRel(db: *DlDb, rel: [*:0]const u8, arity: u8) error{ ClearFailed, OutOfMemory }!void {
+    const it = fx.dl_iter_open(db, rel, null, 0) orelse return;
+    if (fx.dl_iter_arity(it) != arity) {
+        fx.dl_iter_close(it);
         return error.ClearFailed;
     }
     var all: std.ArrayList(u32) = .empty;
     defer all.deinit(gpa_alloc);
     var row: [8]u32 = undefined;
-    while (dl_iter_next(it, &row) == 1) {
+    while (fx.dl_iter_next(it, &row) == 1) {
         all.appendSlice(gpa_alloc, row[0..arity]) catch {
-            dl_iter_close(it);
+            fx.dl_iter_close(it);
             return error.OutOfMemory;
         };
     }
-    dl_iter_close(it);
+    fx.dl_iter_close(it);
     for (0..all.items.len / arity) |i| {
-        _ = dl_txn_delete_fact(db, rel, all.items[i * arity ..][0..arity].ptr, arity);
+        _ = fx.dl_txn_delete_fact(db, rel, all.items[i * arity ..][0..arity].ptr, arity);
     }
 }
 
@@ -742,6 +661,7 @@ fn isDir(dir: std.Io.Dir, io: std.Io, path: []const u8) bool {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const io = init.io;
+    g_io = io;
 
     var stdout_buf: [16384]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
@@ -807,10 +727,11 @@ pub fn main(init: std.process.Init) !void {
     const cerr_z: [*:0]const u8 = @ptrCast(&cerr);
 
     var ps: PackageSet = undefined;
-    if (fx_packageset_load(&ps, pkgset_path_s.ptr, &cerr, cerr.len) != 0) {
-        std.debug.print("fx-activate: {s}\n", .{std.mem.span(cerr_z)});
+    var pe = fx.packageset.ErrBuf{};
+    fx.fx_packageset_load(&ps, pkgset_path_s, &pe) catch {
+        std.debug.print("fx-activate: {s}\n", .{pe.slice()});
         std.process.exit(1);
-    }
+    };
 
     var cfg: FxConfig = undefined;
     cfg_mod.fx_config_load(&cfg, config_path_s, &e) catch {
@@ -818,18 +739,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const s = fx_store_open(store_root_s.ptr, &cerr, cerr.len) orelse {
-        std.debug.print("fx-activate: {s}\n", .{std.mem.span(cerr_z)});
+    var se = fx.store.ErrBuf{};
+    const s = fx.fx_store_open(g_io, store_root_s, &se) catch {
+        std.debug.print("fx-activate: {s}\n", .{se.slice()});
         std.process.exit(1);
     };
-    const db = fx_store_db(s);
+    const db = fx.fx_store_db(s).?;
 
-    // closure roots = config.packages (dupeZ: config strings are slices)
-    const roots = gpa_alloc.alloc(?[*:0]const u8, cfg.packages.len + 1) catch @panic("out of memory");
-    for (cfg.packages, 0..) |p, ri| roots[ri] = dupeZ(p);
-    roots[cfg.packages.len] = null;
-
-    const entries = computePaths(&ps, db, roots.ptr, cfg.packages.len, store_root_s.ptr, &cerr, &e) catch |err| switch (err) {
+    // closure roots = config.packages
+    const entries = computePaths(&ps, db, cfg.packages, store_root_s, &cerr, &e) catch |err| switch (err) {
         error.CFailed => {
             std.debug.print("fx-activate: {s}\n", .{std.mem.span(cerr_z)});
             std.process.exit(1);
@@ -848,7 +766,7 @@ pub fn main(init: std.process.Init) !void {
     for (entries) |*it| {
         if (!isDir(std.Io.Dir.cwd(), io, it.path)) {
             miss.str("  ") catch {};
-            miss.str(std.mem.span(it.p.name.?)) catch {};
+            miss.str(it.p.name) catch {};
             miss.ch('\n') catch {};
             missing += 1;
         }
@@ -917,8 +835,8 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("fx-activate: service '{s}' pkg '{s}' not in the closure\n", .{ sv.name, pkg });
             std.process.exit(1);
         };
-        const pk = fx_find_package(&ps, dupeZ(pkg)).?;
-        bin[bi] = .{ .name = baseName(std.mem.span(pk.target.?)), .storedir = p };
+        const pk = ps.find(pkg).?;
+        bin[bi] = .{ .name = baseName(pk.target), .storedir = p };
         bi += 1;
     }
     std.sort.insertion(BinLink, bin, {}, binLinkLt);
@@ -931,7 +849,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     var genhash: [65]u8 = undefined;
-    sha256_hex(ser.slice().ptr, ser.len, &genhash);
+    fx.sha256_hex(ser.slice(), &genhash);
     const genhash_s: []const u8 = genhash[0..64];
 
     var gen_dir_buf: [PATH_MAX]u8 = undefined;
@@ -1017,7 +935,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    if (dl_txn_begin(db) != 0) {
+    if (fx.dl_txn_begin(db) != 0) {
         std.debug.print("fx-activate: dl_txn_begin failed\n", .{});
         std.process.exit(1);
     }
@@ -1028,7 +946,7 @@ pub fn main(init: std.process.Init) !void {
     // fx-init would boot the union of all past service sets.
     for (decls) |d| clearRel(db, d.rel, d.arity) catch {
         std.debug.print("fx-activate: clear old facts failed\n", .{});
-        _ = dl_txn_rollback(db);
+        _ = fx.dl_txn_rollback(db);
         std.process.exit(1);
     };
 
@@ -1037,9 +955,9 @@ pub fn main(init: std.process.Init) !void {
     // against its --store at boot) — see the buildfile_rel / dhake_rel notes.
     {
         const cols = [4]u32{
-            dl_intern_str(db, genhash[0..64 :0]),
-            dl_intern_str(db, buildfile_rel),
-            dl_intern_str(db, dhake_rel),
+            fx.dl_intern_str(db, genhash[0..64 :0]),
+            fx.dl_intern_str(db, buildfile_rel),
+            fx.dl_intern_str(db, dhake_rel),
             now,
         };
         addFact(db, "generation", &cols);
@@ -1051,7 +969,7 @@ pub fn main(init: std.process.Init) !void {
     // standalone-repo structure.)  The /bin/fx-activate symlink is created by
     // dhake from the bin target.
     {
-        const cols = [1]u32{dl_intern_str(db, "/bin/fx-activate")};
+        const cols = [1]u32{fx.dl_intern_str(db, "/bin/fx-activate")};
         addFact(db, "tool_fxstore", &cols);
     }
     // boot_grace(ms) a1 — persist the config's bootGraceMs so fx-init honors
@@ -1065,7 +983,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // svc facts
     for (cfg.services) |*sv| {
-        const sn = dl_intern_str(db, dupeZ(sv.name));
+        const sn = fx.dl_intern_str(db, dupeZ(sv.name));
         var onf_buf: [256]u8 = undefined;
         const onf = onFull(sv.on_kind, sv.on_arg, &onf_buf);
         const rs: [*:0]const u8 = switch (sv.restart) {
@@ -1073,14 +991,14 @@ pub fn main(init: std.process.Init) !void {
             .on_failure => "on-failure",
             .never => "never",
         };
-        const cols = [3]u32{ sn, dl_intern_str(db, onf), dl_intern_str(db, rs) };
+        const cols = [3]u32{ sn, fx.dl_intern_str(db, onf), fx.dl_intern_str(db, rs) };
         addFact(db, "svc", &cols);
         // svc_backoff(name, backoff_ms)
         const cbk = [2]u32{ sn, sv.backoff_ms };
         addFact(db, "svc_backoff", &cbk);
         // svc_argv(name, idx, arg)
         for (sv.argv, 0..) |arg, a| {
-            const c = [3]u32{ sn, @intCast(a), dl_intern_str(db, dupeZ(arg)) };
+            const c = [3]u32{ sn, @intCast(a), fx.dl_intern_str(db, dupeZ(arg)) };
             addFact(db, "svc_argv", &c);
         }
         // resolve svc_bin: argv[0] -> store path / target-basename, or
@@ -1091,15 +1009,15 @@ pub fn main(init: std.process.Init) !void {
         // fx-init passes through unchanged).
         var resolved_buf: [PATH_MAX]u8 = undefined;
         const resolved = if (sv.pkg) |pkg| blk: {
-            const pe = entryOf(entries, pkg).?;
-            const pk = fx_find_package(&ps, dupeZ(pkg)).?;
-            break :blk snfmtz(&resolved_buf, "{s}-{s}/{s}", .{ pe.hash, pkg, baseName(std.mem.span(pk.target.?)) });
+            const pentry = entryOf(entries, pkg).?;
+            const pk = ps.find(pkg).?;
+            break :blk snfmtz(&resolved_buf, "{s}-{s}/{s}", .{ pentry.hash, pkg, baseName(pk.target) });
         } else snfmtz(&resolved_buf, "{s}", .{sv.argv[0]});
-        const cb = [2]u32{ sn, dl_intern_str(db, resolved) };
+        const cb = [2]u32{ sn, fx.dl_intern_str(db, resolved) };
         addFact(db, "svc_bin", &cb);
         // svc_env(name, key, value)
         for (sv.env) |kv| {
-            const ce = [3]u32{ sn, dl_intern_str(db, dupeZ(kv.key)), dl_intern_str(db, dupeZ(kv.value)) };
+            const ce = [3]u32{ sn, fx.dl_intern_str(db, dupeZ(kv.key)), fx.dl_intern_str(db, dupeZ(kv.value)) };
             addFact(db, "svc_env", &ce);
         }
         // svc_probe(name, kind, arg)
@@ -1110,7 +1028,7 @@ pub fn main(init: std.process.Init) !void {
                 .file => "file",
                 .none => unreachable,
             };
-            const cp = [3]u32{ sn, dl_intern_str(db, pk), dl_intern_str(db, dupeZ(sv.probe_arg orelse "")) };
+            const cp = [3]u32{ sn, fx.dl_intern_str(db, pk), fx.dl_intern_str(db, dupeZ(sv.probe_arg orelse "")) };
             addFact(db, "svc_probe", &cp);
         }
     }
@@ -1122,25 +1040,26 @@ pub fn main(init: std.process.Init) !void {
             if (gi > 0) gcsv.ch(',') catch {};
             gcsv.str(g) catch {};
         }
-        const cols = [3]u32{ dl_intern_str(db, dupeZ(u.name)), u.uid, dl_intern_str(db, dupeZ(gcsv.slice())) };
+        const cols = [3]u32{ fx.dl_intern_str(db, dupeZ(u.name)), u.uid, fx.dl_intern_str(db, dupeZ(gcsv.slice())) };
         addFact(db, "user", &cols);
     }
 
-    if (dl_txn_commit(db) != 0) {
+    if (fx.dl_txn_commit(db) != 0) {
         std.debug.print("fx-activate: dl_txn_commit failed\n", .{});
-        _ = dl_txn_rollback(db);
+        _ = fx.dl_txn_rollback(db);
         std.process.exit(1);
     }
 
-    if (fx_store_publish(s, &cerr, cerr.len) != 0) {
-        std.debug.print("fx-activate: publish: {s}\n", .{std.mem.span(cerr_z)});
+    var se2 = fx.store.ErrBuf{};
+    fx.fx_store_publish(s, &se2) catch {
+        std.debug.print("fx-activate: publish: {s}\n", .{se2.slice()});
         std.process.exit(1);
-    }
+    };
     var v: u32 = 0;
-    if (fx_store_current_version(s, &v, &cerr, cerr.len) != 0) {
-        std.debug.print("fx-activate: {s}\n", .{std.mem.span(cerr_z)});
+    fx.fx_store_current_version(g_io, s, &v, &se2) catch {
+        std.debug.print("fx-activate: {s}\n", .{se2.slice()});
         std.process.exit(1);
-    }
+    };
 
     out.print("activated {s} as version {d}; buildfile {s}\n", .{ genhash_s, v, buildfile_abs }) catch {};
     out.flush() catch {};
@@ -1150,10 +1069,9 @@ pub fn main(init: std.process.Init) !void {
 
 const testing = std.testing;
 
-// S2 gate: the extern structs must EXACTLY mirror fxstore.h:54-107 — load a
-// real package set through the vendored C loader and read every field back;
-// a slipped field order corrupts memory silently.
-test "extern-struct layout round-trip through the real C loader" {
+// Round-trip a real package-set through the Zig store core and read every
+// field back — the Package/PackageSet native-struct layout (packageset.zig).
+test "package-set load round-trip through the Zig store core" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -1179,38 +1097,36 @@ test "extern-struct layout round-trip through the real C loader" {
         \\        ] }
         \\  : PackageSet
     });
-    // tmpDir lives at <cwd>/.zig-cache/tmp/<sub_path>; the C loader takes a
+    // tmpDir lives at <cwd>/.zig-cache/tmp/<sub_path>; the loader takes a
     // filesystem path (realpath resolves it against the cwd).
     var ps_path_buf: [256]u8 = undefined;
     const ps_path = try std.fmt.bufPrint(&ps_path_buf, ".zig-cache/tmp/{s}/package-set.dhall", .{tmp.sub_path});
-    const ps_z = try testing.allocator.dupeZ(u8, ps_path);
-    defer testing.allocator.free(ps_z);
 
     var ps: PackageSet = undefined;
-    var err: [4096]u8 = undefined;
-    try testing.expectEqual(@as(c_int, 0), fx_packageset_load(&ps, ps_z.ptr, &err, err.len));
-    defer fx_packageset_free(&ps);
+    var pe = fx.packageset.ErrBuf{};
+    try fx.fx_packageset_load(&ps, ps_path, &pe);
+    defer ps.deinit();
 
-    try testing.expectEqual(@as(c_int, 2), ps.count);
+    try testing.expectEqual(@as(usize, 2), ps.count);
     const alpha = ps.head.?;
-    try testing.expectEqualStrings("alpha", std.mem.span(alpha.name.?));
-    try testing.expectEqualStrings("1.0", std.mem.span(alpha.version.?));
+    try testing.expectEqualStrings("alpha", alpha.name);
+    try testing.expectEqualStrings("1.0", alpha.version);
     try testing.expectEqual(SrcKind.path, alpha.src.kind);
     try testing.expect(alpha.src.path != null);
     // relative src paths canonicalize (realpath) against the package-set's dir
-    try testing.expect(std.mem.endsWith(u8, std.mem.span(alpha.src.path.?), "src/alpha"));
-    try testing.expectEqual(@as(c_int, 0), alpha.ndeps);
-    try testing.expectEqualStrings("alpha.bin", std.mem.span(alpha.target.?));
+    try testing.expect(std.mem.endsWith(u8, alpha.src.path.?, "src/alpha"));
+    try testing.expectEqual(@as(usize, 0), alpha.deps.len);
+    try testing.expectEqualStrings("alpha.bin", alpha.target);
 
     const beta = alpha.next.?;
-    try testing.expectEqualStrings("beta", std.mem.span(beta.name.?));
-    try testing.expectEqual(@as(c_int, 1), beta.ndeps);
-    try testing.expectEqualStrings("alpha", std.mem.span(beta.deps.?[0].?));
+    try testing.expectEqualStrings("beta", beta.name);
+    try testing.expectEqual(@as(usize, 1), beta.deps.len);
+    try testing.expectEqualStrings("alpha", beta.deps[0]);
     try testing.expectEqual(SrcKind.path, beta.src.kind);
-    try testing.expectEqualStrings("beta.bin", std.mem.span(beta.target.?));
+    try testing.expectEqualStrings("beta.bin", beta.target);
 
-    try testing.expect(fx_find_package(&ps, "beta") == beta);
-    try testing.expect(fx_find_package(&ps, "ghost") == null);
+    try testing.expect(ps.find("beta") == beta);
+    try testing.expect(ps.find("ghost") == null);
 }
 
 test "buf helpers: u32be/lpstr/dhallStr byte shapes" {
@@ -1233,36 +1149,17 @@ test "buf helpers: u32be/lpstr/dhallStr byte shapes" {
 }
 
 test "serialize_generation golden bytes" {
-    // extern-struct literal: string literals need an explicit many-pointer
-    // cast through [*:0]const u8 (no direct *const [N:0]u8 -> ?[*:0]u8).
-    const z = struct {
-        fn z(comptime s: anytype) [*:0]u8 {
-            return @as([*:0]u8, @constCast(s));
-        }
-    }.z;
     var pkg_aa = Package{
-        .name = z("aa"),
-        .version = null,
-        .src = .{ .kind = .path, .path = null, .url = null, .hash = null },
-        .deps = null,
-        .ndeps = 0,
-        .excludes = null,
-        .nexcludes = 0,
-        .target = null,
-        .recipe = null,
-        .next = null,
+        .name = "aa",
+        .version = "",
+        .src = .{ .kind = .path },
+        .target = "",
     };
     var pkg_bb = Package{
-        .name = z("bb"),
-        .version = null,
-        .src = .{ .kind = .fetch, .path = null, .url = null, .hash = null },
-        .deps = null,
-        .ndeps = 0,
-        .excludes = null,
-        .nexcludes = 0,
-        .target = null,
-        .recipe = null,
-        .next = null,
+        .name = "bb",
+        .version = "",
+        .src = .{ .kind = .fetch },
+        .target = "",
     };
     const entries = [_]PathEntry{
         .{ .p = &pkg_aa, .path = undefined, .hash = "11", .src_hash = null },
