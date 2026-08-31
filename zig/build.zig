@@ -290,6 +290,40 @@ pub fn build(b: *std.Build) void {
     const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
     b.installArtifact(activate_exe);
 
+    // activate_paths / activate_facts: the twin drivers activate_diff.sh uses
+    // to (a) pre-create the closure store dirs and (b) dump the store facts.
+    // Zig replacements for zig/activate_paths.c + zig/activate_facts.c (the C
+    // oracle twins, removed with the vendored C engine) — same byte output,
+    // importing the fxstore facade + libdatalog.so.
+    const paths_exe = b.addExecutable(.{
+        .name = "activate_paths",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/activate_paths.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "fxstore", .module = fxstore_mod },
+            },
+        }),
+    });
+    linkDatalog(b, paths_exe.root_module);
+    b.installArtifact(paths_exe);
+    const facts_exe = b.addExecutable(.{
+        .name = "activate_facts",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/activate_facts.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "fxstore", .module = fxstore_mod },
+            },
+        }),
+    });
+    linkDatalog(b, facts_exe.root_module);
+    b.installArtifact(facts_exe);
+
     // ─── UNIT 6: fx-init (PID1/supervisor) ───────────────────────────────
     //
     // init: the port CLI (init_diff.sh execs it and compares against pinned

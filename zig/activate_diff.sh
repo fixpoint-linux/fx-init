@@ -2,7 +2,8 @@
 # activate_diff.sh — unit-5 regression harness: the Zig port of fx-activate
 # (zig-out/bin/fx-activate) over every corpus case, compared against pinned
 # goldens (zig/golden/activate/): stdout, stderr, exit code, the store FACTS
-# (10 M4 relations + versions, dumped by zig/activate_facts.c), the
+# (10 M4 relations + versions, dumped by the Zig twin
+# zig/src/activate_facts.zig), the
 # generation hash, and the emitted generation dir (Dhakefile.dhall + etc/*,
 # as a normalized manifest).
 #
@@ -14,10 +15,13 @@
 # oracle's verified behavior.  `--pin` re-captures goldens from the Zig
 # side (NOT a C oracle rebuild — the C oracle is gone).
 #
-# Fully in-sandbox: needs only zig (no cosmocc, no fxstore binary).  The
-# harness pre-creates each closure store dir (via zig/activate_paths.c, the
-# compute_paths twin) with a dummy payload so it counts as BUILT —
-# fx-activate only stats dir-ness (fx-activate.c:545 in the C oracle era).
+# Fully in-sandbox: needs only zig (no cosmocc, no fxstore binary, no
+# vendored C).  The harness pre-creates each closure store dir (via the Zig
+# twin zig/src/activate_paths.zig, built by `zig build`) with a dummy payload
+# so it counts as BUILT — fx-activate only stats dir-ness (fx-activate.c:545
+# in the C-oracle era).  Both helpers are Zig replacements for the removed C
+# twins (zig/activate_paths.c + zig/activate_facts.c), importing the fxstore
+# Zig facade + the Zig-built libdatalog.so.
 #
 # One shared store path per case (fresh per run): the per-package derivation
 # hash embeds each dep's FULL store path (fxstore.h "each direct dep's FULL
@@ -36,36 +40,16 @@ cd "$(dirname "$0")/.."
 
 CORPUS=zig/corpus/activate
 ROOTS="dhake fx-init fxctl fx-activate fakesvc"
-OBJ=build-tmp/activate-obj
 GOLDEN=zig/golden/activate
 PIN=0
 [ "${1:-}" = "--pin" ] && PIN=1
 
-ENGINE="vendor/datalog-dafsa/src/intern.c vendor/datalog-dafsa/src/termstore.c vendor/datalog-dafsa/src/relation.c vendor/datalog-dafsa/src/vrelation.c vendor/datalog-dafsa/src/tupleset.c vendor/datalog-dafsa/src/parser.c vendor/datalog-dafsa/src/compiler.c vendor/datalog-dafsa/src/vm.c vendor/datalog-dafsa/src/snapshot.c vendor/datalog-dafsa/src/regexwalk.c vendor/datalog-dafsa/src/permindex.c vendor/datalog-dafsa/src/util.c vendor/datalog-dafsa/src/dl.c vendor/datalog-dafsa/src/iter.c vendor/datalog-dafsa/src/magic.c vendor/datalog-dafsa/src/topdown.c vendor/datalog-dafsa/src/analyze.c vendor/datalog-dafsa/src/schema.c vendor/datalog-dafsa/src/typecheck.c vendor/datalog-dafsa/src/json.c vendor/datalog-dafsa/src/txnwal.c vendor/datalog-dafsa/src/index.c"
-DAFSA="vendor/dafsa/dafsa.c vendor/dafsa/dafsa_state.c vendor/dafsa/dafsa_core.c vendor/dafsa/dafsa_persist.c vendor/dafsa/dafsa_view.c vendor/dafsa/dafsa_crc32.c vendor/dafsa/dafsa_wal.c vendor/dafsa/dafsa_build.c vendor/dafsa/dafsa_rank.c vendor/dafsa/dafsa_view_rank.c"
-FXSTORE="vendor/fxstore/packageset.c vendor/fxstore/derivation.c vendor/fxstore/closure.c vendor/fxstore/store.c vendor/fxstore/build.c"
-DHALLC="vendor/dhall-c/src/arena.c vendor/dhall-c/src/lexer.c vendor/dhall-c/src/parser.c vendor/dhall-c/src/ast.c vendor/dhall-c/src/normalize.c vendor/dhall-c/src/typecheck.c vendor/dhall-c/src/builtins.c vendor/dhall-c/src/serialize.c vendor/dhall-c/src/import.c vendor/dhall-c/src/bignum.c vendor/dhall-c/src/sha256.c vendor/dhall-c/src/ssrf.c vendor/dhall-c/src/http.c"
-INC="-I vendor/fxstore -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/dafsa -I vendor/dhall-c/src"
-DEF='-DFXSTORE_STAGE3_PATH="/fx/store/share/stage3"'
-
-echo "== building activate helpers (vendor C only: paths twin + facts dump) =="
-mkdir -p "$OBJ"
-# one static core archive, two consumers (paths twin, facts dump)
-for f in $FXSTORE $ENGINE $DAFSA $DHALLC; do
-    zig cc -std=gnu11 -O2 $DEF $INC -c "$f" -o "$OBJ/$(echo "$f" | tr / _).o"
-done
-ar rcs build-tmp/libfxcore.a "$OBJ"/*.o
-zig cc -std=gnu11 -O2 $DEF $INC -o zig/zig-out/activate_paths \
-    zig/activate_paths.c build-tmp/libfxcore.a
-zig cc -std=gnu11 -O2 $DEF $INC -o zig/zig-out/activate_facts \
-    zig/activate_facts.c build-tmp/libfxcore.a
-echo "helpers built"
 
 echo "== building Zig port =="
 ( cd zig && zig build -Doptimize=ReleaseSafe )
 ACT_Z=zig/zig-out/bin/fx-activate
-PATHS=zig/zig-out/activate_paths
-FACTS=zig/zig-out/activate_facts
+PATHS=zig/zig-out/bin/activate_paths
+FACTS=zig/zig-out/bin/activate_facts
 
 mkdir -p "$GOLDEN"
 
