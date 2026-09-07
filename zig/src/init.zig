@@ -243,6 +243,11 @@ extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+// execvp (not execv) for store binaries: modern cosmocc emits APEs without
+// a #!-shell preamble, so a raw execve fails ENOEXEC; execvp retries via
+// /bin/sh (the same fallback bwrap and POSIX shells apply).  The C oracle's
+// execv only worked because the era's cosmocc still emitted #!-polyglots.
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn time(t: ?*i64) i64;
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn bind(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -1113,7 +1118,7 @@ fn run_dhake() c_int {
         _ = std.c.dup2(outpipe[1], 2);
         _ = std.c.close(outpipe[1]);
         const av = [_:null]?[*:0]const u8{ "dhake.com", "-f", @ptrCast(&bootbf), "rootfs" };
-        _ = execv(@ptrCast(&g_dhake), &av);
+        _ = execvp(@ptrCast(&g_dhake), &av);
         _ = std.c.write(2, "fx-init: exec dhake failed\n", "fx-init: exec dhake failed\n".len);
         std.c._exit(127);
     }
@@ -1205,7 +1210,7 @@ fn start_service(sv: *Svc) void {
             _ = setenv(sv.env_k.?[@intCast(i)].?, sv.env_v.?[@intCast(i)].?, 1);
         }
         const av: [*:null]const ?[*:0]const u8 = @ptrCast(sv.argv.?);
-        _ = execv(sv.argv.?[0].?, av);
+        _ = execvp(sv.argv.?[0].?, av);
         _ = std.c.write(2, "fx-init: exec failed\n", "fx-init: exec failed\n".len);
         std.c._exit(127);
     }
@@ -1587,7 +1592,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             const pid = std.c.fork();
             if (pid == 0) {
                 const av = [_:null]?[*:0]const u8{ @ptrCast(&g_fxstore), "--store", g_store, "--config", arg };
-                _ = execv(@ptrCast(&g_fxstore), &av);
+                _ = execvp(@ptrCast(&g_fxstore), &av);
                 std.c._exit(127);
             }
             var rc: c_int = -1;
