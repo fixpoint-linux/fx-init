@@ -3,6 +3,11 @@
 --   ./vendor/dhake/dhake.com            # default target: all (build + test)
 --   ./vendor/dhake/dhake.com fx-init    # the Zig build (also fx-activate/fxctl/fakesvc)
 --   ./vendor/dhake/dhake.com test       # zig unit tests + the 7 diff harnesses
+--   ./vendor/dhake/dhake.com prov-e2e  # cross-repo provenance E2E (host-only:
+--                                       # bwrap + ../fxstore + cosmocc; like
+--                                       # tests/fxinit_boot.sh it cannot run
+--                                       # inside the rattan sandbox, so it is
+--                                       # NOT a `test` dep — run it on the host)
 --   ./vendor/dhake/dhake.com clean      # remove build outputs
 --
 -- The C oracles (src/fx-init.c, src/fx-activate.c, src/fxctl.c, src/config.c
@@ -140,6 +145,18 @@ in  { default = "all"
               { deps = [ "zig/init_diff.sh", "zig/src/init.zig" ]
               , phony = True
               , recipe = [ < Shell = "sh zig/init_diff.sh" > ]
+              }
+          }
+        , { mapKey = "prov-e2e"
+          , mapValue =
+              { deps =
+                  [ "tests/prov_e2e.sh"
+                  , "m3/package-set.dhall"
+                  , "m3/config-good.dhall"
+                  , "m3/config-bad-exit.dhall"
+                  ]
+              , phony = True
+              , recipe = [ < Shell = "sh tests/prov_e2e.sh" > ]
               }
           }
         , { mapKey = "test"

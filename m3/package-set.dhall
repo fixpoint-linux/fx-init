@@ -9,6 +9,12 @@
 --
 -- Usage:  cd fx-init/m3 && fxstore build --store /fx/store   (or any root)
 --
+-- The fx-init/fx-activate/fxctl packages build the ZIG PORT (the C oracles
+-- were removed once the ports were verified); their recipes run `zig build`,
+-- which reads THREE SIBLING CHECKOUTS (datalog-dafsa, dhall-c, fxstore) as
+-- ../..-relative paths — export FX_SIBLINGS=<dir containing them> and keep
+-- `zig` on PATH.  tests/prov_e2e.sh + tests/fxinit_boot.sh do both.
+--
 -- NOTE: src paths are RELATIVE to this file (.. = the fx-init repo root,
 -- ../vendor/<name> = a vendored submodule).  This repo vendors dafsa as a
 -- TOP-LEVEL submodule (vendor/dafsa/), not under vendor/datalog-dafsa/vendor/.
@@ -80,41 +86,57 @@ in  { packages =
                         > ] } }
       , { name = "fx-init", version = "0.1.0", src = < Path = ".." >,
           deps = [] : List Text,
-          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
+                        "zig/.zig-cache", "zig-out", ".git",
+                        "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fx-init",
                     recipe =
                       [ < Shell =
-                            "cp -a \"$FX_SRC\"/. . && cosmocc " ++ opt ++ " " ++ def
-                          ++ " " ++ inc ++ " -o fx-init src/fx-init.c src/fx_supervise.c src/fx_reloc.c "
-                          ++ "src/fx_probe.c src/fx_log.c vendor/fxstore/store.c "
-                          ++ "vendor/fxstore/closure.c vendor/fxstore/build.c "
-                          ++ "vendor/fxstore/packageset.c " ++ engine ++ " " ++ dafsa
+                            "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
+                          ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
+                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& cp zig-out/bin/fx-init ../fx-init"
                         > ] } }
       , { name = "fx-activate", version = "0.1.0", src = < Path = ".." >,
           deps = [] : List Text,
-          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
+                        "zig/.zig-cache", "zig-out", ".git",
+                        "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fx-activate",
                     recipe =
                       [ < Shell =
-                            "cp -a \"$FX_SRC\"/. . && cosmocc " ++ opt ++ " " ++ def
-                          ++ " " ++ inc ++ " -o fx-activate src/config.c src/fx-activate.c "
-                          ++ "vendor/fxstore/packageset.c vendor/fxstore/derivation.c "
-                          ++ "vendor/fxstore/closure.c vendor/fxstore/store.c "
-                          ++ "vendor/fxstore/build.c " ++ engine ++ " " ++ dafsa
-                          ++ " " ++ dhallc
+                            "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
+                          ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
+                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& cp zig-out/bin/fx-activate ../fx-activate"
                         > ] } }
       , { name = "fxctl", version = "0.1.0", src = < Path = ".." >,
           deps = [] : List Text,
-          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
+                        "zig/.zig-cache", "zig-out", ".git",
+                        "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fxctl",
                     recipe =
                       [ < Shell =
-                            "cp -a \"$FX_SRC\"/. . && cosmocc -std=c11 -O2 -g -Wall -Wextra "
-                          ++ "-I src -o fxctl src/fxctl.c"
+                            "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
+                          ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
+                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
+                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& cp zig-out/bin/fxctl ../fxctl"
                         > ] } }
       , { name = "fake-service", version = "0.1.0", src = < Path = ".." >,
           deps = [] : List Text,
-          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
+                        "zig/.zig-cache", "zig-out", ".git",
+                        "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fakesvc",
                     recipe =
                       [ < Shell =
@@ -123,7 +145,9 @@ in  { packages =
                         > ] } }
       , { name = "fake-service-daemon", version = "0.1.0", src = < Path = ".." >,
           deps = [] : List Text,
-          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist" ],
+          excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
+                        "zig/.zig-cache", "zig-out", ".git",
+                        "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fakesvc_daemon",
                     recipe =
                       [ < Shell =

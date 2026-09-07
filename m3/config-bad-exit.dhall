@@ -1,6 +1,9 @@
 -- m3/config-bad-exit.dhall — used by tests/fxinit_boot.sh: a service that exits 7.
 -- crasher = fakesvc exit 7, restart=always, so fx-init keeps restarting it
--- (backoff doubling) and the boot never reaches ok -> boot_status=failed.
+-- (backoff doubling) and the boot never reaches ok -> boot_status=failed
+-- (the SIGCHLD reaper marks the boot failed the moment a service exits
+-- during the grace window).  The grace is 8s so the exit lands inside it
+-- even when materialization + the APE sh-preamble exec path are slow.
 let Probe = < Tcp : Natural | Unix : Text | File : Text >
 let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
                 restart : Optional Text, backoffMs : Optional Natural,
@@ -17,5 +20,5 @@ in  { hostname = "fixbox"
             env = None (List { key : Text, value : Text }) }
         ]
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = Some 2000
+    , bootGraceMs = Some 8000
     }
