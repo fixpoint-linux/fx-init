@@ -153,6 +153,10 @@ extern fn dl_query_bound(db: *dl_db, goal_rel: [*:0]const u8, leading: [*]const 
 extern fn dl_query_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 extern fn dl_query_bound_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, leading: [*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 extern fn dl_snapshot_versions(db: *const dl_db, out: [*]u32, cap: usize) c_long;
+// The one LIVE-WAL reader (dl.h CAVEAT: once a snapshot is published,
+// dl_query/dl_iter/dl_count prefer the pinned snapshot; dl_prefix reads the
+// WAL-replayed in-memory state).  The U4 restore test asserts through it.
+extern fn dl_prefix(db: *const dl_db, rel: [*:0]const u8, leading: ?[*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 
 // The fxstore Zig port's store core (store.zig): fx_store_open/close/db/
 // current_version/rollback.  Its db handle is closure.zig's DlDb opaque type;
@@ -893,6 +897,11 @@ fn read_store_facts(version: u32) c_int {
 // ─── roll-forward M4 fact restore (fx-init.c:536-622) ─────────────────────
 
 const M4Rel = struct { name: [*:0]const u8, arity: u8 };
+// The activation relations the automated roll-forward re-carries from the
+// last-known-good snapshot: the 10 M4 facts plus the provenance pair
+// install(4)/provides(2) (activate.zig's decls table), so a roll-forward
+// does not leave fx what/verify blind.  Snapshots that predate the pair
+// read it absent-as-empty (dl_query_version cnt<0 -> clears only).
 const M4_RELS = [_]M4Rel{
     .{ .name = "generation", .arity = 4 },
     .{ .name = "svc", .arity = 3 },
@@ -904,6 +913,8 @@ const M4_RELS = [_]M4Rel{
     .{ .name = "user", .arity = 3 },
     .{ .name = "tool_fxstore", .arity = 1 },
     .{ .name = "boot_grace", .arity = 1 },
+    .{ .name = "install", .arity = 4 },
+    .{ .name = "provides", .arity = 2 },
 };
 
 const M4Bag = struct {
@@ -2170,4 +2181,216 @@ test "on_ready: up-graph + time gate (supervise fakes not needed)" {
     g_boot_start_ms = 0;
     @memcpy(svcs[1].on_arg[0.."1".len], "1");
     try std.testing.expectEqual(@as(c_int, 1), on_ready(&svcs[1]));
+}
+
+// ─── U4: roll-forward re-carries install/provides (restore_m4_facts) ──────
+
+/// Collect the LIVE (WAL-replayed) tuples of `rel` — via dl_prefix, the one
+/// reader that ignores the pinned snapshot (dl.h CAVEAT: dl_query/dl_iter
+/// prefer the newest published snapshot), collecting with the same m4_raw_cb
+/// restore_m4_facts feeds dl_query_version.
+const LiveRows = struct { rows: [16][8]u32 = undefined, n: usize = 0 };
+fn live_rows(db: *dl_db, rel: [*:0]const u8, ar: u8) !LiveRows {
+    var bag = M4Bag{};
+    const cnt = dl_prefix(db, rel, null, 0, m4_raw_cb, &bag);
+    defer cfree(bag.tuples);
+    if (cnt < 0) return error.PrefixFailed;
+    if (bag.n > 16) return error.TooManyRows;
+    var out = LiveRows{};
+    for (0..bag.n) |i| @memcpy(out.rows[i][0..ar], (bag.tuples.?)[i * ar ..][0..ar]);
+    out.n = bag.n;
+    return out;
+}
+
+fn sym_of(db: *dl_db, id: u32) []const u8 {
+    const p = dl_intern_str_of(db, id) orelse "";
+    return std.mem.span(p);
+}
+
+fn str_lt(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Set-equality on canonicalized lines (expectEqualSlices is unusable here:
+/// its element compare is std.meta.eql, which for slice elements compares
+/// POINTER identity, not bytes).
+fn expect_lines(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| try std.testing.expectEqualStrings(e, a);
+}
+
+/// Live rows canonicalized to one comparable line each (symbol columns
+/// decoded via dl_intern_str_of; RAW u32 columns formatted directly —
+/// install's mode in octal, boot_grace's ms in decimal), then sorted so the
+/// assert is a set-equality check.
+const Canon = struct {
+    db: *dl_db,
+    lines: [16][]const u8 = undefined,
+    bufs: [16][320]u8 = undefined,
+    n: usize = 0,
+
+    fn add(self: *Canon, comptime fmt: []const u8, args: anytype) void {
+        self.lines[self.n] = std.fmt.bufPrint(&self.bufs[self.n], fmt, args) catch unreachable;
+        self.n += 1;
+    }
+
+    fn install(self: *Canon, lr: LiveRows) void {
+        for (lr.rows[0..lr.n]) |r| self.add("{s}|{s}|0o{o}|{s}", .{
+            sym_of(self.db, r[0]), sym_of(self.db, r[1]), r[2], sym_of(self.db, r[3]),
+        });
+    }
+
+    fn provides(self: *Canon, lr: LiveRows) void {
+        for (lr.rows[0..lr.n]) |r| self.add("{s}|{s}", .{ sym_of(self.db, r[0]), sym_of(self.db, r[1]) });
+    }
+
+    fn boot_grace(self: *Canon, lr: LiveRows) void {
+        for (lr.rows[0..lr.n]) |r| self.add("{d}", .{r[0]});
+    }
+
+    fn sorted(self: *Canon) []const []const u8 {
+        std.mem.sort([]const u8, self.lines[0..self.n], {}, str_lt);
+        return self.lines[0..self.n];
+    }
+};
+
+test "restore_m4_facts re-carries install/provides on roll-forward (U4)" {
+    // fixture db (the provenance.zig test discipline: dl_open holds a
+    // process-lifetime writer lock, so the test owns its own temp dir and
+    // closes + deletes it before ending).
+    var seed: [4]u8 = undefined;
+    std.testing.io.random(&seed);
+    var dir_buf: [64:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/fx-init-m4-{x:0>8}", .{std.mem.readInt(u32, &seed, .little)});
+    const db: *dl_db = @ptrCast(fx.dl_open(dir.ptr) orelse return error.DlOpen);
+    defer {
+        fx.dl_close(@ptrCast(db));
+        std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    }
+
+    const ha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const hb = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const hz = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const gen = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    // fixture fact writers — U1's exact encoding (activate.zig:1051-1093):
+    // symbol columns via dl_intern_str, mode/ms RAW u32 columns.
+    const F = struct {
+        fn install(d: *dl_db, target: [:0]const u8, origin: [:0]const u8, mode: u32, gh: [:0]const u8) !void {
+            const cols = [4]u32{ dl_intern_str(d, target.ptr), dl_intern_str(d, origin.ptr), mode, dl_intern_str(d, gh.ptr) };
+            if (dl_txn_add_fact(d, "install", &cols, 4) != 0) return error.AddFact;
+        }
+        fn del_install(d: *dl_db, target: [:0]const u8, origin: [:0]const u8, mode: u32, gh: [:0]const u8) !void {
+            const cols = [4]u32{ dl_intern_str(d, target.ptr), dl_intern_str(d, origin.ptr), mode, dl_intern_str(d, gh.ptr) };
+            if (dl_txn_delete_fact(d, "install", &cols, 4) != 0) return error.DelFact;
+        }
+        fn provides(d: *dl_db, pkg: [:0]const u8, sdir: [:0]const u8) !void {
+            const cols = [2]u32{ dl_intern_str(d, pkg.ptr), dl_intern_str(d, sdir.ptr) };
+            if (dl_txn_add_fact(d, "provides", &cols, 2) != 0) return error.AddFact;
+        }
+        fn boot_grace(d: *dl_db, ms: u32) !void {
+            const cols = [1]u32{ms}; // RAW u32 (activate.zig:983-987)
+            if (dl_txn_add_fact(d, "boot_grace", &cols, 1) != 0) return error.AddFact;
+        }
+    };
+
+    // v1: a PRE-prov snapshot — old M4 rels only, install/provides not even
+    // declared (the old-snapshot shape every as-of reader must tolerate).
+    if (dl_declare_relation(db, "boot_grace", 1) != 0) return error.Declare;
+    if (dl_txn_begin(db) != 0) return error.Txn;
+    try F.boot_grace(db, 30000);
+    if (dl_txn_commit(db) != 0) return error.Txn;
+    if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
+
+    // v2: a good activation with the provenance pair (declare +
+    // clear-and-rewrite per rel — the U1 txn shape).
+    if (dl_declare_relation(db, "install", 4) != 0) return error.Declare;
+    if (dl_declare_relation(db, "provides", 2) != 0) return error.Declare;
+    if (dl_txn_begin(db) != 0) return error.Txn;
+    const old_grace = [1]u32{30000};
+    if (dl_txn_delete_fact(db, "boot_grace", &old_grace, 1) != 0) return error.DelFact;
+    try F.boot_grace(db, 15000);
+    try F.install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+    try F.install(db, "/etc/motd", gen ++ "-system-generation/etc/motd", 0o644, gen);
+    try F.provides(db, "hello", ha ++ "-hello");
+    try F.provides(db, "world", hb ++ "-world");
+    if (dl_txn_commit(db) != 0) return error.Txn;
+    if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
+
+    // v3: the FAILED activation — its own clear-and-rewrite leaves a
+    // divergent set under a different genhash (this is the corruption the
+    // roll-forward must undo; production always publishes the failed
+    // activation, which is what pins the db's snapshot for restore's
+    // clear enumeration).
+    if (dl_txn_begin(db) != 0) return error.Txn;
+    try F.del_install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+    try F.del_install(db, "/etc/motd", gen ++ "-system-generation/etc/motd", 0o644, gen);
+    try F.install(db, "/bin/evil", hz ++ "-evil", 0, hz);
+    try F.provides(db, "evil", hz ++ "-evil");
+    try F.boot_grace(db, 9999);
+    if (dl_txn_commit(db) != 0) return error.Txn;
+    if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
+
+    var vers: [8]u32 = undefined;
+    const nv = dl_snapshot_versions(db, &vers, 8);
+    try std.testing.expectEqual(@as(c_long, 3), nv);
+    const v1 = vers[0];
+    const v2 = vers[1];
+
+    var err: [1024]u8 = undefined;
+
+    // roll-forward to v2: the live WAL must re-converge on v2's exact set —
+    // install + provides restored (the U4 fix), evil cleared, hello back.
+    try std.testing.expectEqual(@as(c_int, 0), restore_m4_facts(db, v2, &err, err.len));
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install", 4));
+        const exp = [_][]const u8{
+            "/bin/hello|" ++ ha ++ "-hello|0o0|" ++ gen,
+            "/etc/motd|" ++ gen ++ "-system-generation/etc/motd|0o644|" ++ gen,
+        };
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides", 2));
+        const exp = [_][]const u8{
+            "hello|" ++ ha ++ "-hello",
+            "world|" ++ hb ++ "-world",
+        };
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        // the pre-existing M4 restore still works alongside the new rels
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace", 1));
+        const exp = [_][]const u8{"15000"};
+        try expect_lines(&exp, c.sorted());
+    }
+
+    // fx_store_rollback publishes the converged state after restore
+    // (store.zig:1123); the next roll-forward's clear enumeration pins on
+    // THAT snapshot, so mirror the publish before restoring again.
+    if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
+
+    // the OLD snapshot lacks install/provides entirely: restore must NOT
+    // error, and the absent rels read as EMPTY (cleared, nothing re-added)
+    // while v1's pre-prov M4 facts still come back.
+    try std.testing.expectEqual(@as(c_int, 0), restore_m4_facts(db, v1, &err, err.len));
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install", 4));
+        try std.testing.expectEqual(@as(usize, 0), c.sorted().len);
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides", 2));
+        try std.testing.expectEqual(@as(usize, 0), c.sorted().len);
+    }
+    {
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace", 1));
+        const exp = [_][]const u8{"30000"};
+        try expect_lines(&exp, c.sorted());
+    }
 }
