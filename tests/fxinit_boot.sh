@@ -17,8 +17,9 @@
 # Env:
 #   FXSTORE     path to a built fxstore binary  (REQUIRED)
 #   FX_ACTIVATE path to the fx-activate under test (REQUIRED)
-#   FX_INIT_BIN path to the fx-init under test (default: the store-built C
-#               fx-init; pass the Zig port or a custom C build to diff)
+#   FX_INIT_BIN path to the fx-init under test (default: the store-built
+#               ZIG fx-init — the m3 fixture builds this repo's zig port;
+#               pass a custom binary to override)
 #   BWRAP       path to bwrap (default: bwrap from PATH)
 set -u
 
@@ -36,17 +37,77 @@ command -v "$BWRAP" >/dev/null 2>&1 || skip "bwrap not found ($BWRAP) — cannot
 [ -x "$FXSTORE" ]     || skip "fxstore not executable: $FXSTORE"
 [ -x "$FX_ACTIVATE" ] || skip "fx-activate not executable: $FX_ACTIVATE"
 
+# the m3 fixture builds this repo's Zig port: the recipes run `zig build`
+# with the sibling checkouts modeled as fxstore deps (see
+# m3/package-set.dhall) — dhall-c/fxstore from the deps' store outputs, the
+# engine .so from the live sibling checkout (its own zig build is broken at
+# HEAD), so FX_SIBLINGS must be exported; zig must be on PATH; cosmocc
+# builds dhake + fake-service; fxstore's package-set evaluation needs the
+# palisade stage3.
+REPO_PARENT="$(cd "$(dirname "$0")/../.." && pwd)"
+export FX_SIBLINGS="${FX_SIBLINGS:-$REPO_PARENT}"
+command -v zig >/dev/null 2>&1 || skip "zig not found — the m3 fixture builds the Zig port"
+command -v cosmocc >/dev/null 2>&1 || skip "cosmocc not found — the m3 fixture builds dhake + fake-service"
+COSMOBIN="$(dirname "$(command -v cosmocc)")"
+FXSTORE_STAGE3="${FXSTORE_STAGE3:-}"
+if [ -z "$FXSTORE_STAGE3" ]; then
+    FXSTORE_DIR="$(cd "$(dirname "$FXSTORE")" && pwd)"
+    FXSTORE_STAGE3="$FXSTORE_DIR/../../vendor/palisade/bin/stage3"
+fi
+[ -x "$FXSTORE_STAGE3" ] || skip "palisade stage3 not executable: $FXSTORE_STAGE3 (build it in the fxstore repo, or set FXSTORE_STAGE3)"
+
+# libdatalog.so dir the Zig binaries need at runtime (the fxstore RUNPATH is
+# the authoritative location; bound at the same absolute path inside the boot
+# chroot so the loader resolves it).  Same fallback as prov_e2e.sh.
+if command -v readelf >/dev/null 2>&1; then
+    DLIBDIR=$(readelf -d "$FXSTORE" | sed -n 's/.*Library runpath: \[\(.*\)\].*/\1/p' | head -1)
+fi
+[ -n "${DLIBDIR:-}" ] || DLIBDIR="$(cd "$(dirname "$0")/../.." && pwd)/datalog-dafsa/zig-out/lib"
+[ -f "$DLIBDIR/libdatalog.so" ] || fail "libdatalog.so not found at $DLIBDIR (fxstore RUNPATH)"
+
 cd "$(dirname "$0")/.." || fail "cannot cd to repo root"
 REPO="$PWD"
 
-WORK="$(mktemp -d -t fxinitboot.XXXXXX)" || fail "mktemp"
+# Scratch: the fixture build copies the repo per package and the zig builds
+# write caches (~2-3G peak) — same relocation policy as prov_e2e.sh.
+SCRATCH="${TMPDIR:-/tmp}"
+FSTYPE=$(stat -f -c %T "$SCRATCH" 2>/dev/null || echo unknown)
+AVAIL_KB=$(df -Pk "$SCRATCH" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ "$FSTYPE" = "tmpfs" ] && [ -n "${AVAIL_KB:-}" ] && [ "$AVAIL_KB" -lt 3000000 ]; then
+    SCRATCH="${XDG_CACHE_HOME:-$HOME/.cache}/fxinit-boot"
+    mkdir -p "$SCRATCH" || fail "cannot create scratch dir $SCRATCH"
+    echo "fxinit-boot: NOTE: ${TMPDIR:-/tmp} is a small tmpfs (<3G free) — scratch moved to"
+    echo "fxinit-boot: NOTE: $SCRATCH (the fixture build needs ~2-3G)"
+fi
+rm -rf "$SCRATCH"/fxinitboot.?????? 2>/dev/null   # stale killed-run leftovers
+WORK="$(mktemp -d "$SCRATCH/fxinitboot.XXXXXX")" || fail "mktemp in $SCRATCH"
 trap 'rm -rf "$WORK"' EXIT
 STORE="$WORK/store"
 ROOT="$WORK/root"
 mkdir -p "$STORE" "$ROOT/run/fx"
 
 echo "=== fxinit-boot: building closure into $STORE ==="
-( cd "$REPO/m3" && "$FXSTORE" build --store "$STORE" ) || fail "fxstore build failed"
+# Merged-usr hosts (/bin a symlink): fxstore's hermetic bwrap cannot
+# --ro-bind /bin, so hide bwrap from its startup probe and take fxstore's
+# sanctioned LOUD NON-HERMETIC fallback (same deliberate detour as
+# prov_e2e.sh — the build sandbox is not what this harness exercises).
+BIN_LINK=$( (readlink /bin 2>/dev/null || echo /bin) )
+if [ "$BIN_LINK" = "/bin" ]; then
+    ( cd "$REPO/m3" && FXSTORE_STAGE3="$FXSTORE_STAGE3" "$FXSTORE" build --store "$STORE" ) \
+        || fail "fxstore build failed"
+else
+    echo "fxinit-boot: NOTE: merged-usr host (/bin -> $BIN_LINK): fixture build runs via"
+    echo "fxinit-boot: NOTE: fxstore's LOUD NON-HERMETIC fallback (PATH hides bwrap from its probe)"
+    PPATH="$WORK/path"
+    mkdir -p "$PPATH"
+    for t in sh cp ln rm mv cat mkdir file zig; do
+        ln -sf "$(command -v "$t")" "$PPATH/$t" 2>/dev/null || \
+            fail "merged-usr fallback needs '$t' on PATH"
+    done
+    ( cd "$REPO/m3" && FXSTORE_STAGE3="$FXSTORE_STAGE3" \
+        PATH="$COSMOBIN:$PPATH" "$FXSTORE" build --store "$STORE" ) \
+        || fail "fxstore build (non-hermetic) failed"
+fi
 
 # locate the built fx-init + fxctl APEs in the store (content-addressed dirs).
 # FX_INIT_BIN (optional) overrides the fx-init under test with an arbitrary
@@ -75,7 +136,7 @@ FXCTL_BIN=$(ls "$STORE"/*-fxctl/fxctl 2>/dev/null | head -1)
 # $ROOT/run/fx is bound into the bwrap at /run/fx; the unix socket inode is
 # reachable through the bind, so no second namespace is needed.
 fxctl() {
-    FX_RUN="$ROOT/run/fx" "$FXCTL_BIN" "$@"
+    FX_RUN="$ROOT/run/fx" LD_LIBRARY_PATH="$DLIBDIR" "$FXCTL_BIN" "$@"
 }
 
 activate() {
@@ -83,7 +144,7 @@ activate() {
     # (src Paths resolve relative to the package-set FILE's dir) + the config by
     # absolute path; echoes "activated <genhash> as version <v>".
     cfg="$1"
-    out=$( "$FX_ACTIVATE" --store "$STORE" \
+    out=$( LD_LIBRARY_PATH="$DLIBDIR" "$FX_ACTIVATE" --store "$STORE" \
         --package-set "$REPO/m3/package-set.dhall" \
         --config "$cfg" 2>&1 ) || fail "activate $cfg failed: $out"
     echo "$out"
@@ -93,19 +154,23 @@ boot_run() {
     # start fx-init in a bwrap chroot in the background.  Caller polls fxctl.
     rm -rf "$ROOT/etc" "$ROOT/bin" "$ROOT/run/fx"/* 2>/dev/null
     mkdir -p "$ROOT/etc" "$ROOT/bin" "$ROOT/run/fx" "$ROOT/tmp"
-    # The org binaries are cosmocc APEs whose shell-polyglot path needs /bin/sh
-    # (+ its libs) at exec; bind host /bin/sh and /usr /lib /lib64 read-only so
-    # fx-init/dhake/fakesvc can run, while / =$ROOT keeps /etc /bin /run /tmp as
-    # writable materialization targets.
+    # The store-built fx-init is the Zig port: it needs libdatalog.so, whose
+    # RUNPATH is useless inside the chroot — bind the libdatalog dir at its
+    # real host path and force it via LD_LIBRARY_PATH (prov_e2e.sh precedent).
+    # /bin/sh + /usr /lib /lib64 keep the cosmocc APE binaries (dhake,
+    # fakesvc) runnable, while / =$ROOT keeps /etc /bin /run /tmp as writable
+    # materialization targets.
     "$BWRAP" \
         --bind "$ROOT" / \
         --bind "$STORE" /fx/store \
+        --ro-bind "$DLIBDIR" "$DLIBDIR" \
         --ro-bind /bin/sh /bin/sh \
         --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
         --dev /dev \
         --proc /proc \
         --ro-bind /sys /sys \
         --clearenv --setenv FX_INIT_FORCE 1 --setenv PATH /bin:/usr/bin \
+        --setenv LD_LIBRARY_PATH "$DLIBDIR" \
         -- "$FXINIT_CHROOT" --store /fx/store --run-dir /run/fx \
         >"$WORK/boot.out" 2>&1 &
     BPID=$!

@@ -11,9 +11,28 @@
 --
 -- The fx-init/fx-activate/fxctl packages build the ZIG PORT (the C oracles
 -- were removed once the ports were verified); their recipes run `zig build`,
--- which reads THREE SIBLING CHECKOUTS (datalog-dafsa, dhall-c, fxstore) as
--- ../..-relative paths — export FX_SIBLINGS=<dir containing them> and keep
--- `zig` on PATH.  tests/prov_e2e.sh + tests/fxinit_boot.sh do both.
+-- which reads THREE SIBLING CHECKOUTS (datalog-dafsa, dhall-c, fxstore).
+-- The siblings are modeled as DEPS (datalog-dafsa, dhall-c, fxstore packages
+-- below): each dep's store path derives from its clean-tree hash, dep store
+-- paths feed the dependent's derivation hash, and the recipe points the build
+-- at the deps' content-addressed store outputs via FX_SIB_* (see
+-- zig/build.zig `sib`) — so a different sibling revision yields a different
+-- store path AND the fixture compiles exactly the hashed sibling content.
+-- Keep `zig` on PATH and export FX_SIBLINGS=<dir containing the siblings>
+-- (the engine .so input — see the datalog-dafsa note below).
+-- tests/prov_e2e.sh + tests/fxinit_boot.sh arrange both.
+--
+-- HERMETICITY NOTE: the dhall-c/fxstore roots are the deps' store outputs
+-- (readable under fxstore's Landlock sandbox spec: store r, workdir rwcx)
+-- and every recipe WRITE stays inside the workdir — the old
+-- `ln -sfn ... ../../<name>` symlinks outside the workdir are gone.  Two
+-- residuals remain: (1) the engine .so is read from
+-- $FX_SIBLINGS/datalog-dafsa/zig-out/lib, which the hermetic sandbox does
+-- NOT grant (see the datalog-dafsa note below), and (2) fxstore's startup
+-- probe itself: on merged-usr hosts (/bin a symlink) its hermetic bwrap
+-- cannot --ro-bind /bin and the fixture build runs via fxstore's sanctioned
+-- LOUD non-hermetic fallback (prov_e2e.sh deliberately triggers it).  Both
+-- belong to the fxstore / datalog-dafsa repos, not this one.
 --
 -- NOTE: src paths are RELATIVE to this file (.. = the fx-init repo root,
 -- ../vendor/<name> = a vendored submodule).  This repo vendors dafsa as a
@@ -74,7 +93,47 @@ let dhallc =
       ++ "vendor/dhall-c/src/http.c"
 
 in  { packages =
-      [ { name = "dhake", version = "0.1.0", src = < Path = "../vendor/dhake" >,
+      [ -- ── sibling deps (see header): store paths content-address the
+        -- sibling checkouts so the fx-init/* derivations hash their inputs.
+        -- Recipe copies the subtrees the build reads; the derivation hash
+        -- still walks the WHOLE clean src tree (minus excludes), and the
+        -- excludes list only non-inputs (caches, node_modules, docs,
+        -- vendored trees this build never reads).
+        --
+        -- datalog-dafsa CANNOT build its libdatalog.so in-recipe: the
+        -- engine's own `zig build` is broken at its HEAD (@cImport of
+        -- dafsa_internal.h, removed by its 5c7b8cc) and fxstore's clean
+        -- walk auto-excludes *.so from src anyway.  The dependents link
+        -- the sibling's PREBUILT zig-out/lib/libdatalog.so via
+        -- FX_SIB_DATALOG_LIB (an env input, like today); this dep's store
+        -- path still content-addresses the sibling SOURCES, so a sibling
+        -- revision shifts every dependent's store path.  Closing the last
+        -- gap (building the .so in-recipe) needs the sibling repo's build
+        -- fixed — out of scope here.
+        { name = "datalog-dafsa", version = "0.1.0", src = < Path = "../../datalog-dafsa" >,
+          deps = [] : List Text,
+          excludes = [ "node_modules", "elm-stuff", "models", "dl-test-db", "dl-embed",
+                        "design", "dlp", "docs", "dist",
+                        "vendor/mfe-framework", "vendor/ggml", "vendor/dhake",
+                        "vendor/yyjson", "vendor/@mfe", "vendor/design", "vendor/http_client",
+                        "zig-out", "zig/zig-out", "zig/.zig-cache", "zig/.zig-global" ],
+          build = { target = "zig/src/dl.zig",
+                    recipe = [ < Shell = "cp -a \"$FX_SRC\"/zig ." > ] } }
+      , { name = "dhall-c", version = "0.1.0", src = < Path = "../../dhall-c" >,
+          deps = [] : List Text,
+          excludes = [ "node_modules", "elm-stuff", "vendor", "docs", "dist",
+                        "zig-out", "zig/zig-out", "zig/.zig-cache", "zig/.zig-global" ],
+          build = { target = "zig/src/dhall_mod.zig",
+                    recipe = [ < Shell = "cp -a \"$FX_SRC\"/zig ." > ] } }
+      , { name = "fxstore", version = "0.1.0", src = < Path = "../../fxstore" >,
+          deps = [] : List Text,
+          excludes = [ "node_modules", "elm-stuff", "vendor", "mfe-framework", "design",
+                        "dhake", "shell", "dist",
+                        "zig-out", "zig/zig-out", "zig/.zig-cache", "zig/.zig-global" ],
+          build = { target = "zig/src/store.zig",
+                    recipe = [ < Shell = "cp -a \"$FX_SRC\"/zig ." > ] } }
+      -- ── this repo's own packages ──
+      , { name = "dhake", version = "0.1.0", src = < Path = "../vendor/dhake" >,
           deps = [] : List Text,
           excludes = [ "dist", "mfe-framework", "node_modules", "elm-stuff" ],
           build = { target = "dhake.com",
@@ -85,51 +144,51 @@ in  { packages =
                           ++ "src/dhake.c " ++ dhallc
                         > ] } }
       , { name = "fx-init", version = "0.1.0", src = < Path = ".." >,
-          deps = [] : List Text,
+          deps = [ "datalog-dafsa", "dhall-c", "fxstore" ],
           excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
-                        "zig/.zig-cache", "zig-out", ".git",
+                        "zig/.zig-cache", "zig/zig-out", "zig/.zig-global", "zig-out", ".git",
                         "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fx-init",
                     recipe =
                       [ < Shell =
                             "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
                           ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
-                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& FX_SIB_DHALL_C=\"$FX_DEP_DHALL_C\" "
+                          ++ "FX_SIB_FXSTORE=\"$FX_DEP_FXSTORE\" "
+                          ++ "FX_SIB_DATALOG_LIB=\"$FX_SIBLINGS/datalog-dafsa/zig-out/lib\" "
+                          ++ "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
                           ++ "&& cp zig-out/bin/fx-init ../fx-init"
                         > ] } }
       , { name = "fx-activate", version = "0.1.0", src = < Path = ".." >,
-          deps = [] : List Text,
+          deps = [ "datalog-dafsa", "dhall-c", "fxstore" ],
           excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
-                        "zig/.zig-cache", "zig-out", ".git",
+                        "zig/.zig-cache", "zig/zig-out", "zig/.zig-global", "zig-out", ".git",
                         "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fx-activate",
                     recipe =
                       [ < Shell =
                             "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
                           ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
-                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& FX_SIB_DHALL_C=\"$FX_DEP_DHALL_C\" "
+                          ++ "FX_SIB_FXSTORE=\"$FX_DEP_FXSTORE\" "
+                          ++ "FX_SIB_DATALOG_LIB=\"$FX_SIBLINGS/datalog-dafsa/zig-out/lib\" "
+                          ++ "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
                           ++ "&& cp zig-out/bin/fx-activate ../fx-activate"
                         > ] } }
       , { name = "fxctl", version = "0.1.0", src = < Path = ".." >,
-          deps = [] : List Text,
+          deps = [ "datalog-dafsa", "dhall-c", "fxstore" ],
           excludes = [ "build-tmp", "mfe-framework", "node_modules", "elm-stuff", "dist",
-                        "zig/.zig-cache", "zig-out", ".git",
+                        "zig/.zig-cache", "zig/zig-out", "zig/.zig-global", "zig-out", ".git",
                         "vendor/mfe-framework", "vendor/dhake" ],
           build = { target = "fxctl",
                     recipe =
                       [ < Shell =
                             "cp -a \"$FX_SRC\"/. . && cd zig && [ -n \"$FX_SIBLINGS\" ] "
                           ++ "|| { echo m3: FX_SIBLINGS missing; exit 1; } "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/datalog-dafsa\" ../../datalog-dafsa "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/dhall-c\" ../../dhall-c "
-                          ++ "&& ln -sfn \"$FX_SIBLINGS/fxstore\" ../../fxstore "
-                          ++ "&& ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
+                          ++ "&& FX_SIB_DHALL_C=\"$FX_DEP_DHALL_C\" "
+                          ++ "FX_SIB_FXSTORE=\"$FX_DEP_FXSTORE\" "
+                          ++ "FX_SIB_DATALOG_LIB=\"$FX_SIBLINGS/datalog-dafsa/zig-out/lib\" "
+                          ++ "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global zig build "
                           ++ "&& cp zig-out/bin/fxctl ../fxctl"
                         > ] } }
       , { name = "fake-service", version = "0.1.0", src = < Path = ".." >,

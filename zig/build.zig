@@ -6,12 +6,27 @@
 // canonical one lives in the sibling checkout ../../dhall-c.
 const std = @import("std");
 
+/// A sibling-checkout path used as a module root: `rel` (../../<name>/...)
+/// relative to this build root in a dev checkout, overridable via the
+/// FX_SIB_<NAME> env var (an absolute path) so the m3 fixture recipes can
+/// point the build at the sibling's content-addressed STORE output
+/// ($FX_DEP_<NAME>, exported by fxstore for each dep) — the fixture then
+/// compiles exactly the sibling content its derivation hash records, and
+/// never reads or writes outside the build workdir.
+fn sib(b: *std.Build, comptime env: []const u8, comptime rel: []const u8) std.Build.LazyPath {
+    if (b.graph.environ_map.get(env)) |p| {
+        if (p.len > 0) return .{ .cwd_relative = p };
+    }
+    return b.path(rel);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const dhall_mod = b.createModule(.{
-        .root_source_file = b.path("../../dhall-c/zig/src/dhall_mod.zig"),
+        .root_source_file = sib(b, "FX_SIB_DHALL_C", "../../dhall-c")
+            .join(b.allocator, "zig/src/dhall_mod.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -205,7 +220,8 @@ pub fn build(b: *std.Build) void {
     // global replaces the C's renamed `c_dhall_arena` (the C dhall core is
     // gone).
     const packageset_mod = b.createModule(.{
-        .root_source_file = b.path("../../fxstore/zig/src/packageset.zig"),
+        .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
+            .join(b.allocator, "zig/src/packageset.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -214,7 +230,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const derivation_mod = b.createModule(.{
-        .root_source_file = b.path("../../fxstore/zig/src/derivation.zig"),
+        .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
+            .join(b.allocator, "zig/src/derivation.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -224,7 +241,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const closure_mod = b.createModule(.{
-        .root_source_file = b.path("../../fxstore/zig/src/closure.zig"),
+        .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
+            .join(b.allocator, "zig/src/closure.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -235,7 +253,8 @@ pub fn build(b: *std.Build) void {
     // closure unit tests open LIVE dbs (the dedicated-test-module pattern).
     linkDatalog(b, closure_mod);
     const build_mod = b.createModule(.{
-        .root_source_file = b.path("../../fxstore/zig/src/build.zig"),
+        .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
+            .join(b.allocator, "zig/src/build.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -244,7 +263,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const store_mod = b.createModule(.{
-        .root_source_file = b.path("../../fxstore/zig/src/store.zig"),
+        .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
+            .join(b.allocator, "zig/src/store.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -382,6 +402,9 @@ pub fn build(b: *std.Build) void {
 // resolve it at runtime from any cwd.
 fn linkDatalog(b: *std.Build, m: *std.Build.Module) void {
     m.linkSystemLibrary("datalog", .{});
-    m.addLibraryPath(b.path("../../datalog-dafsa/zig-out/lib"));
-    m.addRPath(b.path("../../datalog-dafsa/zig-out/lib"));
+    // FX_SIB_DATALOG_LIB points at the dir HOLDING libdatalog.so (the m3
+    // fixture's dep store output), not the checkout root.
+    const dl_lib = sib(b, "FX_SIB_DATALOG_LIB", "../../datalog-dafsa/zig-out/lib");
+    m.addLibraryPath(dl_lib);
+    m.addRPath(dl_lib);
 }

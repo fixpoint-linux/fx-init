@@ -100,9 +100,11 @@ COSMOBIN="$(dirname "$(command -v cosmocc)")"
 
 [ -n "$FX_CORE_BIN" ] || FX_CORE_BIN="$SIB/fx-core/zig-out/bin"
 
-# The m3 fx-init/fx-activate/fxctl recipes run `zig build`, which reads the
-# live sibling checkouts (datalog-dafsa, dhall-c, fxstore) via ../../ paths
-# symlinked from FX_SIBLINGS — see m3/package-set.dhall.
+# The m3 fx-init/fx-activate/fxctl recipes run `zig build` with the sibling
+# checkouts modeled as fxstore DEPS (datalog-dafsa, dhall-c, fxstore
+# packages in m3/package-set.dhall) — dhall-c/fxstore come from the deps'
+# store outputs; the engine .so still comes from the live sibling checkout
+# (its own zig build is broken at HEAD), so FX_SIBLINGS is required.
 export FX_SIBLINGS="$SIB"
 command -v zig >/dev/null 2>&1 || skip "zig not found — the m3 fixture builds the Zig port"
 

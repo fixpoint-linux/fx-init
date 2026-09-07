@@ -39,6 +39,7 @@ const PATH_MAX: usize = 4096;
 const EEXIST: c_int = 17;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
+const ENOEXEC: c_int = 8;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
@@ -244,10 +245,37 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 // execvp (not execv) for store binaries: modern cosmocc emits APEs without
-// a #!-shell preamble, so a raw execve fails ENOEXEC; execvp retries via
-// /bin/sh (the same fallback bwrap and POSIX shells apply).  The C oracle's
-// execv only worked because the era's cosmocc still emitted #!-polyglots.
+// a #!-shell preamble, so a raw execve fails ENOEXEC.  glibc's execvp then
+// retries via /bin/sh itself; musl's does NOT (a slash path is a plain
+// execve), so exec_sh_retry does the sh retry EXPLICITLY and a
+// static/-musl build boots the same APEs instead of dying with 127.  The
+// C oracle's execv only worked because the era's cosmocc still emitted
+// #!-polyglots.
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+
+/// execvp with the explicit ENOEXEC -> /bin/sh retry (glibc's fallback,
+/// made portable).  Like glibc, the retry DROPS argv[0]: sh sees
+/// $0=<file>, $1..=argv[1..] (every call site's argv[0] is a cosmetic
+/// path/label, and env is untouched).  Fork-child context: libc externs +
+/// stack only.
+fn exec_sh_retry(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int {
+    const rc = execvp(file, argv);
+    if (std.c._errno().* != ENOEXEC) return rc;
+    var sh: [80]?[*:0]const u8 = undefined;
+    var n: usize = 0;
+    sh[n] = "/bin/sh";
+    n += 1;
+    sh[n] = file;
+    n += 1;
+    var i: usize = 1;
+    while (argv[i] != null) : (i += 1) {
+        if (n + 1 >= sh.len) return rc; // absurd argv: plain-execvp behavior
+        sh[n] = argv[i];
+        n += 1;
+    }
+    sh[n] = null;
+    return execv("/bin/sh", @ptrCast(&sh));
+}
 extern "c" fn time(t: ?*i64) i64;
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn bind(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
@@ -293,11 +321,6 @@ fn fx_err(err: ?[*]u8, errcap: usize, comptime fmt: []const u8, args: anytype) c
     return -1;
 }
 
-/// typed malloc (the C's malloc(sizeof *p * n)).
-fn mallocT(comptime T: type, n: usize) ?[*]T {
-    const raw = malloc(n * @sizeOf(T)) orelse return null;
-    return @ptrCast(@alignCast(raw));
-}
 fn reallocT(comptime T: type, ptr: ?[*]T, n: usize) ?[*]T {
     const raw = realloc(@ptrCast(ptr), n * @sizeOf(T)) orelse return null;
     return @ptrCast(@alignCast(raw));
@@ -950,50 +973,36 @@ fn restore_m4_facts(db: *dl_db, vok: u32, err: ?[*]u8, errcap: usize) c_int {
     for (M4_RELS) |rel0| {
         const rel = rel0.name;
         const ar = rel0.arity;
-        const it = dl_iter_open(db, rel, null, 0);
-        if (it) |iter| {
-            const bad = dl_iter_arity(iter) != ar;
-            var cap: usize = 64;
-            var n: usize = 0;
-            var all: ?[*]u32 = if (bad) null else mallocT(u32, cap * ar);
-            var row: [8]u32 = undefined;
-            var oom: c_int = 0;
-            while (!bad and dl_iter_next(iter, &row) == 1) {
-                if (n >= cap) {
-                    cap *= 2;
-                    const na = reallocT(u32, all, cap * ar);
-                    if (na == null) {
-                        oom = 1;
-                        break;
-                    }
-                    all = na;
-                }
-                @memcpy(all.?[n * ar ..][0..ar], row[0..ar]);
-                n += 1;
-            }
-            dl_iter_close(iter);
-            if (oom != 0) {
-                cfree(all);
-                _ = fx_err(err, errcap, "m4 restore: oom", .{});
-                _ = dl_txn_rollback(db);
-                return -1;
-            }
-            if (bad) {
-                _ = fx_err(err, errcap, "m4 restore: {s} arity mismatch", .{span(rel)});
-                _ = dl_txn_rollback(db);
-                return -1;
-            }
-            var k: usize = 0;
-            while (k < n) : (k += 1)
-                _ = dl_txn_delete_fact(db, rel, all.?[k * ar ..], ar);
-            cfree(all);
+        // Enumerate the LIVE (WAL-replayed) relation, not the pinned
+        // snapshot: dl_iter_open routes to the newest published snapshot
+        // whenever snap_version>0, so tuples from a committed-but-
+        // UNPUBLISHED divergent txn (crash between activate's txn commit
+        // and its publish, or a manual `fxctl rollback <v>` over a stale
+        // live WAL) would escape this clear and then be made PERMANENT by
+        // fx_store_rollback's publish-first.  dl_prefix is the one reader
+        // that walks the live dafsa (the declare loop above already
+        // rejects an arity-mismatched live relation).
+        var live = M4Bag{};
+        const lcnt = dl_prefix(db, rel, null, 0, m4_raw_cb, &live);
+        if (lcnt < 0 or lcnt != @as(c_long, @intCast(live.n))) {
+            // lcnt > live.n: prefixDfs counts a tuple BEFORE handing it to
+            // the callback, so a count above the collected rows means
+            // m4_raw_cb hit its realloc failure mid-scan.
+            cfree(live.tuples);
+            _ = fx_err(err, errcap, "m4 restore: live scan {s} failed", .{span(rel)});
+            _ = dl_txn_rollback(db);
+            return -1;
         }
+        var k: usize = 0;
+        while (k < live.n) : (k += 1)
+            _ = dl_txn_delete_fact(db, rel, live.tuples.?[k * ar ..], ar);
+        cfree(live.tuples);
         var bag = M4Bag{};
         const cnt = dl_query_version(db, vok, rel, m4_raw_cb, &bag);
         if (cnt >= 0) {
-            var k: usize = 0;
-            while (k < bag.n) : (k += 1)
-                _ = dl_txn_add_fact(db, rel, bag.tuples.?[k * ar ..], ar);
+            var k2: usize = 0;
+            while (k2 < bag.n) : (k2 += 1)
+                _ = dl_txn_add_fact(db, rel, bag.tuples.?[k2 * ar ..], ar);
         }
         cfree(bag.tuples);
     }
@@ -1118,7 +1127,7 @@ fn run_dhake() c_int {
         _ = std.c.dup2(outpipe[1], 2);
         _ = std.c.close(outpipe[1]);
         const av = [_:null]?[*:0]const u8{ "dhake.com", "-f", @ptrCast(&bootbf), "rootfs" };
-        _ = execvp(@ptrCast(&g_dhake), &av);
+        _ = exec_sh_retry(@ptrCast(&g_dhake), &av);
         _ = std.c.write(2, "fx-init: exec dhake failed\n", "fx-init: exec dhake failed\n".len);
         std.c._exit(127);
     }
@@ -1210,7 +1219,7 @@ fn start_service(sv: *Svc) void {
             _ = setenv(sv.env_k.?[@intCast(i)].?, sv.env_v.?[@intCast(i)].?, 1);
         }
         const av: [*:null]const ?[*:0]const u8 = @ptrCast(sv.argv.?);
-        _ = execvp(sv.argv.?[0].?, av);
+        _ = exec_sh_retry(sv.argv.?[0].?, av);
         _ = std.c.write(2, "fx-init: exec failed\n", "fx-init: exec failed\n".len);
         std.c._exit(127);
     }
@@ -1592,7 +1601,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             const pid = std.c.fork();
             if (pid == 0) {
                 const av = [_:null]?[*:0]const u8{ @ptrCast(&g_fxstore), "--store", g_store, "--config", arg };
-                _ = execvp(@ptrCast(&g_fxstore), &av);
+                _ = exec_sh_retry(@ptrCast(&g_fxstore), &av);
                 std.c._exit(127);
             }
             var rc: c_int = -1;
@@ -2374,8 +2383,51 @@ test "restore_m4_facts re-carries install/provides on roll-forward (U4)" {
     }
 
     // fx_store_rollback publishes the converged state after restore
-    // (store.zig:1123); the next roll-forward's clear enumeration pins on
-    // THAT snapshot, so mirror the publish before restoring again.
+    // (store.zig:1123) — mirror that publish so the db's snapshot matches
+    // what production's rollback sequence would leave behind.
+    if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
+
+    // the UNPUBLISHED divergent-txn arm: a committed-but-unpublished
+    // activation (crash between activate's txn commit and its publish) or
+    // a manual `fxctl rollback <v>` over a stale live WAL leaves live
+    // tuples the PINNED snapshot lacks — the clear must enumerate them via
+    // dl_prefix (live WAL) or they survive the restore and
+    // fx_store_rollback's publish-first makes them permanent.
+    if (dl_txn_begin(db) != 0) return error.Txn;
+    const g15000 = [1]u32{15000};
+    if (dl_txn_delete_fact(db, "boot_grace", &g15000, 1) != 0) return error.DelFact;
+    try F.del_install(db, "/bin/hello", ha ++ "-hello", 0, gen);
+    try F.install(db, "/bin/ghost", hz ++ "-ghost", 0, hz);
+    try F.provides(db, "ghost", hz ++ "-ghost");
+    try F.boot_grace(db, 4242);
+    if (dl_txn_commit(db) != 0) return error.Txn;
+    // deliberately NO publish: the db stays pinned on the snapshot above,
+    // so a snapshot-routed clear enumeration cannot see these tuples.
+    try std.testing.expectEqual(@as(c_int, 0), restore_m4_facts(db, v2, &err, err.len));
+    {
+        var c = Canon{ .db = db };
+        c.install(try live_rows(db, "install", 4));
+        const exp = [_][]const u8{
+            "/bin/hello|" ++ ha ++ "-hello|0o0|" ++ gen,
+            "/etc/motd|" ++ gen ++ "-system-generation/etc/motd|0o644|" ++ gen,
+        };
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.provides(try live_rows(db, "provides", 2));
+        const exp = [_][]const u8{
+            "hello|" ++ ha ++ "-hello",
+            "world|" ++ hb ++ "-world",
+        };
+        try expect_lines(&exp, c.sorted());
+    }
+    {
+        var c = Canon{ .db = db };
+        c.boot_grace(try live_rows(db, "boot_grace", 1));
+        const exp = [_][]const u8{"15000"};
+        try expect_lines(&exp, c.sorted());
+    }
     if (fx.dl_publish_snapshot(@ptrCast(db)) != 0) return error.Publish;
 
     // the OLD snapshot lacks install/provides entirely: restore must NOT
