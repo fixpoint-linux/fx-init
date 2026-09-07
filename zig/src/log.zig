@@ -251,8 +251,9 @@ pub fn fx_log_rotate(db: ?*dl_db, cap: u64) c_int {
     // the first `drop` tuples are the oldest.
     //
     // COLLECT-then-DELETE (same pattern as fx-activate's clear_rel and
-    // fx-init's restore_m4_facts): collect the oldest `drop` tuples into a
-    // buffer with the iterator CLOSED, then delete them in one txn.
+    // fxstore's snapshot-complete fx_store_rollback): collect the oldest
+    // `drop` tuples into a buffer with the iterator CLOSED, then delete
+    // them in one txn.
     const it = dl_iter_open(d, "log", null, 0) orelse return -1;
     const ar = dl_iter_arity(it);
     if (ar != 4) {

@@ -22,11 +22,11 @@
 #      the FAILED activation's genhash (current view pre-roll-forward);
 #      --as-of v_good still answers gen_good (snapshot timeline intact)
 #   6. boot v_bad -> failed; boot again -> roll-forward to the newest ok
-#      generation, restore_m4_facts + re-publish.  All post-roll-forward
-#      asserts run strictly AFTER the re-publish (the U4 read-semantics
-#      finding: dl_query/dl_iter read the PINNED snapshot until
-#      fx_store_rollback publishes — never assert against the live WAL
-#      mid-restore):
+#      generation (snapshot-complete fx_store_rollback + re-publish).  All
+#      post-roll-forward asserts run strictly AFTER the re-publish (the
+#      read-semantics caveat: dl_query/dl_iter read the PINNED snapshot
+#      until fx_store_rollback publishes — never assert against the live
+#      WAL mid-rollback):
 #        what /etc/hostname -> gen_good again, NOT gen_bad
 #        what /bin/fakesvc  -> package fake-service, gen_good
 #        why fake-service   -> provides /bin/fakesvc
