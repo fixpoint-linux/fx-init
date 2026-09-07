@@ -2,7 +2,8 @@
 # activate_diff.sh — unit-5 regression harness: the Zig port of fx-activate
 # (zig-out/bin/fx-activate) over every corpus case, compared against pinned
 # goldens (zig/golden/activate/): stdout, stderr, exit code, the store FACTS
-# (10 M4 relations + versions, dumped by the Zig twin
+# (12 relations — the 10 M4 relations + the provenance install/provides —
+# plus versions, dumped by the Zig twin
 # zig/src/activate_facts.zig), the
 # generation hash, and the emitted generation dir (Dhakefile.dhall + etc/*,
 # as a normalized manifest).

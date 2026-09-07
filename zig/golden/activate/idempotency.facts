@@ -1,6 +1,21 @@
 boot_grace 4000
 current 5
 generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
+install /bin/dhake H-dhake 0 H
+install /bin/fakesvc H-fakesvc 0 H
+install /bin/fx-activate H-fx-activate 0 H
+install /bin/fxctl H-fxctl 0 H
+install /bin/init H-fx-init 0 H
+install /etc/group H-system-generation/etc/group 420 H
+install /etc/hostname H-system-generation/etc/hostname 420 H
+install /etc/issue.net H-system-generation/etc/issue.net 420 H
+install /etc/motd H-system-generation/etc/motd 420 H
+install /etc/passwd H-system-generation/etc/passwd 420 H
+provides dhake H-dhake
+provides fakesvc H-fakesvc
+provides fx-activate H-fx-activate
+provides fx-init H-fx-init
+provides fxctl H-fxctl
 svc gated up:heartbeat on-failure
 svc heartbeat all always
 svc netty net on-failure

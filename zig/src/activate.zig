@@ -373,10 +373,13 @@ pub const EtcItem = struct {
     content: []const u8,
 };
 
-/// (name, storedir) pair for a /bin symlink.
+/// (name, storedir) pair for a /bin symlink.  `pkg` is the closure package
+/// the link points into — the install fact derives the STORE-RELATIVE origin
+/// `<hash>-<pkg>` from it (emitBuildfile itself ignores it).
 pub const BinLink = struct {
     name: []const u8,
     storedir: []const u8,
+    pkg: []const u8 = "",
 };
 
 fn etcItemLt(_: void, x: EtcItem, y: EtcItem) bool {
@@ -821,13 +824,13 @@ pub fn main(init: std.process.Init) !void {
     const bin = gpa_alloc.alloc(BinLink, nbin) catch @panic("out of memory");
     var bi: usize = 0;
     const initp = storePathOf(entries, "fx-init").?;
-    bin[bi] = .{ .name = "init", .storedir = initp };
+    bin[bi] = .{ .name = "init", .storedir = initp, .pkg = "fx-init" };
     bi += 1;
-    bin[bi] = .{ .name = "fxctl", .storedir = storePathOf(entries, "fxctl").? };
+    bin[bi] = .{ .name = "fxctl", .storedir = storePathOf(entries, "fxctl").?, .pkg = "fxctl" };
     bi += 1;
-    bin[bi] = .{ .name = "dhake", .storedir = dhake_path };
+    bin[bi] = .{ .name = "dhake", .storedir = dhake_path, .pkg = "dhake" };
     bi += 1;
-    bin[bi] = .{ .name = "fx-activate", .storedir = storePathOf(entries, "fx-activate").? };
+    bin[bi] = .{ .name = "fx-activate", .storedir = storePathOf(entries, "fx-activate").?, .pkg = "fx-activate" };
     bi += 1;
     for (cfg.services) |*sv| {
         const pkg = sv.pkg orelse continue;
@@ -836,7 +839,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         const pk = ps.find(pkg).?;
-        bin[bi] = .{ .name = baseName(pk.target), .storedir = p };
+        bin[bi] = .{ .name = baseName(pk.target), .storedir = p, .pkg = pkg };
         bi += 1;
     }
     std.sort.insertion(BinLink, bin, {}, binLinkLt);
@@ -929,6 +932,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .rel = "user", .arity = 3 },
         .{ .rel = "tool_fxstore", .arity = 1 },
         .{ .rel = "boot_grace", .arity = 1 },
+        .{ .rel = "install", .arity = 4 },
+        .{ .rel = "provides", .arity = 2 },
     };
     for (decls) |d| declare(db, d.rel, d.arity, &e) catch {
         std.debug.print("fx-activate: {s}\n", .{e.slice()});
@@ -1042,6 +1047,50 @@ pub fn main(init: std.process.Init) !void {
         }
         const cols = [3]u32{ fx.dl_intern_str(db, dupeZ(u.name)), u.uid, fx.dl_intern_str(db, dupeZ(gcsv.slice())) };
         addFact(db, "user", &cols);
+    }
+    // install(target, origin, mode, genhash) a4 — one fact per rootfs
+    // mutation the buildfile performs: every /etc copy and every /bin
+    // symlink.  `origin` is STORE-RELATIVE (resolved against the store root
+    // at query time — the same relocation principle as the generation
+    // fact's buildfile/dhake columns).  `mode` is a raw u32 so reconcile
+    // can compare it against lstat's st_mode & 0o7777: 0o644 for the etc
+    // copies (emitBuildfile's Chmod), 0 for symlinks.
+    for (etc) |it| {
+        var tgt_buf: [PATH_MAX]u8 = undefined;
+        var org_buf: [PATH_MAX]u8 = undefined;
+        const cols = [4]u32{
+            fx.dl_intern_str(db, snfmtz(&tgt_buf, "/etc/{s}", .{it.path})),
+            fx.dl_intern_str(db, snfmtz(&org_buf, "{s}-system-generation/etc/{s}", .{ genhash_s, it.path })),
+            0o644,
+            fx.dl_intern_str(db, genhash[0..64 :0]),
+        };
+        addFact(db, "install", &cols);
+    }
+    for (bin) |it| {
+        // store-relative pkg dir `<hash>-<pkg>` (entryOf non-null: the bin
+        // construction above already required each pkg in the closure)
+        const be = entryOf(entries, it.pkg).?;
+        var tgt_buf: [PATH_MAX]u8 = undefined;
+        var org_buf: [PATH_MAX]u8 = undefined;
+        const cols = [4]u32{
+            fx.dl_intern_str(db, snfmtz(&tgt_buf, "/bin/{s}", .{it.name})),
+            fx.dl_intern_str(db, snfmtz(&org_buf, "{s}-{s}", .{ be.hash, it.pkg })),
+            0,
+            fx.dl_intern_str(db, genhash[0..64 :0]),
+        };
+        addFact(db, "install", &cols);
+    }
+    // provides(pkg, store_dir) a2 — the closure's store-dir -> pkg-name
+    // mapping, today implicit in the derivation hex.  store_dir is
+    // STORE-RELATIVE (`<hash>-<pkg>`); entries are in topo (deps-first)
+    // order.
+    for (entries) |*it| {
+        var dir_buf: [PATH_MAX]u8 = undefined;
+        const cols = [2]u32{
+            fx.dl_intern_str(db, dupeZ(it.p.name)),
+            fx.dl_intern_str(db, snfmtz(&dir_buf, "{s}-{s}", .{ it.hash, it.p.name })),
+        };
+        addFact(db, "provides", &cols);
     }
 
     if (fx.dl_txn_commit(db) != 0) {

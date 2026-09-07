@@ -1,11 +1,12 @@
 // activate_facts.zig — unit-5 differential-harness helper (Zig replacement for
 // the C oracle twin zig/activate_facts.c, which is removed with the C engine).
-// Opens a store and dumps the 10 M4 relations fx-activate maintains
-// (generation, svc, svc_argv, svc_env, svc_probe, svc_bin, svc_backoff, user,
-// tool_fxstore, boot_grace) plus the published snapshot versions + CURRENT, as
+// Opens a store and dumps the 12 relations fx-activate maintains (the 10 M4
+// relations generation, svc, svc_argv, svc_env, svc_probe, svc_bin, svc_backoff,
+// user, tool_fxstore, boot_grace + the Lens-2 provenance relations install,
+// provides) plus the published snapshot versions + CURRENT, as
 // SORTED lines with sym columns resolved via dl_intern_str_of.  Raw-u32 columns
-// (epoch, uid, idx, backoff_ms, grace_ms) print numerically; activate_diff.sh
-// sed-normalizes the generation epoch.
+// (epoch, uid, idx, backoff_ms, grace_ms, mode) print numerically;
+// activate_diff.sh sed-normalizes the generation epoch.
 //
 // Must run AFTER the activator exits: dl_open holds a process-lifetime
 // exclusive fcntl lock, so the dump opens its own store handle only once the
@@ -35,6 +36,8 @@ const rels = [_]RelSpec{
     .{ .rel = "user", .arity = 3, .sym_mask = 0x5 }, // (name, uid-raw, groups_csv)
     .{ .rel = "tool_fxstore", .arity = 1, .sym_mask = 0x1 }, // (path)
     .{ .rel = "boot_grace", .arity = 1, .sym_mask = 0x0 }, // (grace_ms-raw)
+    .{ .rel = "install", .arity = 4, .sym_mask = 0xB }, // (target, origin, mode-raw, genhash)
+    .{ .rel = "provides", .arity = 2, .sym_mask = 0x3 }, // (pkg, store_dir)
 };
 
 fn addLine(lines: *std.ArrayList([]const u8), line: []const u8) void {
