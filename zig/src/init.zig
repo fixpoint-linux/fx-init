@@ -1876,6 +1876,19 @@ fn pivot_root_to_tmpfs() void {
     } else {
         errf("fx-init: warning: post-pivot root fstype '{s}' magic 0x{x:0>8} (want {s}/0x01021994)\n", .{ if (new_fst.len == 0) "?" else new_fst, @as(u32, @truncate(@as(u64, @bitCast(fs_magic("/"))))), TMPFS_FST });
     }
+
+    // B2: detach the old initramfs root from the namespace.  This is namespace
+    // hygiene only — what switch_root does — NOT memory reclaim: the /lib64 and
+    // /usr MS_BINDs above hold their OWN reference to the initramfs superblock,
+    // so the initramfs pages stay pinned and are NOT freed by this umount.
+    // MNT_DETACH (lazy) detaches immediately even if a reference lingers, and
+    // cannot fail EBUSY the way a plain umount can.  The system is already fully
+    // up on the new root, so any failure is a WARNING only — never fatal, never
+    // affects the boot or the verdict.  The /oldroot directory entry is left in
+    // place; the binds are untouched.
+    if (umount2("/oldroot", MNT_DETACH) != 0) {
+        errf("fx-init: warning: detach /oldroot failed: {s} (non-fatal — boot continues on new root)\n", .{errnoStr()});
+    }
 }
 
 fn evaluate_boot_ok() void {
