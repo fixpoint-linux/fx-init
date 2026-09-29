@@ -14,6 +14,12 @@
 #     rdevmajor/rdevminor directly, and the kernel's initramfs unpacker
 #     processes concatenated archives (the early-cpio pattern dracut/
 #     mkinitcpio use for exactly this reason).
+#   - the 5 kernel modules the M4 DISK path needs (crc16 mbcache jbd2 ext4
+#     virtio_blk), DECOMPRESSED (busybox insmod cannot read .ko.zst) from
+#   the pinned kernel's module tree, flat under /lib/modules/<ver>/ — the
+#   version-lock below FAILS the build when the modules tree's version does
+#   not match the pinned kernel (a mismatched set would only fail later,
+#   in-guest, as an insmod vermagic error).
 #
 # Guest layout: /fx/store/* (the whole store minus the .build/.tmp scratch
 # dirs), /lib64/<ld + ldd closure of the shipped binaries> + libdatalog.so,
@@ -96,6 +102,31 @@ chmod 755 "$STAGE/usr/bin/busybox"
 ln -s /usr/bin/busybox "$STAGE/bin/sh"
 ln -s /usr/bin/busybox "$STAGE/bin/mount"
 ln -s /usr/bin/busybox "$STAGE/usr/bin/mount"
+# the M4 disk path's applets (zig/src/init.zig execs /usr/bin/busybox
+# directly via its multi-call form, so these are belt + a debugging aid —
+# but the image must visibly carry them)
+for applet in insmod mkfs.ext2 cp rm mv sync; do
+    ln -sf /usr/bin/busybox "$STAGE/usr/bin/$applet"
+done
+
+# ─── the 5 disk-path kernel modules, version-locked to the pin ────────────
+# KERNEL is e.g. /boot/vmlinuz-<ver>; the modules live at
+# /usr/lib/modules/<ver>/kernel/... as .ko.zst and are decompressed to a
+# FLAT /lib/modules/<ver>/ (zig/src/init.zig insmods them by bare name, in
+# the modules.dep-derived order crc16 mbcache jbd2 ext4 virtio_blk).
+command -v zstd >/dev/null 2>&1 || skip "zstd not found (disk modules)"
+KVER=$(basename "$KERNEL" | sed -n 's/^vmlinuz-//p')
+[ -n "$KVER" ] || fail "cannot derive kernel version from $KERNEL (expected /boot/vmlinuz-<ver>)"
+MODTREE="/usr/lib/modules/$KVER"
+[ -d "$MODTREE" ] || fail "module tree missing for the pinned kernel: $MODTREE (version mismatch — update the kernel pin or ship modules for $KVER)"
+# insmod'd by bare name; the POC measured these exact subpaths
+MODSRC="kernel/lib/crc/crc16.ko.zst kernel/fs/mbcache.ko.zst kernel/fs/jbd2/jbd2.ko.zst kernel/fs/ext4/ext4.ko.zst kernel/drivers/block/virtio_blk.ko.zst"
+mkdir -p "$STAGE/lib/modules/$KVER" || fail "cannot create modules stage"
+for m in $MODSRC; do
+    [ -f "$MODTREE/$m" ] || fail "module $m missing from $MODTREE (version-locked set incomplete)"
+    zstd -d -q -f "$MODTREE/$m" -o "$STAGE/lib/modules/$KVER/$(basename "$m" .ko.zst).ko" \
+        || fail "zstd -d failed for $m"
+done
 
 # ─── the store (minus build scratch) ──────────────────────────────────────
 cp -a "$STORE"/. "$STAGE/fx/store/" || fail "cannot copy store"

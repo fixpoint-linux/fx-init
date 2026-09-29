@@ -39,7 +39,11 @@
 #                 negative control sets m3/config-bad-exit.dhall and expects
 #                 boot-FAILED + exit 1)
 #   QEMU_BOOT_TIMEOUT  seconds to wait for the verdict (default 90)
+#   QEMU_DISK     path to the virtio disk image (default: a fresh 512M
+#                 qemu-img in the scratch dir; the rollback harness points
+#                 this at ONE shared disk across its 3 boots)
 #   FX_SIBLINGS   dir with the sibling checkouts (default: repo ../..)
+#   QEMU_KEEP=1   keep the scratch dir (debugging; prints its path)
 set -u
 
 fail() { echo "qemu-boot: FAIL: $*" >&2; exit 1; }
@@ -49,6 +53,8 @@ command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "qemu-system-x86_64 not fo
 command -v cpio >/dev/null 2>&1    || skip "cpio not found"
 command -v gzip >/dev/null 2>&1    || skip "gzip not found"
 command -v timeout >/dev/null 2>&1 || skip "timeout not found"
+command -v qemu-img >/dev/null 2>&1 || skip "qemu-img not found (disk store)"
+command -v sha256sum >/dev/null 2>&1 || skip "sha256sum not found (disk store)"
 [ -e /dev/kvm ]                   || skip "/dev/kvm absent (v1 requires kvm for a fast deterministic timeout)"
 [ -w /dev/kvm ]                   || skip "/dev/kvm not writable"
 
@@ -73,7 +79,11 @@ GOT_SHA=$(sha256sum "$KERNEL" | awk '{print $1}')
 # ─── scratch ──────────────────────────────────────────────────────────────
 SCRATCH="${TMPDIR:-/tmp}"
 WORK="$(mktemp -d "$SCRATCH/qemuboot.XXXXXX")" || fail mktemp
-trap 'rm -rf "$WORK"' EXIT
+if [ "${QEMU_KEEP:-0}" = "1" ]; then
+    trap 'echo "qemu-boot: scratch kept at $WORK"' EXIT
+else
+    trap 'rm -rf "$WORK"' EXIT
+fi
 STORE="$WORK/store"
 ROOT="$WORK/root"
 mkdir -p "$STORE" "$ROOT/run/fx" "$ROOT/etc" "$ROOT/bin" "$ROOT/tmp"
@@ -172,12 +182,22 @@ echo "=== qemu-boot: building initramfs ==="
 sh "$REPO/tests/mkinitramfs.sh" -s "$STORE" -r "$ROOT" -k "$KERNEL" -o "$WORK/initrd.cpio.gz" \
     || fail "mkinitramfs failed"
 
+# ─── the persistent disk store (M4): a blank virtio-blk image; the GUEST
+# insmods virtio_blk+ext4, mkfs.ext2 -F's it, seeds it from the ramfs store
+# and mounts it at /fx/disk/store (ensure_disk_store in zig/src/init.zig).
+# The host cannot mkfs/populate an fs image as uid 1001 — the guest does.
+DISK="${QEMU_DISK:-$WORK/disk.img}"
+if [ ! -f "$DISK" ]; then
+    qemu-img create -q "$DISK" 512M || fail "qemu-img create failed"
+fi
+DISK_SHA_BEFORE=$(sha256sum "$DISK" | awk '{print $1}')
+
 # rdinit target: the store's fx-init (guest-absolute)
 FXD=$(ls -d "$STORE"/*-fx-init | head -1)
 RDINIT="/fx/store/$(basename "$FXD")/fx-init"
 
 # ─── boot it ──────────────────────────────────────────────────────────────
-echo "=== qemu-boot: booting (rdinit=$RDINIT, expecting version v$V) ==="
+echo "=== qemu-boot: booting (rdinit=$RDINIT, expecting version v$V, disk=$DISK) ==="
 CONSOLE="$WORK/console.log"
 : > "$CONSOLE"
 timeout "$QEMU_BOOT_TIMEOUT" qemu-system-x86_64 \
@@ -185,8 +205,27 @@ timeout "$QEMU_BOOT_TIMEOUT" qemu-system-x86_64 \
     -kernel "$KERNEL" -initrd "$WORK/initrd.cpio.gz" \
     -append "console=ttyS0,115200 rdinit=$RDINIT fx.store=/fx/store panic=-1 oops=panic" \
     -nographic -no-reboot -monitor none -serial file:"$CONSOLE" \
+    -drive file="$DISK",format=raw,if=virtio \
     >"$WORK/qemu.out" 2>&1
 QRC=$?
+
+# the disk path ran: fx-init's ensure_disk_store succeeded (the negative
+# insmod/mkfs/mount warnings all end in "disk store disabled", so grepping
+# for the success line + NOT the disabled marker covers both directions)
+if ! grep -q 'fx-init: disk store mounted (current v' "$CONSOLE"; then
+    echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
+    fail "no 'disk store mounted' line — the disk store path did not run"
+fi
+if grep -q 'disk store disabled\|insmod .* FAILED' "$CONSOLE"; then
+    echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
+    fail "disk store bring-up FAILED (insmod/mkfs/mount)"
+fi
+# PERSISTENCE: the disk image must have been WRITTEN (mkfs/seed), not just
+# read — its sha must differ from the pre-boot blank image
+DISK_SHA_AFTER=$(sha256sum "$DISK" | awk '{print $1}')
+if [ "$DISK_SHA_BEFORE" = "$DISK_SHA_AFTER" ]; then
+    fail "disk.img unchanged by the boot — the store was not written to disk"
+fi
 
 # the verdict line is unique to fx-init's boot-decision branches.  The
 # harness asserts the activated version booted OK — a bad config (the

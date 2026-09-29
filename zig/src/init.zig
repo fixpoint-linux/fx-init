@@ -281,6 +281,7 @@ extern "c" fn accept(fd: c_int, addr: ?*anyopaque, addrlen: ?*c_uint) c_int;
 // not in std.c, declared locally per the repo's fork/execv precedent.
 extern "c" fn mount(source: [*:0]const u8, target: [*:0]const u8, fstype: [*:0]const u8, flags: c_ulong, data: ?*const anyopaque) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn sync() void;
 
 const SockaddrUn = extern struct {
     family: u16,
@@ -541,6 +542,12 @@ fn bootlog_append(v: u32, status: [*:0]const u8, epoch: u32) void {
     _ = fflush(f);
     _ = fsync(fileno(f));
     _ = fclose(f);
+    // the disk store is mounted r/w NOJOURNAL4 (busybox mkfs.ext2 under
+    // ext4): metadata churn (adopt's rm+cp) can sit unflushed when a harness
+    // kills the VM at the verdict — the next mount then finds "doubly
+    // allocated" inode state.  bootlog_append IS the durability point of the
+    // boot contract, so flush the whole fs here.
+    sync();
 }
 
 fn bootlog_last(v_out: *u32, status_out: [*]u8, scap: usize) c_int {
@@ -955,6 +962,11 @@ fn decide_boot_version() u32 {
                 _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
                 if (rb == 0) {
                     log_line("fx-init", "info", "rolled forward to known-good generation");
+                    // second durability point: bootlog_append's sync() covers
+                    // only ITS OWN append — this rewrite of CURRENT is a
+                    // separate commit, and a kill before the next append
+                    // would lose it (next boot rolls forward AGAIN).
+                    sync();
                 } else {
                     errf("fx-init: roll-forward failed: {s}\n", .{span(@ptrCast(&e2))});
                 }
@@ -1237,6 +1249,231 @@ fn mount_early() void {
             if (fd > 2) _ = std.c.close(fd);
         }
     }
+}
+
+// ─── M4 disk store: persist the store on a virtio-blk disk ────────────────
+
+/// The disk store lives on a writable virtio-blk device (tests/qemu_boot.sh
+/// attaches one; the guest sees /dev/vda).  rdinit receives NO argv from the
+/// kernel (MEASURED, handoff-image-disk-artifact-1), so the path is chosen by
+/// DEVICE PRESENCE, not a flag: only the QEMU boots ever get a /dev/vda (the
+/// bwrap harnesses and the host have no virtio-blk device), which keeps this
+/// whole block inert on every existing path.
+///
+/// Layout: the disk is mounted at /fx/disk and g_store is repointed at
+/// /fx/disk/store BEFORE anything opens the store (the first fx_store_open
+/// happens inside decide_boot_version).  NOT at /fx/store itself:
+/// fx_store_open puts the .build scratch SIBLING of the root and rejects a
+/// root whose sibling lands on another st_dev — i.e. a store root that is
+/// itself a mountpoint cannot be opened at all.
+///
+/// Three cases once the disk is mounted (busybox mkfs.ext2 -F when blank;
+/// mounted -t ext4, NOT ext2: CONFIG_EXT2_FS is unset, only
+/// EXT4_USE_FOR_EXT2=y, and busybox `mount -t ext2` fails EINVAL — MEASURED
+/// in the POC):
+///   unseeded disk:                     seed = cp -a the ramfs store over;
+///   seeded, ramfs CURRENT <= disk:     the DISK wins (persistence);
+///   seeded, ramfs CURRENT >  disk:     ADOPT the ramfs store (a newer
+///                                      initramfs supersedes the disk
+///                                      generation) while PRESERVING the
+///                                      disk .bootlog — the boot history a
+///                                      prior boot wrote is exactly what
+///                                      the next boot's roll-forward reads.
+const DISK_MOUNT = "/fx/disk";
+const DISK_STORE = "/fx/disk/store";
+const DISK_DEV = "/dev/vda";
+const DISK_STORE_DB = DISK_STORE ++ "/.db";
+const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
+// insmod order (POC, from the pinned kernel's modules.dep): ext4 depends on
+// crc16 + mbcache + jbd2; virtio_blk has no deps.
+const DISK_MODULE_ORDER = [_][]const u8{ "crc16.ko", "mbcache.ko", "jbd2.ko", "ext4.ko", "virtio_blk.ko" };
+
+const Dirent = extern struct {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    d_name: [256]u8,
+};
+extern "c" fn opendir(name: [*:0]const u8) ?*anyopaque;
+extern "c" fn readdir(dir: *anyopaque) ?*Dirent;
+extern "c" fn closedir(dir: *anyopaque) c_int;
+
+/// Run a busybox applet to completion (the image ships busybox at
+/// /usr/bin/busybox; argv = {"busybox", applet, a1..} is the multi-call
+/// form).  Returns the exit status, or -1 on fork/exec/wait failure (127 =
+/// exec failed).  Used only BEFORE the SIGCHLD handler + main loop exist,
+/// so a plain waitpid is safe here.
+fn run_bb(applet: [*:0]const u8, a1: ?[*:0]const u8, a2: ?[*:0]const u8, a3: ?[*:0]const u8) c_int {
+    const pid = std.c.fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        const av = [_:null]?[*:0]const u8{ "busybox", applet, a1, a2, a3 };
+        _ = execv("/usr/bin/busybox", @ptrCast(&av));
+        std.c._exit(127);
+    }
+    var status: c_int = 0;
+    while (std.c.waitpid(pid, &status, 0) < 0 and std.c._errno().* == EINTR) {}
+    return if (std.os.linux.W.IFEXITED(@bitCast(status))) @as(c_int, std.os.linux.W.EXITSTATUS(@bitCast(status))) else -1;
+}
+
+/// Is /dev already a kernel-populated devtmpfs mount?  On the host (and in
+/// bwrap) it is — or the devtmpfs mount below fails in the user namespace —
+/// and both mean "no virtio disk can appear later", so the disk path stays
+/// inert there.
+fn dev_is_devtmpfs() bool {
+    const f = fopen("/proc/mounts", "r") orelse return false;
+    defer _ = fclose(f);
+    var line: [512]u8 = undefined;
+    while (fgets(&line, @intCast(line.len), f)) |_| {
+        var spec: [128]u8 = undefined;
+        var mnt: [128]u8 = undefined;
+        var fst: [64]u8 = undefined;
+        if (sscanf(@ptrCast(&line), "%127s %127s %63s", &spec, &mnt, &fst) == 3) {
+            if (strcmp(@ptrCast(&mnt), "/dev") == 0 and strcmp(@ptrCast(&fst), "devtmpfs") == 0) return true;
+        }
+    }
+    return false;
+}
+
+/// The single /lib/modules/<ver> entry the image ships (tests/mkinitramfs.sh
+/// writes exactly one, version-locked to the pinned kernel at BUILD time).
+fn modules_dir(out: []u8) bool {
+    const d = opendir("/lib/modules") orelse return false;
+    defer _ = closedir(d);
+    while (readdir(d)) |e| {
+        const name = std.mem.sliceTo(&e.d_name, 0);
+        if (name.len == 0 or name[0] == '.') continue;
+        if (name.len + 1 > out.len) continue;
+        @memcpy(out[0..name.len], name);
+        out[name.len] = 0;
+        return true;
+    }
+    return false;
+}
+
+/// Best-effort read of <root>/.db/snapshots/CURRENT (0 when unreadable) —
+/// the same file fx_store_current_version parses, read directly so this
+/// never needs an open store handle (or creates scratch dirs) this early.
+fn store_current_of(root: [:0]const u8) u32 {
+    var p: [512]u8 = undefined;
+    _ = snfmt(&p, "{s}/.db/snapshots/CURRENT", .{root});
+    if (std.c.access(@ptrCast(&p), F_OK) == 0) {
+        // CURRENT exists but is unreadable/unparsable: returning 0 makes the
+        // caller treat the store as unseeded and adopt/overwrite — a
+        // defensible recovery, but it must be LOUD.
+        const f0 = fopen(@ptrCast(&p), "r");
+        if (f0 != null) _ = fclose(f0);
+        if (f0 == null) {
+            errf("fx-init: WARNING: {s} exists but cannot be opened — treating as no store\n", .{span(@ptrCast(&p))});
+        } else {
+            var line0: [64]u8 = undefined;
+            var v0: u32 = 0;
+            if (fgets(&line0, @intCast(line0.len), f0) == null or sscanf(@ptrCast(&line0), "%u", &v0) != 1) {
+                errf("fx-init: WARNING: {s} exists but is unparsable — treating as no store\n", .{span(@ptrCast(&p))});
+            }
+        }
+    }
+    const f = fopen(@ptrCast(&p), "r") orelse return 0;
+    defer _ = fclose(f);
+    var line: [64]u8 = undefined;
+    if (fgets(&line, @intCast(line.len), f) == null) return 0;
+    var v: u32 = 0;
+    if (sscanf(@ptrCast(&line), "%u", &v) != 1) return 0;
+    return v;
+}
+
+/// Bring up the persistent disk store (see the block comment above).  Runs
+/// right after mount_early() and before any store handle is opened.
+/// Non-fatal by design (mirrors mount_early): every failure warns on the
+/// console and the boot continues from the ramfs store — the QEMU harness
+/// asserts the success line, so a broken disk path fails the harness, not
+/// the boot.
+fn ensure_disk_store() void {
+    // PID1 only: the path mkfs's a block device, and presence-discovery
+    // (below) is exactly the right gate for a real init.  An FX_INIT_FORCE
+    // run on a host that happens to have a /dev/vda must never reach it.
+    if (std.c.getpid() != 1) return;
+    // /dev must be kernel-populated for /dev/vda to appear once virtio_blk
+    // loads.  The image ships baked device nodes, so mount_early SKIPPED
+    // devtmpfs (its /dev/null probe hits) — mount it here.  INTERPRETATION:
+    // this mount succeeding also separates "initramfs PID1 in the initial
+    // user namespace" from every harness path (bwrap/user ns: EPERM).  If a
+    // future image ships no baked /dev nodes, mount_early mounts devtmpfs
+    // itself and the `else` branch below takes over cleanly.
+    if (!dev_is_devtmpfs()) {
+        if (mount("devtmpfs", "/dev", "devtmpfs", 0, null) != 0) return; // harness / bwrap: inert
+    } else if (std.c.access(DISK_DEV, F_OK) != 0) {
+        return; // /dev already kernel-populated and no virtio disk: host / harness
+    }
+
+    // modules first: virtio_blk makes the disk appear, ext4 mounts it.
+    var mdir: [256]u8 = undefined;
+    if (!modules_dir(&mdir)) {
+        errf("fx-init: warning: no /lib/modules — disk store disabled\n", .{});
+        return;
+    }
+    for (DISK_MODULE_ORDER) |mod| {
+        var mp: [512]u8 = undefined;
+        _ = snfmt(&mp, "/lib/modules/{s}/{s}", .{ span(@ptrCast(&mdir)), mod });
+        const rc = run_bb("insmod", @ptrCast(&mp), null, null);
+        if (rc != 0) {
+            errf("fx-init: disk: insmod {s} FAILED (exit {d}) — disk store disabled\n", .{ mod, rc });
+            return;
+        }
+    }
+    if (std.c.access(DISK_DEV, F_OK) != 0) {
+        errf("fx-init: disk store: no {s} — using ramfs store\n", .{DISK_DEV});
+        return;
+    }
+
+    _ = mkdirp(DISK_MOUNT);
+    if (mount(DISK_DEV, DISK_MOUNT, "ext4", 0, null) != 0) {
+        // blank disk: the GUEST formats it (the host cannot mkfs/populate
+        // the image as uid 1001 — that constraint is this whole design)
+        const mk = run_bb("mkfs.ext2", "-F", DISK_DEV, null);
+        if (mk != 0) {
+            errf("fx-init: disk: mkfs.ext2 FAILED (exit {d}) — disk store disabled\n", .{mk});
+            return;
+        }
+        if (mount(DISK_DEV, DISK_MOUNT, "ext4", 0, null) != 0) {
+            errf("fx-init: disk: mount {s} ext4 FAILED: {s} — disk store disabled\n", .{ DISK_DEV, errnoStr() });
+            return;
+        }
+    }
+
+    if (std.c.access(DISK_STORE_DB, F_OK) != 0) {
+        // unseeded: copy the whole ramfs store over (mkinitramfs already
+        // stripped the .build/.tmp scratch from the image copy)
+        _ = run_bb("rm", "-rf", DISK_STORE, null);
+        const cp = run_bb("cp", "-a", DEFAULT_STORE, DISK_MOUNT);
+        if (cp != 0) {
+            errf("fx-init: disk: seed cp FAILED (exit {d}) — disk store disabled\n", .{cp});
+            return;
+        }
+    } else {
+        const disk_v = store_current_of(DISK_STORE);
+        const ramfs_v = store_current_of(DEFAULT_STORE);
+        if (ramfs_v != 0 and ramfs_v > disk_v) {
+            // adopt: the ramfs (image) generation is NEWER.  Replace the
+            // disk store wholesale but keep its .bootlog aside — restoring
+            // the boot history is what makes the next boot's roll-forward
+            // decision read a disk a PRIOR boot wrote.
+            _ = run_bb("mv", DISK_STORE_BOOTLOG, "/fx/disk/bootlog.keep", null);
+            _ = run_bb("rm", "-rf", DISK_STORE, null);
+            const cp = run_bb("cp", "-a", DEFAULT_STORE, DISK_MOUNT);
+            _ = run_bb("mv", "/fx/disk/bootlog.keep", DISK_STORE_BOOTLOG, null);
+            if (cp != 0) {
+                errf("fx-init: disk: adopt cp FAILED (exit {d}) — disk store disabled\n", .{cp});
+                return;
+            }
+            errf("fx-init: disk store adopted ramfs v{d} over disk v{d} (bootlog preserved)\n", .{ ramfs_v, disk_v });
+        }
+    }
+    _ = run_bb("sync", null, null, null); // belt: flush the copy before an abrupt harness kill
+
+    g_store = DISK_STORE;
+    errf("fx-init: disk store mounted (current v{d})\n", .{store_current_of(DISK_STORE)});
 }
 
 fn evaluate_boot_ok() void {
@@ -1987,6 +2224,10 @@ pub fn main(init: std.process.Init) !void {
     // /dev/console for a rdinit PID1; a captured stderr in the harnesses).
     mount_early();
     errf("fx-init: boot start store {s}\n", .{span(g_store)});
+    // the persistent store must be up (and g_store repointed at it) before
+    // ANY store handle is opened — the first open is inside
+    // decide_boot_version below.
+    ensure_disk_store();
 
     if (std.c.pipe(&g_sigpipe) != 0) {
         errf("fx-init: pipe: {s}\n", .{errnoStr()});
