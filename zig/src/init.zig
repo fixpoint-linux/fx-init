@@ -45,6 +45,8 @@ const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
 const O_RDWR: c_int = 0o2;
+const O_RDONLY: c_int = 0o0;
+const O_DIRECTORY: c_int = 0o200000; // x86_64 (asm-generic): directory-only open
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 const X_OK: c_int = 1;
@@ -124,6 +126,22 @@ var g_boot_start_ms: u64 = 0;
 var g_boot_deadline_ms: u64 = 0;
 var g_next_probe: i64 = 0;
 var g_ctrl_fd: c_int = -1;
+// M4 virtio-serial control channel (tests/qemu_ctrl.sh): the guest end of a
+// qemu virtserialport.  Inert everywhere else — the gate in
+// setup_virtio_ctrl needs BOTH pid1 AND a /dev/vport*p* node, which only a
+// virtio-serial-equipped guest has.
+var g_vio_fd: c_int = -1;
+var g_vio_wf: ?*FILE = null;
+// Latched "no live peer on the port" — TRUE also initially (before the host
+// has ever connected, and again after read(2) returned 0).  A disconnected
+// virtserialport reports POLLHUP/EOF-readable to poll FOREVER, so while
+// latched the fd stays OUT of the poll set (poll would spin) and the main
+// loop instead reprobe-reads it once per iteration (cadence bounded by the
+// poll timeout, <=1s).  Any read that yields data clears the latch and the
+// fd rejoins the poll set for instant dispatch.
+var g_vio_peer_gone: bool = true;
+var g_vio_carry: [REQ_MAX]u8 = undefined;
+var g_vio_carry_len: usize = 0;
 var g_sigpipe: [2]c_int = .{ -1, -1 };
 var g_shutdown: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0);
 var g_txn_id: u32 = 1;
@@ -188,6 +206,48 @@ fn fx_store_rollback_wrap(s: *fx.Store, version: u32, hard: bool, err: ?[*]u8, e
     return 0;
 }
 
+/// Close a store handle and make what it wrote DURABLE — but only when the
+/// store lives on the DISK mount (post-pivot "/" is tmpfs: syncfs there
+/// flushes nothing that survives the kill).  dl_close/dl_publish_snapshot
+/// fsync their FILES (atomic_write_str: tmp+fsync+rename+dir-fsync), yet
+/// ext4-NOJOURNAL still owes the INODE/BLOCK BITMAP updates of every
+/// create/unlink the handle caused (open() mkdirs the .build sibling and
+/// O_CREATs LOCK; publish creates+renames snapshot dirs) — and ext4 writes
+/// bitmaps LAZILY, seconds after the inode table itself is on disk.
+/// MEASURED on the ctrl harness's killed disk: e2fsck -fn reported BOTH
+/// missing allocations (inode 8224, blocks 33978-33992 — bitmap pages the
+/// kill caught mid-writeback, leaving freed-but-marked-busy extents) AND a
+/// missing free (inode 8336 = store/.db/dep.dafsa, blocks 33998-34013 —
+/// the newly-created file's journal-less allocation had not reached its
+/// bitmap page when boot 3's syncfs raced it).  Boot 3 then hit
+/// __ext4_new_inode:1284 "doubly allocated?" trying to reuse a block whose
+/// bitmap still said busy, and roll-forward died at its first publish.
+/// This is the durability class bootlog_append's sync() already covers for
+/// ITS writes; store mutations need the same protection on the SAME fs.
+fn store_close_durable(s: *fx.Store) void {
+    const root = fx.store.Store.root(s); // []const u8
+    fx.fx_store_close(s);
+    if (!std.mem.startsWith(u8, root, DISK_MOUNT)) return; // ramfs store: nothing durable owed
+    syncfs_path(DISK_MOUNT);
+}
+
+/// Durability flush of the ACTIVE store's filesystem (no handle needed) —
+/// the call the rollback arms use right after a store mutation commit.
+fn syncfs_store() void {
+    if (std.mem.startsWith(u8, span(g_store), DISK_MOUNT)) syncfs_path(DISK_MOUNT);
+}
+
+/// syncfs(2) by MOUNT POINT: an fd on the fs itself reaches every dirty
+/// inode on it (the .db and any nested version dirs included), unlike
+/// sync() from the pivoted root, which flushes the ROOT fs (tmpfs) and
+/// only whatever disk pages chance to be queued when it runs.
+fn syncfs_path(path: [*:0]const u8) void {
+    const fd = open(path, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) return; // best-effort durability, like every other site
+    _ = syncfs(fd);
+    _ = std.c.close(fd);
+}
+
 /// store.zig's db handle (closure.zig's DlDb opaque) cast to this file's
 /// dl_db opaque type — both are plain opaque pointers over libdatalog.so.
 fn store_db(s: *fx.Store) *dl_db {
@@ -219,6 +279,10 @@ extern "c" fn ftell(f: *FILE) c_long;
 extern "c" fn fseek(f: *FILE, offset: c_long, whence: c_int) c_int;
 extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*FILE;
 extern "c" fn fputs(s: [*:0]const u8, f: *FILE) c_int;
+extern "c" fn ferror(f: *FILE) c_int;
+extern "c" fn clearerr(f: *FILE) void;
+extern "c" fn setvbuf(f: *FILE, buf: ?[*]u8, mode: c_int, size: usize) c_int;
+const _IONBF: c_int = 2;
 extern "c" fn fputc(c: c_int, f: *FILE) c_int;
 extern "c" fn fprintf(f: *FILE, fmt: [*:0]const u8, ...) c_int;
 extern "c" fn sscanf(s: [*:0]const u8, fmt: [*:0]const u8, ...) c_int;
@@ -283,6 +347,7 @@ extern "c" fn accept(fd: c_int, addr: ?*anyopaque, addrlen: ?*c_uint) c_int;
 extern "c" fn mount(source: [*:0]const u8, target: [*:0]const u8, fstype: [*:0]const u8, flags: c_ulong, data: ?*const anyopaque) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn sync() void;
+extern "c" fn syncfs(fd: c_int) c_int;
 
 const SockaddrUn = extern struct {
     family: u16,
@@ -544,11 +609,12 @@ fn bootlog_append(v: u32, status: [*:0]const u8, epoch: u32) void {
     _ = fsync(fileno(f));
     _ = fclose(f);
     // the disk store is mounted r/w NOJOURNAL4 (busybox mkfs.ext2 under
-    // ext4): metadata churn (adopt's rm+cp) can sit unflushed when a harness
-    // kills the VM at the verdict — the next mount then finds "doubly
-    // allocated" inode state.  bootlog_append IS the durability point of the
-    // boot contract, so flush the whole fs here.
-    sync();
+    // ext4): metadata churn can sit unflushed when a harness kills the VM
+    // at the verdict — the next mount then finds "doubly allocated" inode
+    // state (see store_close_durable for the measured failure).  Target the
+    // STORE's own filesystem: post-pivot "/" is tmpfs, so a bare sync()
+    // from there flushes the wrong fs.
+    syncfs_store();
 }
 
 fn bootlog_last(v_out: *u32, status_out: [*]u8, scap: usize) c_int {
@@ -604,7 +670,7 @@ fn version_exists(v: u32) c_int {
     const s = fx_store_open_wrap(g_store, &err, err.len) orelse return 0;
     var vers: [256]u32 = undefined;
     const n = dl_snapshot_versions(store_db(s), &vers, vers.len);
-    fx.fx_store_close(s);
+    store_close_durable(s);
     if (n <= 0) return 0;
     var i: c_long = 0;
     while (i < n and i < 256) : (i += 1) {
@@ -855,13 +921,13 @@ fn read_store_facts(version: u32) c_int {
     var gp = GenPick{};
     _ = dl_query_version(db, version, "generation", gen_pick_cb, &gp);
     if (gp.found == 0) {
-        fx.fx_store_close(s);
+        store_close_durable(s);
         return -1;
     }
     const bf = dl_intern_str_of(db, gp.bf);
     const dh = dl_intern_str_of(db, gp.dh);
     if (bf == null or dh == null) {
-        fx.fx_store_close(s);
+        store_close_durable(s);
         return -1;
     }
     _ = snfmt(&g_buildfile, "{s}/{s}", .{ span(g_store), span(bf.?) });
@@ -926,7 +992,7 @@ fn read_store_facts(version: u32) c_int {
         cfree(ac.args);
     }
 
-    fx.fx_store_close(s);
+    store_close_durable(s);
     return 0;
 }
 
@@ -941,11 +1007,11 @@ fn decide_boot_version() u32 {
     var v: u32 = 0;
     if (fx_store_current_version_wrap(s, &v, &err, err.len) != 0) {
         errf("fx-init: no current version: {s}\n", .{span(@ptrCast(&err))});
-        fx.fx_store_close(s);
+        store_close_durable(s);
         return 0;
     }
     g_current_version = v;
-    fx.fx_store_close(s);
+    store_close_durable(s);
 
     var lv: u32 = 0;
     var lstatus: [64]u8 = [_]u8{0} ** 64;
@@ -963,15 +1029,17 @@ fn decide_boot_version() u32 {
                 _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
                 if (rb == 0) {
                     log_line("fx-init", "info", "rolled forward to known-good generation");
-                    // second durability point: bootlog_append's sync() covers
-                    // only ITS OWN append — this rewrite of CURRENT is a
-                    // separate commit, and a kill before the next append
-                    // would lose it (next boot rolls forward AGAIN).
-                    sync();
+                    // second durability point: the roll-forward's CURRENT
+                    // rewrite is a separate commit from bootlog_append's
+                    // fsync — and on the DISK store the nojournal-ext4
+                    // BITMAPS of the rollback's snapshot churn can still be
+                    // mid-writeback (see store_close_durable).  Flush the
+                    // store's OWN filesystem before this boot can be killed.
+                    syncfs_store();
                 } else {
                     errf("fx-init: roll-forward failed: {s}\n", .{span(@ptrCast(&e2))});
                 }
-                fx.fx_store_close(rs);
+                store_close_durable(rs);
             }
             return g_current_version;
         }
@@ -2157,7 +2225,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 return;
             };
             _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
-            fx.fx_store_close(s);
+            store_close_durable(s);
             _ = read_store_facts(g_current_version);
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
@@ -2176,12 +2244,20 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 return;
             };
             if (fx_store_rollback_wrap(s, v, false, &e2, e2.len) != 0) {
-                fx.fx_store_close(s);
+                store_close_durable(s);
                 resp_err(o, @ptrCast(&e2));
                 return;
             }
             _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
-            fx.fx_store_close(s);
+            store_close_durable(s);
+            // The CURRENT rewrite is a separate commit from the rollback's
+            // journal appends (same loss window as decide_boot_version's
+            // roll-forward, init.zig:966-970): a kill between the socket
+            // response and the next bootlog fsync loses it, and the next
+            // boot rolls FORWARD again over the rollback the operator just
+            // asked for.  The ctrl harness kills QEMU seconds after this
+            // response — flush everything before answering.
+            syncfs_store();
             _ = read_store_facts(g_current_version);
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
@@ -2277,6 +2353,130 @@ fn handle_conn(cfd: c_int) void {
     _ = fclose(o);
 }
 
+// ─── virtio-serial control channel (M4: tests/qemu_ctrl.sh) ───────────────
+
+/// Is there a /dev/vport<p>n<p> node?  Scans (opendir/readdir, mirrors
+/// modules_dir) rather than hardcoding vport0p1 — the first virtserialport is
+/// INTERPRETED to land at vport0p1, but the node name is the kernel's to pick.
+fn find_vport(out: []u8) bool {
+    const d = opendir("/dev") orelse return false;
+    defer _ = closedir(d);
+    while (readdir(d)) |e| {
+        const name = std.mem.sliceTo(&e.d_name, 0);
+        if (std.mem.startsWith(u8, name, "vport") and std.mem.indexOf(u8, name, "p") != null) {
+            if (name.len + ("/dev/".len) > out.len) continue;
+            @memcpy(out[0.."/dev/".len], "/dev/");
+            @memcpy(out["/dev/".len .. "/dev/".len + name.len], name);
+            out["/dev/".len + name.len] = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Open the guest end of the virtserialport, if this boot can have one:
+/// PID1 (a harness running as a normal process must stay inert) AND an actual
+/// vport node (no virtio-serial device attached => none exists => inert).
+fn setup_virtio_ctrl() void {
+    if (std.c.getpid() != 1) return;
+    var vp: [256]u8 = undefined;
+    if (!find_vport(&vp)) return;
+    const fd = open(@ptrCast(&vp), O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) {
+        errf("fx-init: warning: virtio control: open {s}: {s}\n", .{ span(@ptrCast(&vp)), errnoStr() });
+        return;
+    }
+    // ONE stdio write handle for the channel's lifetime: handle_request's
+    // resp_ok/resp_err fprintf into it and fflush (init.zig resp_*), so the
+    // response leaves for the host immediately.
+    g_vio_wf = fdopen(fd, "w");
+    const wf = g_vio_wf orelse {
+        errf("fx-init: warning: virtio control: fdopen {s} failed\n", .{span(@ptrCast(&vp))});
+        _ = std.c.close(fd);
+        return;
+    };
+    g_vio_fd = fd;
+    // The channel outlives many host sessions: make the FILE unbuffered (a
+    // failed write loses only that response — nothing stale sits in a stdio
+    // buffer for the NEXT session) and clear the stdio error flag whenever a
+    // write failed (musl/glibc refuse all writes on a FILE once ferror is
+    // set; without clearerr one dropped response would silence the channel
+    // for every later peer).  MEASURED: nc -N's half-close makes qemu drop
+    // the chardev before the guest's response write -> EAGAIN; the next
+    // session must still be able to answer.
+    _ = setvbuf(wf, null, _IONBF, 0);
+    errf("fx-init: virtio control up ({s})\n", .{span(@ptrCast(&vp))});
+}
+
+/// One POLLIN dispatch on the virtio port: a single read, appended to the
+/// carry buffer, split on newlines; each COMPLETE line runs the EXISTING
+/// handle_request (the command grammar is the socket's, not a copy).
+/// read()==0 (host chardev closed/dropped) LATCHES g_vio_peer_gone: a
+/// disconnected port reports POLLIN|POLLHUP with an endless EOF, so the
+/// latch both stops this path spinning and (see main_loop) drops the fd from
+/// the poll set.  Any read that yields data clears the latch — the host
+/// connected (or reconnected) and the port is live again.
+fn handle_virtio() void {
+    const wf = g_vio_wf orelse return;
+    var buf: [4096]u8 = undefined;
+    const n = std.c.read(g_vio_fd, &buf, buf.len);
+    if (n < 0) return; // EAGAIN or a transient error: nothing to do
+    if (n == 0) {
+        if (!g_vio_peer_gone) errf("fx-init: vio: peer EOF (latched)\n", .{});
+        g_vio_peer_gone = true;
+        return;
+    }
+    if (g_vio_peer_gone) errf("fx-init: vio: peer is back\n", .{});
+    g_vio_peer_gone = false;
+    // One command per read (MEASURED on this channel: the host's requests
+    // arrive as separate reads) — handle_request takes a MUTABLE [*:0]u8
+    // (strtok_r), so a shared static line buffer would alias g_vio_carry.
+    var consumed: usize = 0;
+    while (consumed < @as(usize, @intCast(n))) {
+        const nl = std.mem.indexOfScalar(u8, buf[consumed..@intCast(n)], '\n') orelse {
+            // partial line: carry it, capped — a line longer than the buffer
+            // is truncated at REQ_MAX-1 and handled (garbage-in) rather than
+            // wedgeing the channel.
+            const room = @min(g_vio_carry.len - 1 - g_vio_carry_len, @as(usize, @intCast(n)) - consumed);
+            @memcpy(g_vio_carry[g_vio_carry_len .. g_vio_carry_len + room], buf[consumed .. consumed + room]);
+            g_vio_carry_len += room;
+            consumed += room;
+            break;
+        };
+        const seg = buf[consumed .. consumed + nl];
+        var line: [REQ_MAX + 1]u8 = undefined;
+        const clen = @min(g_vio_carry_len, REQ_MAX);
+        @memcpy(line[0..clen], g_vio_carry[0..clen]);
+        const total = clen + seg.len;
+        if (total <= REQ_MAX) {
+            @memcpy(line[clen..total], seg);
+            line[total] = 0;
+            handle_request(wf, @ptrCast(&line));
+        }
+        // overlong line: copy the truncated seg and NUL-terminate, then feed
+        // it (garbage-in).  line[clen..REQ_MAX] is zeroed first so a truncated
+        // segment cannot carry uninitialized garbage into the handled line;
+        // line[REQ_MAX] terminates it so strtok_r stops at the boundary.
+        else {
+            @memset(line[clen..REQ_MAX], 0);
+            const copy_len = @min(seg.len, REQ_MAX - clen);
+            @memcpy(line[clen..clen + copy_len], seg[0..copy_len]);
+            line[REQ_MAX] = 0;
+            handle_request(wf, @ptrCast(&line));
+        }
+        g_vio_carry_len = 0;
+        consumed += nl + 1;
+    }
+    // One flushed, observed response per dispatch; a failed write (host
+    // dropped the chardev mid-response — MEASURED with nc -N) clears the
+    // error flag so the NEXT session can still answer.
+    _ = fflush(wf);
+    if (ferror(wf) != 0) {
+        errf("fx-init: vio: response write failed (host dropped?) — clearing\n", .{});
+        clearerr(wf);
+    }
+}
+
 // ─── shutdown (fx-init.c:1194-1220) ───────────────────────────────────────
 
 fn do_shutdown() void {
@@ -2329,6 +2529,13 @@ fn do_shutdown() void {
     _ = snfmt(&sp, "{s}/control.sock", .{span(@ptrCast(&g_run))});
     _ = std.c.unlink(@ptrCast(&sp));
     if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
+    if (g_vio_fd >= 0) {
+        // g_vio_wf is an fdopen over g_vio_fd and owns it — one fclose
+        // closes both (fdclose(3) is not in this libc; no double close).
+        if (g_vio_wf) |wf| _ = fclose(wf) else _ = std.c.close(g_vio_fd);
+        g_vio_fd = -1;
+        g_vio_wf = null;
+    }
     if (g_rt) |r| dl_close(r);
     if (g_log) |l| fx_log_close(l);
 }
@@ -2371,6 +2578,14 @@ fn main_loop() void {
             pf[nfd] = .{ .fd = g_ctrl_fd, .events = std.posix.POLL.IN, .revents = 0 };
             nfd += 1;
         }
+        // Latched (no live peer / host dropped): keep the port OUT of the
+        // poll set — a disconnected virtserialport is POLLIN|POLLHUP-readable
+        // FOREVER and would spin poll at 100% — and reprobe it once per
+        // iteration below instead (MEASURED on the first qemu_ctrl run).
+        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+            pf[nfd] = .{ .fd = g_vio_fd, .events = std.posix.POLL.IN, .revents = 0 };
+            nfd += 1;
+        }
         var i: c_int = 0;
         while (i < g_nsvc and nfd < pf.len) : (i += 1) {
             if (g_svc.?[@intCast(i)].out_fd >= 0) {
@@ -2396,6 +2611,24 @@ fn main_loop() void {
                     if (cfd >= 0) handle_conn(cfd);
                 }
             }
+        }
+        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+            pi = 0;
+            while (pi < nfd) : (pi += 1) {
+                if (pf[pi].fd == g_vio_fd and (pf[pi].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                    handle_virtio();
+                }
+            }
+        } else if (g_vio_fd >= 0) {
+            // reprobe: ONE nonblocking read per main-loop iteration — the
+            // latched port may have a host again (qemu's chardev accepts a
+            // new connection without touching the guest).  A poll() with a
+            // <=1s timeout bounds the cadence, so this is not a spin; the
+            // first data read clears the latch and the fd rejoins the poll
+            // set above.  Silent by design: handle_virtio logs only STATE
+            // CHANGES (peer EOF latched / peer is back) — one console line
+            // that matters must not drown in per-iteration reprobes.
+            handle_virtio();
         }
         pi = 0;
         while (pi < nfd) : (pi += 1) {
@@ -2653,6 +2886,7 @@ pub fn main(init: std.process.Init) !void {
 
     g_ctrl_fd = setup_ctrl();
     if (g_ctrl_fd < 0) errf("fx-init: warning: control socket failed\n", .{});
+    setup_virtio_ctrl();
 
     log_line("fx-init", "info", "entered main loop");
     main_loop();
