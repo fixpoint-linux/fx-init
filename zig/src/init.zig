@@ -142,6 +142,19 @@ var g_vio_wf: ?*FILE = null;
 var g_vio_peer_gone: bool = true;
 var g_vio_carry: [REQ_MAX]u8 = undefined;
 var g_vio_carry_len: usize = 0;
+// M4 in-guest activate: the `put <path>` upload state (config transport
+// over the line-oriented channel — base64 lines until a lone `.`).  The
+// pump calls handle_request once per COMPLETE line, so the multi-line
+// framing state must live in file-statics toggled across calls (the
+// g_vio_carry precedent).  Path + accumulated payload + an open flag; a
+// `.` with no open put is an ERR, never a silent no-op.
+const PUT_MAX: usize = 1 << 20; // 1 MiB decoded cap (a config is ~2 KiB)
+const PUT_LINE_MAX: usize = 4096;
+var g_put_open: bool = false;
+var g_put_path: [PATH_MAX]u8 = [_]u8{0} ** PATH_MAX;
+var g_put_b64: ?[*]u8 = null; // malloc'd base64 payload (NUL-terminated)
+var g_put_b64_len: usize = 0;
+var g_put_b64_cap: usize = 0;
 var g_sigpipe: [2]c_int = .{ -1, -1 };
 var g_shutdown: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0);
 var g_txn_id: u32 = 1;
@@ -2063,6 +2076,137 @@ fn resp_err(o: *FILE, msg: [*:0]const u8) void {
     _ = fflush(o);
 }
 
+// ─── put <path> (M4 in-guest activate: config upload over the channel) ────
+//
+// Framing: `put <path>` opens, raw base64 lines accumulate (RFC 4648,
+// padding allowed, lines short enough for REQ_MAX), a lone `.` decodes +
+// writes + answers "OK put <n> bytes" or "ERR ...".  The write target is
+// WHITELISTED to /run/ — the channel must not be able to write arbitrary
+// guest files (a config is the only intended payload, and /run/fx is where
+// the activate handler's consumers live).
+
+fn putAbort() void {
+    g_put_open = false;
+    g_put_b64_len = 0;
+    if (g_put_b64) |p| _ = free(@ptrCast(p));
+    g_put_b64 = null;
+    g_put_b64_cap = 0;
+}
+
+fn putBegin(o: *FILE, path: [*:0]u8) void {
+    const p = span(path);
+    // whitelist: /run/ only (and an absolute path — no CWD games)
+    if (p.len < "/run/x".len or p[0] != '/' or !std.mem.startsWith(u8, p, "/run/")) {
+        resp_err(o, "put: path must be under /run/");
+        return;
+    }
+    if (g_put_open) putAbort(); // a stale open put: reset before starting
+    if (p.len >= g_put_path.len) {
+        resp_err(o, "put: path too long");
+        return;
+    }
+    @memcpy(g_put_path[0..p.len], p);
+    g_put_path[p.len] = 0;
+    g_put_open = true;
+    g_put_b64_len = 0;
+    resp_ok(o);
+}
+
+/// Append one payload line to the open put; on the lone `.` terminator,
+/// base64-decode, write the file, answer.  Always leaves g_put_open false
+/// after a `.` (success or failure) — never a half-open upload.
+fn putPayloadLine(o: *FILE, line: [*:0]u8) void {
+    const l = span(line);
+    if (l.len == 1 and l[0] == '.') {
+        g_put_open = false;
+        putFinish(o);
+        return;
+    }
+    // base64 payload (with padding; blank lines are tolerated as no-ops so
+    // a trailing newline in the stream cannot corrupt the upload)
+    if (l.len == 0) return;
+    if (g_put_b64_len + l.len + 1 > PUT_MAX) {
+        putAbort();
+        resp_err(o, "put: payload too large");
+        return;
+    }
+    if (g_put_b64 == null) {
+        const cap: usize = 64 * 1024;
+        const p = malloc(cap) orelse {
+            putAbort();
+            resp_err(o, "put: out of memory");
+            return;
+        };
+        g_put_b64 = p;
+        g_put_b64_cap = cap;
+    }
+    if (g_put_b64_len + l.len + 1 > g_put_b64_cap) {
+        var nc = g_put_b64_cap;
+        while (nc < g_put_b64_len + l.len + 1) nc *= 2;
+        if (nc > PUT_MAX + 1) nc = PUT_MAX + 1;
+        const p = realloc(@ptrCast(g_put_b64), nc);
+        if (p == null) {
+            putAbort();
+            resp_err(o, "put: out of memory");
+            return;
+        }
+        g_put_b64 = @ptrCast(@alignCast(p));
+        g_put_b64_cap = nc;
+    }
+    @memcpy(g_put_b64.?[g_put_b64_len..][0..l.len], l);
+    g_put_b64_len += l.len;
+    g_put_b64.?[g_put_b64_len] = 0;
+}
+
+fn putFinish(o: *FILE) void {
+    const dec = std.base64.standard.Decoder;
+    const src = g_put_b64.?[0..g_put_b64_len];
+    const n = dec.calcSizeForSlice(src) catch {
+        putAbort();
+        resp_err(o, "put: invalid base64");
+        return;
+    };
+    if (n > PUT_MAX) {
+        putAbort();
+        resp_err(o, "put: decoded too large");
+        return;
+    }
+    const buf = malloc(n) orelse {
+        putAbort();
+        resp_err(o, "put: out of memory");
+        return;
+    };
+    defer _ = free(buf);
+    dec.decode(buf[0..n], src) catch {
+        putAbort();
+        resp_err(o, "put: invalid base64");
+        return;
+    };
+    // write via fopen/fwrite (the C-style file surface used here)
+    const f = fopen(@ptrCast(&g_put_path), "wb") orelse {
+        putAbort();
+        resp_err(o, "put: open failed");
+        return;
+    };
+    if (fwrite(buf, 1, n, f) != n) {
+        _ = fclose(f);
+        putAbort();
+        resp_err(o, "put: write failed");
+        return;
+    }
+    if (fclose(f) != 0) {
+        putAbort();
+        resp_err(o, "put: close failed");
+        return;
+    }
+    var m: [64]u8 = undefined;
+    _ = snprintf(&m, m.len, "OK put %zu bytes", n);
+    _ = fputs(@ptrCast(&m), o);
+    _ = fputc('\n', o);
+    _ = fflush(o);
+    putAbort();
+}
+
 const GrepEmitCtx = struct { o: *FILE, db: ?*dl_db };
 fn grep_log_cb(ts: u32, svc: [*:0]const u8, lvl: [*:0]const u8, msg: [*:0]const u8, user: ?*anyopaque) callconv(.c) c_int {
     const g: *GrepEmitCtx = @ptrCast(@alignCast(user.?));
@@ -2076,10 +2220,27 @@ fn search_log_cb(ts: u32, svc: [*:0]const u8, lvl: [*:0]const u8, msg: [*:0]cons
 
 fn handle_request(o: *FILE, line: [*:0]u8) void {
     var save: ?[*:0]u8 = null;
+    // an OPEN put swallows every line as payload (even one that looks like
+    // a command) until the lone `.` terminator — the framing state must be
+    // consulted BEFORE the command grammar, or a payload line colliding
+    // with a command name would corrupt the upload.
+    if (g_put_open) {
+        putPayloadLine(o, line);
+        return;
+    }
     const cmd = strtok_r(line, " \t", &save) orelse {
         resp_err(o, "empty");
         return;
     };
+
+    if (strcmp(cmd, "put") == 0) {
+        const arg = strtok_r(null, " \t", &save) orelse {
+            resp_err(o, "put <path>");
+            return;
+        };
+        putBegin(o, arg);
+        return;
+    }
 
     if (strcmp(cmd, "status") == 0) {
         _ = fprintf(o, "boot_status:\n");
@@ -2212,14 +2373,62 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
         rt_control(txn, cmd, arg);
         _ = rt_txn_commit();
         if (strcmp(cmd, "activate") == 0) {
+            // Capture the child's stderr: an in-guest activate failure must
+            // be diagnosable FROM THE CHANNEL (fx-activate's own message —
+            // "package not built", a config parse error, a missing pkgset —
+            // is the only clue; the child's console stderr does not reach
+            // the host transcript).
+            var epipe: [2]c_int = .{ -1, -1 };
+            const have_pipe = std.c.pipe(&epipe) == 0;
             const pid = std.c.fork();
             if (pid == 0) {
-                const av = [_:null]?[*:0]const u8{ @ptrCast(&g_fxstore), "--store", g_store, "--config", arg };
+                // /usr/fx/package-set.dhall: the IMAGE-shipped guest pkgset
+                // (absolute src paths, frozen at build time).  /usr is one
+                // of the pivot binds, so the file is readable both pre- and
+                // post-pivot; without it fx-activate defaults to a CWD
+                // package-set.dhall that does not exist in the guest, and
+                // in-guest activation would fail at load.
+                if (have_pipe) {
+                    _ = std.c.close(epipe[0]);
+                    _ = std.c.dup2(epipe[1], 2);
+                    _ = std.c.close(epipe[1]);
+                }
+                const av = [_:null]?[*:0]const u8{ @ptrCast(&g_fxstore), "--store", g_store, "--package-set", "/usr/fx/package-set.dhall", "--config", arg };
                 _ = exec_sh_retry(@ptrCast(&g_fxstore), &av);
+                _ = std.c.write(2, "fx-init: exec fx-activate failed\n", "fx-init: exec fx-activate failed\n".len);
                 std.c._exit(127);
             }
-            var rc: c_int = -1;
+            var rc: c_int = -1; // fork failed => rc stays -1 => failure below
+            var eb: [512]u8 = undefined;
+            var elen: usize = 0;
             if (pid > 0) {
+                if (have_pipe) {
+                    _ = std.c.close(epipe[1]);
+                    // Drain the child's stderr to EOF (the child exits, all
+                    // its fds close), keeping the LAST 512 bytes — the final
+                    // lines carry the reason, the head is progress output.
+                    // Reading BEFORE waitpid also empties the pipe so a
+                    // chatty child cannot deadlock on a full pipe buffer.
+                    while (true) {
+                        var c: [256]u8 = undefined;
+                        const n = std.c.read(epipe[0], &c, c.len);
+                        if (n <= 0) break;
+                        const un: usize = @intCast(n);
+                        if (un >= eb.len) {
+                            @memcpy(&eb, c[un - eb.len ..][0..eb.len]);
+                            elen = eb.len;
+                            continue;
+                        }
+                        if (elen + un > eb.len) {
+                            const drop = elen + un - eb.len;
+                            std.mem.copyForwards(u8, eb[0 .. eb.len - drop], eb[drop..]);
+                            elen -= drop;
+                        }
+                        @memcpy(eb[elen..][0..un], c[0..un]);
+                        elen += un;
+                    }
+                    _ = std.c.close(epipe[0]);
+                }
                 var st: c_int = 0;
                 _ = std.c.waitpid(pid, &st, 0);
                 const st_u32: u32 = @bitCast(st);
@@ -2229,7 +2438,36 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 rt_txn_begin();
                 rt_effect(txn, "activate", "failed");
                 _ = rt_txn_commit();
-                resp_err(o, "activate failed");
+                // ONE channel line: "activate failed (rc N): <stderr tail>"
+                // — inner newlines collapse to spaces so the response cannot
+                // forge extra protocol lines.
+                var msg: [560]u8 = undefined;
+                var mi: usize = 0;
+                const hdr = if (have_pipe) "activate failed" else "activate failed (no stderr capture)";
+                @memcpy(msg[0..hdr.len], hdr);
+                mi = hdr.len;
+                const rcw = std.fmt.bufPrint(msg[mi..], " (rc {d})", .{rc}) catch msg[mi..][0..0];
+                mi += rcw.len;
+                var tl = elen;
+                while (tl > 0 and (eb[tl - 1] == '\n' or eb[tl - 1] == '\r' or eb[tl - 1] == ' ')) tl -= 1;
+                if (tl > 0 and mi + 2 < msg.len - 1) {
+                    if (tl > msg.len - 1 - (mi + 2)) tl = msg.len - 1 - (mi + 2);
+                    msg[mi] = ':';
+                    msg[mi + 1] = ' ';
+                    mi += 2;
+                    var j: usize = 0;
+                    while (j < tl) : (j += 1) {
+                        const ch = eb[j];
+                        if (ch == '\n' or ch == '\r' or ch == '\t') {
+                            if (msg[mi - 1] == ' ') continue;
+                            msg[mi] = ' ';
+                        } else msg[mi] = ch;
+                        mi += 1;
+                    }
+                    while (mi > 0 and msg[mi - 1] == ' ') mi -= 1;
+                }
+                msg[mi] = 0;
+                resp_err(o, @ptrCast(&msg));
                 return;
             }
             var e2: [1024]u8 = undefined;
@@ -2247,6 +2485,16 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             rt_txn_begin();
             rt_effect(txn, "version", "");
             _ = rt_txn_commit();
+            // Same loss window as the rollback arm below (its comment):
+            // the child's publish writes snapshot manifests with buffered
+            // stdio (dl.zig materializeSnapshot — the .dafsa files are
+            // per-file fsync'd, the manifest is NOT), and the LAST store
+            // touch before the response is read_store_facts' open/close —
+            // a kill before writeback lands leaves the manifest 0-byte on
+            // disk (MEASURED: next boot's dl_query_version finds no
+            // generation and the guest boot-FAILED v7).  Flush everything
+            // before answering.
+            syncfs_store();
             resp_ok(o);
             return;
         } else {

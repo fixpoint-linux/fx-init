@@ -45,6 +45,14 @@
 #   file list (dev segment + main segment, sorted) to LISTFILE — cpio -it
 #   stops at the first trailer, so the concatenation is otherwise hard to
 #   inspect (determinism checks pin this list; mtimes vary by design).
+#   -p PKGSET (OPTIONAL, default off): rewrite the pkgset's RELATIVE src
+#   Path values to ABSOLUTE (the loader keeps absolute paths verbatim —
+#   relative ones realpath against the pkgset dir AT LOAD and fail in the
+#   guest, where no source trees exist) and ship it at /usr/fx/package-set.dhall
+#   (the fx-init control handler's activate argv points there; /usr is one
+#   of the pivot binds, so the file is readable both pre- and post-pivot).
+#   Without -p the image is byte-identical to before (every existing caller
+#   unchanged).
 set -u
 
 fail() { echo "mkinitramfs: FAIL: $*" >&2; exit 1; }
@@ -55,6 +63,7 @@ ROOTDIR=""
 KERNEL=""
 OUT=""
 LIST=""
+PKGSET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -s) [ $# -ge 2 ] || fail "-s needs a value"; STORE=$2; shift 2 ;;
@@ -62,7 +71,8 @@ while [ $# -gt 0 ]; do
         -k) [ $# -ge 2 ] || fail "-k needs a value"; KERNEL=$2; shift 2 ;;
         -o) [ $# -ge 2 ] || fail "-o needs a value"; OUT=$2; shift 2 ;;
         -l) [ $# -ge 2 ] || fail "-l needs a value"; LIST=$2; shift 2 ;;
-        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE])" ;;
+        -p) [ $# -ge 2 ] || fail "-p needs a value"; PKGSET=$2; shift 2 ;;
+        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET])" ;;
     esac
 done
 [ -n "$STORE" ]   || fail "-s STORE required"
@@ -162,6 +172,32 @@ cp "$FX_DATALOG_LIB/libdatalog.so" "$STAGE/lib64/libdatalog.so" || fail "cannot 
 
 # ─── ROOTDIR overlay (pre-boot rootfs state; empty for the qemu boots) ────
 cp -a "$ROOTDIR"/. "$STAGE/" || fail "cannot overlay ROOTDIR $ROOTDIR"
+
+# ─── the guest pkgset (-p; AFTER the overlay so it is authoritative) ──────
+# Rewrite RELATIVE src Path values to ABSOLUTE and ship at
+# /usr/fx/package-set.dhall — the fx-init control handler's in-guest
+# `activate` argv points there.  The rewrite mirrors tests/qemu_ctrl.sh's
+# freeze sed: each < Path = "<relative>" > becomes < Path = "<abs>" >,
+# resolved against the PKGSET's own directory.  ABSOLUTE values pass
+# through untouched (the loader keeps them verbatim), so the caller may
+# pass an already-frozen pkgset.
+if [ -n "$PKGSET" ]; then
+    [ -f "$PKGSET" ] || fail "-p pkgset not a file: $PKGSET"
+    case "$PKGSET" in /*) ;; *) PKGSET=$(cd "$(dirname "$PKGSET")" && pwd)/$(basename "$PKGSET") ;; esac
+    PKGDIR=$(dirname "$PKGSET")
+    mkdir -p "$STAGE/usr/fx" || fail "cannot create /usr/fx"
+    sed -e "s|< Path = \"\(\.\.[^\"]*\)\" >|< Path = \"$PKGDIR/\1\" >|" \
+        -e "s|< Path = \"\.\(/[^\"]*\)\" >|< Path = \"$PKGDIR\1\" >|" \
+        "$PKGSET" > "$STAGE/usr/fx/package-set.dhall" \
+        || fail "cannot rewrite the pkgset"
+    # every Path in the shipped pkgset must now be ABSOLUTE (a relative one
+    # would fail the in-guest load with a confusing canonicalize error).
+    # NOTE: match `\.` literally via -F (a BRE like '< Path = "\.' is an
+    # unterminated escape — grep errors rc=2 and the guard never fires).
+    if grep -qF '< Path = "..' "$STAGE/usr/fx/package-set.dhall"; then
+        fail "-p: the pkgset still has relative Path values after the rewrite"
+    fi
+fi
 
 # ─── the early device-node cpio segment ───────────────────────────────────
 # 070701 (newc) record: 110-byte header = magic + 13 x 8-hex fields (ino

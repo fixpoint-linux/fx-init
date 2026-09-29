@@ -259,6 +259,12 @@ fn storePathOf(es: []const PathEntry, name: []const u8) ?[]const u8 {
 // (fx_content_hash_dir / fx_store_*); main() sets it from init.io.
 var g_io: std.Io = undefined;
 
+// src-free fallback visibility: how many closure packages were resolved
+// from published srcstore facts this run (0 = the sources were all present
+// and the behavior is byte-identical to before).
+var src_free_resolved: usize = 0;
+var src_free_failed: usize = 0;
+
 /// Copy a port module's ErrBuf message into `cerr` and fail as the C callees
 /// did (the C fx_* fns wrote into the caller's `char err[PATH_MAX]`).
 fn cerrCopy(eb: anytype, cerr: *[PATH_MAX]u8) ComputeError {
@@ -270,6 +276,183 @@ fn cerrCopy(eb: anytype, cerr: *[PATH_MAX]u8) ComputeError {
 }
 
 pub const ComputeError = error{ CFailed, FxErr, OutOfMemory };
+
+// ─── src-free resolution (in-guest activation) ────────────────────────────
+//
+// In the guest the package source trees are ABSENT (only the store ships),
+// so the per-package source hash cannot be computed by walking them.  The
+// store's own committed metadata carries the mapping instead:
+//
+//   srcstore(src_hash, name)  — clean-source artifact index (store.zig;
+//                               col0=src_hash, col1=name — commit_srcstore_fact)
+//   store(hash, name)         — the built-package index (same column order)
+//   activate_root(root)       — the store root the committed hashes were
+//                               computed under (committed by fx-activate)
+//
+// A dep-carrying package's derivation hash embeds each dep's FULL store path
+// (fx_derivation_hash_ex serializes dep_paths verbatim), so recomputing under
+// a DIFFERENT store root yields a different hash.  The fallback therefore
+// recomputes dep paths under the RECORDED activation root — a string
+// re-prefix, no filesystem access — and adopts a candidate only when the
+// recomputed derivation hash's store dir EXISTS under the live root AND
+// store(h,name) is committed.  Adoption is then exactly "the exact bytes the
+// sources would have built are already in THIS store, self-attested by its
+// own metadata": a different closure would need a different h and its dir
+// present, at which point it is not different.
+
+/// Every srcstore row as (src_hash_sym, name_sym) pairs (the relation is
+/// package-count small; a full walk + filter beats a leading-prefix bind,
+/// which would bind col0=HASH, not the name).
+const SrcRows = struct {
+    rows: std.ArrayList([2]u32) = .empty,
+    oom: bool = false,
+};
+
+fn srcRowsCb(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = arity; // srcstore is arity 2; cols[0..2] are the pair
+    const bag: *SrcRows = @ptrCast(@alignCast(user.?));
+    bag.rows.append(gpa_alloc, .{ cols[0], cols[1] }) catch {
+        bag.oom = true;
+        return 1;
+    };
+    return 0;
+}
+
+/// The store root recorded by the activation that committed the hashes
+/// (activate_root(root)); null when the relation is empty/undeclared.
+fn recordedRoot(db: *DlDb, buf: []u8) ?[]const u8 {
+    const RootBag = struct {
+        db: *DlDb,
+        buf: []u8,
+        len: usize = 0,
+        got: bool = false,
+        oom: bool = false,
+    };
+    const cb = struct {
+        fn f(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+            _ = arity;
+            const rb: *RootBag = @ptrCast(@alignCast(user.?));
+            if (rb.got) return 0; // one root per store: first row wins
+            const s = fx.dl_intern_str_of(rb.db, cols[0]) orelse {
+                rb.oom = true;
+                return 1;
+            };
+            const sv = std.mem.span(s);
+            if (sv.len >= rb.buf.len) {
+                rb.oom = true;
+                return 1;
+            }
+            @memcpy(rb.buf[0..sv.len], sv);
+            rb.len = sv.len;
+            rb.got = true;
+            return 0;
+        }
+    }.f;
+    var rb = RootBag{ .db = db, .buf = buf };
+    _ = fx.dl_query(db, "activate_root", cb, &rb);
+    if (rb.oom or !rb.got) return null;
+    return rb.buf[0..rb.len];
+}
+
+/// Resolve a .path package's hashes WITHOUT its source tree: for every
+/// srcstore(?, name) candidate src_hash, recompute the derivation hash over
+/// dep paths re-prefixed under the RECORDED activation root, and adopt the
+/// first candidate whose store dir exists AND whose store(h,name) fact is
+/// committed.  Returns false with `why` set when no candidate resolves — a
+/// config adding a genuinely new package must still fail loudly.
+fn srcFreeResolve(
+    p: *Package,
+    db: *DlDb,
+    dep_paths: []const []const u8, // dep store paths under the LIVE root
+    store_root: []const u8, // the LIVE root (dir-existence tests)
+    out_hash: *[65]u8, // adopted derivation hash (hex64)
+    out_src: *[65]u8, // adopted src_hash (hex64)
+    why: *ErrBuf,
+) bool {
+    var arena = std.heap.ArenaAllocator.init(gpa_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // dep paths under the RECORDED root: derivation identity requires the
+    // root the committed hashes were computed under, not the live one.
+    var root_buf: [PATH_MAX]u8 = undefined;
+    const rec_root = recordedRoot(db, &root_buf) orelse {
+        eSet(why, "package '{s}': source tree absent and the store records no activate_root (activate once with sources present and re-ship the store)", .{p.name});
+        return false;
+    };
+    var rec_deps: [][]const u8 = &.{};
+    if (dep_paths.len > 0) {
+        const dp = a.alloc([]const u8, dep_paths.len) catch {
+            eSet(why, "out of memory", .{});
+            return false;
+        };
+        for (dep_paths, 0..) |dpath, j| {
+            // dpath is "<live_root>/<hash>-<name>": keep the store-relative tail
+            const rel = std.mem.lastIndexOfScalar(u8, dpath, '/') orelse (dpath.len - 1);
+            dp[j] = std.fmt.allocPrint(a, "{s}/{s}", .{ rec_root, dpath[rel + 1 ..] }) catch {
+                eSet(why, "out of memory", .{});
+                return false;
+            };
+        }
+        rec_deps = dp;
+    }
+
+    var nz: [256:0]u8 = undefined;
+    if (p.name.len >= nz.len) {
+        eSet(why, "package '{s}': name too long", .{p.name});
+        return false;
+    }
+    @memcpy(nz[0..p.name.len], p.name);
+    nz[p.name.len] = 0;
+    const name_sym = fx.dl_intern_str(db, &nz);
+    if (name_sym == 0) {
+        eSet(why, "out of memory", .{});
+        return false;
+    }
+
+    var bag = SrcRows{};
+    defer bag.rows.deinit(gpa_alloc);
+    const n = fx.dl_query(db, "srcstore", srcRowsCb, &bag);
+    if (n < 0 or bag.oom) {
+        eSet(why, "package '{s}': srcstore enumeration failed", .{p.name});
+        return false;
+    }
+
+    var dir_buf: [PATH_MAX]u8 = undefined;
+    var hz: [65:0]u8 = undefined;
+    for (bag.rows.items) |row| {
+        if (row[1] != name_sym) continue;
+        const hs = fx.dl_intern_str_of(db, row[0]) orelse continue;
+        const h = std.mem.span(hs);
+        if (h.len != 64) continue; // not a hex64 src hash: skip, not fail
+        var cand_src: [65]u8 = undefined;
+        @memcpy(cand_src[0..64], h[0..64]);
+
+        var h2: [65]u8 = undefined;
+        var de = fx.derivation.ErrBuf{};
+        fx.fx_derivation_hash_ex(p, cand_src[0..64], rec_deps, &h2, &de) catch continue;
+        // adopt only if the derivation hash's dir is in THIS store and its
+        // store(h,name) fact is committed (self-attestation, not trust)
+        const sp = fx.fx_store_path_of(store_root, h2[0..64], p.name, &dir_buf);
+        if (!isDir(std.Io.Dir.cwd(), g_io, sp)) continue;
+        @memcpy(hz[0..64], h2[0..64]);
+        hz[64] = 0;
+        const hsym = fx.dl_intern_str(db, &hz);
+        if (hsym == 0) {
+            eSet(why, "out of memory", .{});
+            return false;
+        }
+        const pair = [2]u32{ hsym, name_sym };
+        if (fx.dl_lookup(db, "store", &pair, 2) == 0) continue;
+        @memcpy(out_hash[0..64], h2[0..64]);
+        out_hash[64] = 0;
+        @memcpy(out_src[0..64], cand_src[0..64]);
+        out_src[64] = 0;
+        return true;
+    }
+    eSet(why, "package '{s}': source tree absent and no published srcstore/store pair resolves it (build it on a host: fxstore build / fx-activate with sources present) and re-ship the store", .{p.name});
+    return false;
+}
 
 /// compute_paths — fx_closure_compute -> fx_closure_names -> fx_topo_order,
 /// then per package (topo, deps-first): content-hash the SRC_PATH tree, hash
@@ -323,14 +506,45 @@ pub fn computePaths(
             var h: [65]u8 = undefined;
             var src_hash: ?[]const u8 = null;
             if (p.src.kind == .path) {
-                var sh: [65]u8 = undefined;
-                fx.fx_content_hash_dir(g_io, p.src.path.?, p.excludes, &sh, &de) catch return cerrCopy(&de, cerr);
-                const own = gpa_alloc.dupe(u8, sh[0..64]) catch {
-                    eSet(e, "out of memory", .{});
-                    return error.FxErr;
-                };
-                entries[i].src_hash = own;
-                src_hash = own;
+                if (isDir(std.Io.Dir.cwd(), g_io, p.src.path.?)) {
+                    var sh: [65]u8 = undefined;
+                    fx.fx_content_hash_dir(g_io, p.src.path.?, p.excludes, &sh, &de) catch return cerrCopy(&de, cerr);
+                    const own = gpa_alloc.dupe(u8, sh[0..64]) catch {
+                        eSet(e, "out of memory", .{});
+                        return error.FxErr;
+                    };
+                    entries[i].src_hash = own;
+                    src_hash = own;
+                } else {
+                    // src-free fallback (in-guest activation): resolve from
+                    // the store's own committed srcstore/store/activate_root
+                    // metadata; LOUD failure when nothing resolves.
+                    var fh: [65]u8 = undefined;
+                    var fs: [65]u8 = undefined;
+                    if (!srcFreeResolve(p, db, dep_paths orelse &.{}, store_root, &fh, &fs, e)) {
+                        src_free_failed += 1;
+                        return error.FxErr;
+                    }
+                    const own_h = gpa_alloc.dupe(u8, fh[0..64]) catch {
+                        eSet(e, "out of memory", .{});
+                        return error.FxErr;
+                    };
+                    const own_s = gpa_alloc.dupe(u8, fs[0..64]) catch {
+                        eSet(e, "out of memory", .{});
+                        return error.FxErr;
+                    };
+                    entries[i].hash = own_h;
+                    entries[i].src_hash = own_s;
+                    var path: [PATH_MAX]u8 = undefined;
+                    const path_s = fx.fx_store_path_of(store_root, own_h, p.name, &path);
+                    entries[i].p = p;
+                    entries[i].path = gpa_alloc.dupeZ(u8, path_s) catch {
+                        eSet(e, "out of memory", .{});
+                        return error.FxErr;
+                    };
+                    src_free_resolved += 1;
+                    continue;
+                }
             }
             fx.fx_derivation_hash_ex(p, src_hash, dep_paths orelse &.{}, &h, &de) catch return cerrCopy(&de, cerr);
             var path: [PATH_MAX]u8 = undefined;
@@ -373,12 +587,16 @@ pub const EtcItem = struct {
     content: []const u8,
 };
 
-/// (name, storedir) pair for a /bin symlink.  `pkg` is the closure package
-/// the link points into — the install fact derives the STORE-RELATIVE origin
-/// `<hash>-<pkg>` from it (emitBuildfile itself ignores it).
+/// (name, from, pkg) pair for a /bin symlink: `from` is the store path of
+/// the BINARY the link points at (`<store>/<hash>-<pkg>/<target>` — a
+/// symlink to the package DIR is un-exec-able, which is how the first
+/// in-guest `activate` failed: /bin/fx-activate -> dir => EACCES => 127).
+/// `pkg` is the closure package the link points into — the install fact
+/// derives the STORE-RELATIVE origin `<hash>-<pkg>` from it (emitBuildfile
+/// itself ignores it).
 pub const BinLink = struct {
     name: []const u8,
-    storedir: []const u8,
+    from: []const u8, // symlink target: the BINARY path, not the store dir
     pkg: []const u8 = "",
 };
 
@@ -443,7 +661,7 @@ pub fn emitBuildfile(
             try b.str("< Rm = < Plain = ");
             try b.dhallStr(to_s);
             try b.str(" > >\n                  , < Symlink = { from = ");
-            try b.dhallStr(it.storedir);
+            try b.dhallStr(it.from);
             try b.str(", to = ");
             try b.dhallStr(to_s);
             try b.str(" } >\n                  , ");
@@ -639,6 +857,38 @@ fn clearRel(db: *DlDb, rel: [*:0]const u8, arity: u8) error{ ClearFailed, OutOfM
     }
 }
 
+/// Commit the closure metadata the SRC-FREE fallback resolves from (called
+/// inside main's open txn, just before dl_txn_commit):
+///   store(hash, name)        for every closure entry
+///   srcstore(src_hash, name) for every .path closure entry
+///   activate_root(root)      ONLY-IF-ABSENT — the root the committed
+///                            derivation hashes embed (dep store paths are
+///                            root-qualified); the fallback recomputes dep
+///                            paths under exactly this root, and a later
+///                            activation under a different root must not
+///                            rewrite history the fallback depends on.
+/// Duplicates are DAFSA no-ops, so re-activation is idempotent.
+fn commitClosureMeta(db: *DlDb, entries: []PathEntry, store_root: []const u8) void {
+    // store/srcstore are declared by fx_store_open; activate_root is ours
+    // (dl_txn_add_fact REJECTS unknown relations, and addFact does not
+    // surface that — declare idempotently so the fact always lands).
+    var e_meta: ErrBuf = .{};
+    _ = declare(db, "activate_root", 1, &e_meta) catch {};
+    for (entries) |*it| {
+        const store_cols = [2]u32{ fx.dl_intern_str(db, dupeZ(it.hash)), fx.dl_intern_str(db, dupeZ(it.p.name)) };
+        addFact(db, "store", &store_cols);
+        if (it.src_hash) |sh| {
+            const src_cols = [2]u32{ fx.dl_intern_str(db, dupeZ(sh)), fx.dl_intern_str(db, dupeZ(it.p.name)) };
+            addFact(db, "srcstore", &src_cols);
+        }
+    }
+    const root_sym = fx.dl_intern_str(db, dupeZ(store_root));
+    if (root_sym != 0 and fx.dl_lookup(db, "activate_root", &[1]u32{root_sym}, 1) == 0) {
+        const cols = [1]u32{root_sym};
+        addFact(db, "activate_root", &cols);
+    }
+}
+
 // ─── CLI ──────────────────────────────────────────────────────────────────
 
 const usage_text =
@@ -816,21 +1066,27 @@ pub fn main(init: std.process.Init) !void {
     }
     std.sort.insertion(EtcItem, etc, {}, etcItemLt);
 
-    // collect /bin symlinks: init, fxctl, dhake, fx-activate, + one per service pkg
+    // collect /bin symlinks: init, fxctl, dhake, fx-activate, + one per service pkg.
+    // `from` is the BINARY path inside the store dir (<dir>/<target>): the
+    // guest execs these links (the activate handler runs /bin/fx-activate),
+    // and a symlink to the package DIR is un-exec-able (EACCES).
     var nbin: usize = 4;
     for (cfg.services) |*sv| {
         if (sv.pkg != null) nbin += 1;
     }
     const bin = gpa_alloc.alloc(BinLink, nbin) catch @panic("out of memory");
+    var fb: [PATH_MAX]u8 = undefined;
     var bi: usize = 0;
+    // snfmtz writes into a SHARED scratch buffer — dupe each from or every
+    // entry would alias the last write.
     const initp = storePathOf(entries, "fx-init").?;
-    bin[bi] = .{ .name = "init", .storedir = initp, .pkg = "fx-init" };
+    bin[bi] = .{ .name = "init", .from = gpa_alloc.dupeZ(u8, snfmtz(&fb, "{s}/fx-init", .{initp})) catch @panic("out of memory"), .pkg = "fx-init" };
     bi += 1;
-    bin[bi] = .{ .name = "fxctl", .storedir = storePathOf(entries, "fxctl").?, .pkg = "fxctl" };
+    bin[bi] = .{ .name = "fxctl", .from = gpa_alloc.dupeZ(u8, snfmtz(&fb, "{s}/fxctl", .{storePathOf(entries, "fxctl").?})) catch @panic("out of memory"), .pkg = "fxctl" };
     bi += 1;
-    bin[bi] = .{ .name = "dhake", .storedir = dhake_path, .pkg = "dhake" };
+    bin[bi] = .{ .name = "dhake", .from = gpa_alloc.dupeZ(u8, snfmtz(&fb, "{s}/dhake.com", .{dhake_path})) catch @panic("out of memory"), .pkg = "dhake" };
     bi += 1;
-    bin[bi] = .{ .name = "fx-activate", .storedir = storePathOf(entries, "fx-activate").?, .pkg = "fx-activate" };
+    bin[bi] = .{ .name = "fx-activate", .from = gpa_alloc.dupeZ(u8, snfmtz(&fb, "{s}/fx-activate", .{storePathOf(entries, "fx-activate").?})) catch @panic("out of memory"), .pkg = "fx-activate" };
     bi += 1;
     for (cfg.services) |*sv| {
         const pkg = sv.pkg orelse continue;
@@ -839,7 +1095,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         const pk = ps.find(pkg).?;
-        bin[bi] = .{ .name = baseName(pk.target), .storedir = p, .pkg = pkg };
+        const tb = baseName(pk.target);
+        bin[bi] = .{ .name = tb, .from = gpa_alloc.dupeZ(u8, snfmtz(&fb, "{s}/{s}", .{ p, tb })) catch @panic("out of memory"), .pkg = pkg };
         bi += 1;
     }
     std.sort.insertion(BinLink, bin, {}, binLinkLt);
@@ -934,6 +1191,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .rel = "boot_grace", .arity = 1 },
         .{ .rel = "install", .arity = 4 },
         .{ .rel = "provides", .arity = 2 },
+        .{ .rel = "activate_root", .arity = 1 },
     };
     for (decls) |d| declare(db, d.rel, d.arity, &e) catch {
         std.debug.print("fx-activate: {s}\n", .{e.slice()});
@@ -949,11 +1207,18 @@ pub fn main(init: std.process.Init) !void {
     // published snapshot is self-consistent (only THIS activation's set).
     // Without this, a re-activation would accumulate stale services and
     // fx-init would boot the union of all past service sets.
-    for (decls) |d| clearRel(db, d.rel, d.arity) catch {
-        std.debug.print("fx-activate: clear old facts failed\n", .{});
-        _ = fx.dl_txn_rollback(db);
-        std.process.exit(1);
-    };
+    // activate_root is EXEMPT: it records the root the COMMITTED store
+    // hashes were computed under — immutable for the life of the store (a
+    // later activation under a different root must not rewrite history the
+    // src-free fallback depends on).
+    for (decls) |d| {
+        if (std.mem.eql(u8, std.mem.span(d.rel), "activate_root")) continue;
+        clearRel(db, d.rel, d.arity) catch {
+            std.debug.print("fx-activate: clear old facts failed\n", .{});
+            _ = fx.dl_txn_rollback(db);
+            std.process.exit(1);
+        };
+    }
 
     // generation(genhash, buildfile, dhake, epoch) a4.
     // buildfile + dhake columns are STORE-RELATIVE paths (resolved by fx-init
@@ -1092,6 +1357,12 @@ pub fn main(init: std.process.Init) !void {
         };
         addFact(db, "provides", &cols);
     }
+    // store(hash,name) + srcstore(src_hash,name) for every closure entry —
+    // the metadata the SRC-FREE fallback (in-guest activation) resolves
+    // from, committed by fx-activate itself (a provisioned/harness store
+    // has nobody else to write them).  Duplicates are DAFSA no-ops, so
+    // re-activation is idempotent.
+    commitClosureMeta(db, entries, store_root_s);
 
     if (fx.dl_txn_commit(db) != 0) {
         std.debug.print("fx-activate: dl_txn_commit failed\n", .{});
@@ -1109,6 +1380,12 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("fx-activate: {s}\n", .{se2.slice()});
         std.process.exit(1);
     };
+
+    // src-free visibility: ONLY when the fallback actually resolved
+    // something (a src-present closure prints nothing — stderr is
+    // golden-compared and a 0/N line would be noise on every host run).
+    if (src_free_resolved > 0)
+        std.debug.print("fx-activate: src-free {d}/{d} packages resolved from published srcstore\n", .{ src_free_resolved, entries.len });
 
     out.print("activated {s} as version {d}; buildfile {s}\n", .{ genhash_s, v, buildfile_abs }) catch {};
     out.flush() catch {};
@@ -1278,7 +1555,7 @@ test "emit_buildfile: shape, Copy+Chmod, Rm+Symlink, trailing-separator trim" {
     var b: Buf = undefined;
     b.init();
     const etc = [_]EtcItem{.{ .path = "m", .content = "x" }};
-    const bin = [_]BinLink{.{ .name = "tool", .storedir = "/store/44-tool" }};
+    const bin = [_]BinLink{.{ .name = "tool", .from = "/store/44-tool/tool" }};
     try emitBuildfile(&b, "/G", &etc, &bin);
     const out = b.slice();
 
@@ -1289,9 +1566,10 @@ test "emit_buildfile: shape, Copy+Chmod, Rm+Symlink, trailing-separator trim" {
     // etc: Copy from GEN + Chmod 0644
     try testing.expect(std.mem.indexOf(u8, out, "< Copy = { from = \"/G/etc/m\", to = \"/etc/m\" } >\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, ", < Chmod = { path = \"/etc/m\", mode = \"0644\" } >\n") != null);
-    // bin: Rm guard before Symlink (dhake bare symlink fails EEXIST)
+    // bin: Rm guard before Symlink (dhake bare symlink fails EEXIST); the
+    // link target is the BINARY inside the store dir, not the dir itself
     try testing.expect(std.mem.indexOf(u8, out, "< Rm = < Plain = \"/bin/tool\" > >\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, ", < Symlink = { from = \"/store/44-tool\", to = \"/bin/tool\" } >\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ", < Symlink = { from = \"/store/44-tool/tool\", to = \"/bin/tool\" } >\n") != null);
     // the trailing-", "-trim quirk: the list closes right after the last
     // action (18-space indent + " ]"), never "<sep>,\n<indent>]"
     try testing.expect(std.mem.indexOf(u8, out, "} >\n                   ]\n") != null); // 18 spaces + " ]" (the trim quirk)
@@ -1344,4 +1622,274 @@ test "on_full reconstruction" {
     try testing.expectEqualStrings("sock:unix:/run/x.sock", onFull(.sock_unix, "/run/x.sock", &buf));
     try testing.expectEqualStrings("time:250", onFull(.time, "250", &buf));
     try testing.expectEqualStrings("net", onFull(.net, null, &buf));
+}
+
+// ─── src-free fallback (in-guest activation) ─────────────────────────────
+
+// The shared fixture of the three src-free tests: a two-package set (alpha
+/// <- beta) with REAL source trees, a store rooted at <tmp>/store whose
+/// closure dirs exist (fx-activate's "built" check only stats dir-ness), and
+/// the metadata committed exactly as fx-activate's happy path does.
+fn srcFreeFixture(io: std.Io, tmp: *testing.TmpDir, store_rel: []const u8) !struct {
+    ps: PackageSet,
+    store_path: [256]u8,
+    store_len: usize,
+} {
+    try tmp.dir.createDirPath(io, "src/alpha");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/alpha/a.txt", .data = "alpha\n" });
+    try tmp.dir.createDirPath(io, "src/beta");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/beta/b.txt", .data = "beta\n" });
+    // ABSOLUTE src paths: the loader keeps them verbatim (no realpath), so
+    // the same pkgset text serves BOTH arms — the src-free arm rewrites the
+    // roots to nonexistent dirs under the same tmp.
+    // ABSOLUTE src paths (the loader keeps them verbatim — the same
+    // mechanism the guest pkgset uses); resolve the tmp dir against cwd.
+    var cwd: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.Io.Dir.cwd().realPathFile(io, ".", &cwd);
+    const cwd_s = cwd[0..cwd_len];
+    var alpha_abs: [std.fs.max_path_bytes]u8 = undefined;
+    var beta_abs: [std.fs.max_path_bytes]u8 = undefined;
+    const alpha_s = try std.fmt.bufPrint(&alpha_abs, "{s}/.zig-cache/tmp/{s}/src/alpha", .{ cwd_s, tmp.sub_path });
+    const beta_s = try std.fmt.bufPrint(&beta_abs, "{s}/.zig-cache/tmp/{s}/src/beta", .{ cwd_s, tmp.sub_path });
+    var ps_text: [1024]u8 = undefined;
+    const ps_s = try std.fmt.bufPrint(&ps_text,
+        \\let Src = < Path : Text | Fetch : {{ url : Text, hash : Text }} >
+        \\let Action = < Shell : Text >
+        \\let Build = {{ target : Text, recipe : List Action }}
+        \\let Package = {{ name : Text, version : Text, src : Src, deps : List Text,
+        \\                excludes : List Text, build : Build }}
+        \\let PackageSet = {{ packages : List Package }}
+        \\in  {{ packages =
+        \\        [ {{ name = "alpha", version = "1.0", src = < Path = "{s}" >,
+        \\            deps = [] : List Text, excludes = [] : List Text,
+        \\            build = {{ target = "alpha.bin", recipe = [] : List Action }} }}
+        \\        , {{ name = "beta", version = "2.0", src = < Path = "{s}" >,
+        \\            deps = [ "alpha" ] : List Text, excludes = [] : List Text,
+        \\            build = {{ target = "beta.bin", recipe = [] : List Action }} }}
+        \\        ] }}
+        \\  : PackageSet
+    , .{ alpha_s, beta_s });
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-set.dhall", .data = ps_s });
+
+    var ps: PackageSet = undefined;
+    var pe = fx.packageset.ErrBuf{};
+    var ps_path_buf: [256]u8 = undefined;
+    const ps_path = try std.fmt.bufPrint(&ps_path_buf, ".zig-cache/tmp/{s}/package-set.dhall", .{tmp.sub_path});
+    fx.fx_packageset_load(&ps, ps_path, &pe) catch |err| {
+        std.debug.print("fixture load failed: {s}\n", .{pe.slice()});
+        return err;
+    };
+
+    // the store: open, compute the closure WITH sources, materialize each
+    // entry's dir (a marker file), commit the closure meta + publish.
+    var store_path: [256]u8 = undefined;
+    const store_s = try std.fmt.bufPrint(&store_path, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, store_rel });
+    var se = fx.store.ErrBuf{};
+    const s = fx.fx_store_open(io, store_s, &se) catch |err| {
+        std.debug.print("fixture store open failed: {s}\n", .{se.slice()});
+        return err;
+    };
+    const db = fx.fx_store_db(s).?;
+    g_io = io;
+    var cerr: [PATH_MAX]u8 = undefined;
+    var e: ErrBuf = .{};
+    const entries = computePaths(&ps, db, &.{}, store_s, &cerr, &e) catch |err| {
+        std.debug.print("fixture computePaths failed: {s} / {s}\n", .{ std.mem.span(@as([*:0]const u8, @ptrCast(&cerr))), e.slice() });
+        return err;
+    };
+    for (entries) |*it| {
+        // it.path is CWD-relative (the store was opened with a relative
+        // root): create the dirs under cwd, NOT under tmp.dir (whose
+        // sub_paths are tmp-relative — a doubled prefix would put them
+        // where neither the store nor the fallback looks).
+        try std.Io.Dir.cwd().createDirPath(io, it.path);
+    }
+    if (fx.dl_txn_begin(db) != 0) return error.StoreTxn;
+    commitClosureMeta(db, entries, store_s);
+    if (fx.dl_txn_commit(db) != 0) return error.StoreTxn;
+    var se2 = fx.store.ErrBuf{};
+    fx.fx_store_publish(s, &se2) catch return error.StorePublish;
+    fx.fx_store_close(s);
+    return .{ .ps = ps, .store_path = store_path, .store_len = store_s.len };
+}
+
+// (i) the publication round trip: after the happy-path commit + publish +
+// close + REOPEN, every closure package has store(hash,name) and
+// srcstore(src_hash,name) rows, and activate_root is the store root.
+test "src-free: publication round trip (store/srcstore/activate_root facts)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var fxq = try srcFreeFixture(io, &tmp, "store");
+    defer fxq.ps.deinit();
+
+    var se = fx.store.ErrBuf{};
+    const s = fx.fx_store_open(io, fxq.store_path[0..fxq.store_len], &se) catch {
+        std.debug.print("reopen failed: {s}\n", .{se.slice()});
+        return error.StoreOpen;
+    };
+    defer fx.fx_store_close(s);
+    const db = fx.fx_store_db(s).?;
+
+    // walk BOTH pair relations once, matching by resolved col1 string
+    const Bag = struct {
+        db: *DlDb,
+        alloc: std.mem.Allocator,
+        a: std.ArrayList([]const u8) = .empty,
+        b: std.ArrayList([]const u8) = .empty,
+    };
+    const bagCb = struct {
+        fn f(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+            _ = arity;
+            const bg: *Bag = @ptrCast(@alignCast(user.?));
+            const x = fx.dl_intern_str_of(bg.db, cols[0]) orelse return 1;
+            const y = fx.dl_intern_str_of(bg.db, cols[1]) orelse return 1;
+            const xd = bg.alloc.dupe(u8, std.mem.span(x)) catch return 1;
+            const yd = bg.alloc.dupe(u8, std.mem.span(y)) catch return 1;
+            bg.a.append(bg.alloc, xd) catch return 1;
+            bg.b.append(bg.alloc, yd) catch return 1;
+            return 0;
+        }
+    }.f;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var sbag = Bag{ .db = db, .alloc = arena.allocator() };
+    _ = fx.dl_query(db, "srcstore", &bagCb, &sbag);
+    var tbag = Bag{ .db = db, .alloc = arena.allocator() };
+    _ = fx.dl_query(db, "store", &bagCb, &tbag);
+    try testing.expectEqual(@as(usize, 2), sbag.b.items.len); // col1 = NAME
+    try testing.expectEqual(@as(usize, 2), tbag.b.items.len);
+
+    // activate_root == the store root, exactly one row
+    var root_buf: [PATH_MAX]u8 = undefined;
+    const rr = recordedRoot(db, &root_buf);
+    try testing.expect(rr != null);
+    try testing.expectEqualStrings(fxq.store_path[0..fxq.store_len], rr.?);
+}
+
+// (ii) THE ASYMMETRY PIN: a src-free run must yield BYTE-IDENTICAL hashes
+// to the with-sources run.  Same store, same closure, the only difference
+// is that the src trees are absent (absolute paths pointing at nonexistent
+// dirs — kept verbatim by the loader).  A flipped srcstore column order, a
+// wrong recorded root, or any divergence in the fallback's recompute makes
+// this test FAIL LOUDLY, not adapt silently.
+test "src-free: fallback yields byte-identical hashes to the with-sources run" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var fxq = try srcFreeFixture(io, &tmp, "store");
+    defer fxq.ps.deinit();
+    const store_s = fxq.store_path[0..fxq.store_len];
+
+    // ground truth: WITH sources (the trees still exist)
+    var se = fx.store.ErrBuf{};
+    const s1 = fx.fx_store_open(io, store_s, &se) catch return error.StoreOpen;
+    const db1 = fx.fx_store_db(s1).?;
+    g_io = io;
+    var cerr1: [PATH_MAX]u8 = undefined;
+    var e1: ErrBuf = .{};
+    const with_src = computePaths(&fxq.ps, db1, &.{}, store_s, &cerr1, &e1) catch |err| {
+        std.debug.print("with-sources computePaths failed: {s}\n", .{e1.slice()});
+        return err;
+    };
+    fx.fx_store_close(s1);
+
+    // RELOCATE the store (the guest scenario: the live root differs from
+    // the root the committed hashes were computed under — dep store paths
+    // are root-qualified inside the derivation hash, so a fallback that
+    // recomputes under the LIVE root would diverge; only the RECORDED root
+    // keeps the hashes byte-identical).
+    try tmp.dir.rename("store", tmp.dir, "store2", io);
+    var store2_path: [512]u8 = undefined;
+    var cwd2: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd2_len = try std.Io.Dir.cwd().realPathFile(io, ".", &cwd2);
+    const store2_s = try std.fmt.bufPrint(&store2_path, "{s}/.zig-cache/tmp/{s}/store2", .{ cwd2[0..cwd2_len], tmp.sub_path });
+    const s2 = fx.fx_store_open(io, store2_s, &se) catch return error.StoreOpen;
+    const db2 = fx.fx_store_db(s2).?;
+
+    // the src-free arm: rewrite every Path value to a NONEXISTENT absolute
+    // dir under the same tmp (absolute => no realpath => load succeeds)
+    var p = fxq.ps.head;
+    var gone_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const gone = try std.fmt.bufPrint(&gone_buf, "{s}/.zig-cache/tmp/{s}/gone", .{ cwd2[0..cwd2_len], tmp.sub_path });
+    while (p) |pkg| : (p = pkg.next) {
+        // PackageSet strings live in its arena: mutating in place is safe
+        // (the fixture's ps is a copy returned by value from srcFreeFixture)
+        const arena_p = fxq.ps.arena.allocator();
+        const nz = try arena_p.dupe(u8, gone[0..]);
+        pkg.src.path = nz;
+    }
+    // belt: the gone dir must NOT exist (the fallback must not be able to
+    // hash anything even by accident)
+    try testing.expect(!(std.Io.Dir.cwd().statFile(io, gone, .{}) catch null != null));
+
+    const entries = computePaths(&fxq.ps, db2, &.{}, store2_s, &cerr1, &e1) catch |err| {
+        std.debug.print("src-free computePaths FAILED: {s}\n", .{e1.slice()});
+        return err;
+    };
+    try testing.expectEqual(with_src.len, entries.len);
+    try testing.expect(src_free_resolved == entries.len); // every package went through the fallback
+    for (with_src, entries) |*w, *g| {
+        try testing.expectEqualStrings(w.p.name, g.p.name);
+        try testing.expectEqualStrings(w.hash, g.hash); // BYTE-IDENTICAL derivation hashes
+        // the store path's TAIL must match; the PREFIX is the (differing)
+        // live root by design — the relocate arm would fail a full compare
+        const w_rel = std.mem.lastIndexOfScalar(u8, w.path, '/').? + 1;
+        const g_rel = std.mem.lastIndexOfScalar(u8, g.path, '/').? + 1;
+        try testing.expectEqualStrings(w.path[w_rel..], g.path[g_rel..]);
+        try testing.expect(w.src_hash != null and g.src_hash != null);
+        try testing.expectEqualStrings(w.src_hash.?, g.src_hash.?); // and src hashes
+    }
+    fx.fx_store_close(s2);
+}
+
+// (iii) the loud failure: a package absent from srcstore (a genuinely NEW
+// package) must fail computePaths with the naming error — never silently
+// adopt something else.
+test "src-free: new package fails loudly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var fxq = try srcFreeFixture(io, &tmp, "store");
+    defer fxq.ps.deinit();
+    const store_s = fxq.store_path[0..fxq.store_len];
+
+    // a third package whose src tree does not exist and whose name has no
+    // srcstore row: append it to the package set via a fresh load
+    var ps_text: [1024]u8 = undefined;
+    const ps_s = try std.fmt.bufPrint(&ps_text,
+        \\let Src = < Path : Text | Fetch : {{ url : Text, hash : Text }} >
+        \\let Action = < Shell : Text >
+        \\let Build = {{ target : Text, recipe : List Action }}
+        \\let Package = {{ name : Text, version : Text, src : Src, deps : List Text,
+        \\                excludes : List Text, build : Build }}
+        \\let PackageSet = {{ packages : List Package }}
+        \\in  {{ packages =
+        \\        [ {{ name = "gamma", version = "1.0", src = < Path = "/nonexistent/gamma-src" >,
+        \\            deps = [] : List Text, excludes = [] : List Text,
+        \\            build = {{ target = "gamma.bin", recipe = [] : List Action }} }}
+        \\        ] }}
+        \\  : PackageSet
+    , .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-set-gamma.dhall", .data = ps_s });
+    var ps2: PackageSet = undefined;
+    var pe = fx.packageset.ErrBuf{};
+    var ps2_path_buf: [256]u8 = undefined;
+    const ps2_path = try std.fmt.bufPrint(&ps2_path_buf, ".zig-cache/tmp/{s}/package-set-gamma.dhall", .{tmp.sub_path});
+    fx.fx_packageset_load(&ps2, ps2_path, &pe) catch |err| {
+        std.debug.print("gamma load failed: {s}\n", .{pe.slice()});
+        return err;
+    };
+    defer ps2.deinit();
+
+    var se = fx.store.ErrBuf{};
+    const s = fx.fx_store_open(io, store_s, &se) catch return error.StoreOpen;
+    defer fx.fx_store_close(s);
+    g_io = io;
+    var cerr: [PATH_MAX]u8 = undefined;
+    var e: ErrBuf = .{};
+    const r = computePaths(&ps2, fx.fx_store_db(s).?, &.{"gamma"}, store_s, &cerr, &e);
+    try testing.expectError(error.FxErr, r);
+    try testing.expect(std.mem.indexOf(u8, e.slice(), "gamma") != null);
+    try testing.expect(std.mem.indexOf(u8, e.slice(), "no published srcstore/store pair resolves it") != null);
 }

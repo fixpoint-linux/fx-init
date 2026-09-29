@@ -92,19 +92,26 @@ if [ -z "$FXS" ] || [ -z "$FXA" ]; then
     # which fails on hosts with an unpopulated vendor/datalog-dafsa submodule
     # (missing dl.h) — pre-existing, unrelated to the image path.  Gate on the
     # binaries this harness needs, not the step's aggregate exit.
-    ( cd "$REPO/zig" && zig build ) >/dev/null 2>&1
+    #
+    # The build's EXIT CODE is the stale-binary check.  An mtime heuristic
+    # ("is any source newer than fx-init?") was tried here and is UNSOUND:
+    # `zig build` is content-hash cached, so a `touch` (a git checkout, an
+    # editor save, a scratch file added and removed) relinks nothing and
+    # leaves the binary older than the sources even though it is perfectly
+    # current — it fired on healthy builds.  The condition that actually
+    # matters is "did the build fail, leaving the previous binary in place",
+    # and the exit code answers exactly that.  (It was unavailable when the
+    # heuristic was added: `zig build` failed on an unrelated vendored-header
+    # gap, so the harness gated on binaries and discarded this status.  That
+    # gap is fixed, so the sound instrument is usable.)
+    if ! ( cd "$REPO/zig" && zig build ) >/dev/null 2>&1; then
+        fail "zig build failed — refusing to test a possibly stale binary (run 'cd zig && zig build' and read its errors)"
+    fi
     ZB="$REPO/zig/zig-out/bin"
     DL="$FX_SIBLINGS/datalog-dafsa/zig-out/lib"
     for b in fx-init fx-activate fxctl activate_paths; do
         [ -x "$ZB/$b" ] || fail "zig build did not produce zig-out/bin/$b"
     done
-    # the fx-init under test must not be STALE: a build that silently failed
-    # and left the old binary would test the WRONG code — the exact failure
-    # mode that shipped a stale binary through the M4 disk increment (the
-    # harness gates on binaries, the aggregate build exit was lost).
-    if [ -n "$(find "$REPO/zig/src" -newer "$ZB/fx-init" -print -quit 2>/dev/null)" ]; then
-        fail "zig-out/bin/fx-init is older than zig/src — the build failed and left a stale binary (run 'cd zig && zig build' and read its errors)"
-    fi
 
     cp "$FX_SIBLINGS/dhake/dhake.com" "$WORK/dhake.com"
     chmod +x "$WORK/dhake.com"
