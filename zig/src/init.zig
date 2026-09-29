@@ -43,6 +43,7 @@ const ENOEXEC: c_int = 8;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
+const O_RDWR: c_int = 0o2;
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 const X_OK: c_int = 1;
@@ -276,6 +277,10 @@ extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn bind(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
 extern "c" fn accept(fd: c_int, addr: ?*anyopaque, addrlen: ?*c_uint) c_int;
+// real-init bootstrap (M4 image): mount(2) + open(2) for the console reopen —
+// not in std.c, declared locally per the repo's fork/execv precedent.
+extern "c" fn mount(source: [*:0]const u8, target: [*:0]const u8, fstype: [*:0]const u8, flags: c_ulong, data: ?*const anyopaque) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 
 const SockaddrUn = extern struct {
     family: u16,
@@ -1188,6 +1193,52 @@ fn svcSlice() []const Svc {
     return &.{};
 }
 
+/// Real-init bootstrap (M4 image increment): as a rdinit PID1, mount the
+/// kernel filesystems /proc, /sys, /dev before anything reads them
+/// (fx_probe_refresh hits /proc + /sys at the top of main).  The probe is a
+/// file that exists ONLY on the live fs (an empty /proc directory — what the
+/// image ships — has no /proc/1/stat), so this is INERT on every existing
+/// path: the bwrap harnesses (bwrap --proc/--dev, /sys ro-bind) and
+/// FX_INIT_FORCE runs all find the live fs and skip the mounts entirely.  A
+/// mount that fails is non-fatal (console + log warning; boot continues —
+/// probe/supervision already tolerate missing files).  devtmpfs is populated
+/// by the kernel (no mknod by us; CONFIG_DEVTMPFS_MOUNT only auto-mounts onto
+/// a real rootfs, never an initramfs).  When devtmpfs WAS mounted here, also
+/// reopen /dev/console on fds 0-2: the kernel opened init's fds before exec,
+/// and an initramfs without a baked-in /dev/console node leaves them closed —
+/// every errf below (incl. the boot-ok/FAILED verdicts) would be lost.
+fn mount_early() void {
+    const M = struct {
+        fs: [:0]const u8,
+        dir: [:0]const u8,
+        probe: [:0]const u8,
+    };
+    const ms = [_]M{
+        .{ .fs = "proc", .dir = "/proc", .probe = "/proc/1/stat" },
+        .{ .fs = "sysfs", .dir = "/sys", .probe = "/sys/class" },
+        .{ .fs = "devtmpfs", .dir = "/dev", .probe = "/dev/null" },
+    };
+    var mounted_dev = false;
+    for (ms) |m| {
+        if (std.c.access(m.probe.ptr, F_OK) == 0) continue; // already up (harness/bwrap)
+        if (mount("none", m.dir.ptr, m.fs.ptr, 0, null) != 0) {
+            errf("fx-init: warning: mount {s} on {s} failed: {s}\n", .{ m.fs, m.dir, errnoStr() });
+            log_line("fx-init", "error", "early mount failed");
+            continue;
+        }
+        if (std.mem.eql(u8, m.dir, "/dev")) mounted_dev = true;
+    }
+    if (mounted_dev) {
+        const fd = open("/dev/console", O_RDWR, 0);
+        if (fd >= 0) {
+            _ = std.c.dup2(fd, 0);
+            _ = std.c.dup2(fd, 1);
+            _ = std.c.dup2(fd, 2);
+            if (fd > 2) _ = std.c.close(fd);
+        }
+    }
+}
+
 fn evaluate_boot_ok() void {
     const decision = boot_decision(g_boot_decided != 0, svcSlice(), sup.fx_boot_grace_expired(now_ms(), g_boot_deadline_ms) != 0);
     switch (decision) {
@@ -1198,6 +1249,9 @@ fn evaluate_boot_ok() void {
             _ = rt_txn_commit();
             bootlog_append(g_current_version, "ok", now_s());
             log_line("fx-init", "info", "boot ok");
+            // console verdict (image/QEMU path): fd 2 = /dev/console for a
+            // rdinit PID1; captured stderr in the bwrap harnesses.
+            errf("fx-init: boot-ok v{d}\n", .{g_current_version});
             g_boot_decided = 1;
             g_boot_failed = 0;
         },
@@ -1207,6 +1261,7 @@ fn evaluate_boot_ok() void {
             _ = rt_txn_commit();
             bootlog_append(g_current_version, "failed", now_s());
             log_line("fx-init", "error", "boot failed");
+            errf("fx-init: boot-FAILED v{d}\n", .{g_current_version});
             g_boot_decided = 1;
             g_boot_failed = 1;
         },
@@ -1286,6 +1341,9 @@ fn reap_children() void {
             _ = rt_txn_commit();
             bootlog_append(g_current_version, "failed", now_s());
             log_line("fx-init", "error", "boot failed: service exited during grace window");
+            // console verdict (image/QEMU path): fd 2 = /dev/console for a
+            // rdinit PID1; captured stderr in the bwrap harnesses.
+            errf("fx-init: boot-FAILED v{d}\n", .{g_current_version});
             g_boot_decided = 1;
             g_boot_failed = 1;
         }
@@ -1921,6 +1979,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    // Real-init path (rdinit in the initramfs image): nothing has mounted the
+    // kernel filesystems yet, and fx_probe_refresh below reads /proc + /sys.
+    // Inert everywhere else — the bwrap harnesses and FX_INIT_FORCE runs
+    // always have /proc up, and mount_early skips when it finds it — followed
+    // by the one console line proving PID1 itself started (fd 2 is
+    // /dev/console for a rdinit PID1; a captured stderr in the harnesses).
+    mount_early();
+    errf("fx-init: boot start store {s}\n", .{span(g_store)});
+
     if (std.c.pipe(&g_sigpipe) != 0) {
         errf("fx-init: pipe: {s}\n", .{errnoStr()});
         std.process.exit(1);
@@ -1965,7 +2032,14 @@ pub fn main(init: std.process.Init) !void {
     const boot_v = decide_boot_version();
     if (boot_v == 0 or read_store_facts(boot_v) != 0) {
         errf("fx-init: no generation to boot\n", .{});
+        errf("fx-init: boot-FAILED v{d}\n", .{g_current_version});
         g_boot_version = 0;
+        // Pin the verdict: no services were loaded, so boot_decision would
+        // see an EMPTY slice at grace expiry — all_started vacuously true,
+        // any_failed false — and emit a SECOND, contradicting boot-ok v0
+        // (plus a false rt_set_boot "ok" commit) for this already-failed boot.
+        g_boot_decided = 1;
+        g_boot_failed = 1;
         g_boot_deadline_ms = sup.fx_boot_deadline_ms(g_boot_start_ms, g_grace_ms);
     } else {
         g_boot_version = boot_v;
@@ -1982,6 +2056,10 @@ pub fn main(init: std.process.Init) !void {
             rt_set_boot(g_current_version, "failed");
             _ = rt_txn_commit();
             bootlog_append(g_current_version, "failed", now_s());
+            // console verdict — same line the other failure sites emit; the
+            // QEMU harness greps it.  Without this a dhake-failure boot has
+            // no observable verdict and the harness sees a bare timeout.
+            errf("fx-init: boot-FAILED v{d}\n", .{g_current_version});
             g_boot_decided = 1;
             g_boot_failed = 1;
         }

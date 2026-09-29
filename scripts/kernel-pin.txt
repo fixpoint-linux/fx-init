@@ -1,0 +1,18 @@
+# scripts/kernel-pin.txt — the M4 image increment's pinned kernel input.
+#
+# DESIGN.md §8.5 decision for v1: take the HOST kernel as a pinned,
+# sha256-recorded input (no kernel build).  Fetch-with-hash of a dedicated
+# defconfig-minimal kernel is follow-up increment 10.
+#
+# MEASURED on this host (openSUSE MicroOS) 2026-09-28; re-verify with
+#   sha256sum /boot/vmlinuz-7.1.8-1-default
+# before trusting a new host.  tests/qemu_boot.sh reads this file and skips
+# loudly on a mismatch ("kernel pin mismatch — update scripts/kernel-pin.txt").
+#
+# Kernel config facts this increment depends on (all =y, MEASURED):
+#   CONFIG_BLK_DEV_INITRD, CONFIG_RD_GZIP (gzip'd newc cpio initrd),
+#   CONFIG_DEVTMPFS + CONFIG_DEVTMPFS_MOUNT (devtmpfs; note the automount
+#   only applies to a real rootfs — an initramfs PID1 mounts it itself),
+#   CONFIG_SERIAL_8250_CONSOLE (console=ttyS0).
+path /boot/vmlinuz-7.1.8-1-default
+sha256 de643a59d767f7fa675a11240b3adf1fcee5287e4e7e1332ba27d88a8d414884
