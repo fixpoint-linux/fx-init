@@ -116,8 +116,10 @@ pub fn build(b: *std.Build) void {
     // vendored C sources: the dl_*/aux_*/tokenize/regex_* externs the Zig
     // ports declare are resolved against the Zig-built libdatalog.so in the
     // sibling ../../datalog-dafsa checkout (linkDatalog, below).  The C
-    // headers are still vendored so the C driver log_probe_live.c keeps
-    // compiling unchanged.
+    // headers (dl.h and the vector.h it includes) come from that SAME sibling
+    // checkout via the FX_SIB_DATALOG_SRC override (sib(), below), so the C
+    // driver log_probe_live.c compiles against the headers paired with the
+    // .so it links — not the empty vendored submodule dirs.
 
     // log_port / probe_port: the Zig ports as objects exposing zig_log_* /
     // zig_probe_* to the C live driver (the supervise_extern.o pattern, now
@@ -163,7 +165,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    live_mod.addIncludePath(b.path("../vendor/datalog-dafsa/src"));
+    live_mod.addIncludePath(sib(b, "FX_SIB_DATALOG_SRC", "../../datalog-dafsa/src"));
     live_mod.addCSourceFiles(.{
         .root = b.path(".."),
         .files = &.{
