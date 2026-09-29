@@ -174,6 +174,24 @@ st=$(wait_status)
 st_bs "$st" | grep -q 'ok' || { echo "$st"; boot_stop; fail "genuine-PID1 boot did not reach ok"; }
 st_sr "$st" | grep '^heartbeat' | grep -q 'started' || { echo "$st"; boot_stop; fail "heartbeat not started"; }
 
+# ─── Step 1b: the pivot gate must REJECT this (non-initramfs) root, loudly ────
+# This harness's root is the HOST fs (btrfs, bwrap --bind), not an initramfs
+# rootfs — the one PID1 path where the pivot gate's rejection diagnostic is
+# EXPECTED on the console.  The fx-init under test here is the ZIG build of
+# THIS tree (the package-set recipe compiles zig/src — FX_INIT_BIN overrides
+# it for a diff), so a regression that silences or rewords the gate's
+# diagnostic makes this assertion fail instead of passing silently.
+# NOTE: skip the check (not fail) when the binary under test predates the
+# pivot gate — the store-built default may be a C fx-init from an older tree.
+if ! grep -q 'pivot not attempted' "$WORK/boot.out" 2>/dev/null; then
+    if strings -a "$FXINIT_BIN" 2>/dev/null | grep -q 'pivot not attempted'; then
+        { echo "--- $WORK/boot.out (tail) ---"; tail -20 "$WORK/boot.out" 2>/dev/null; }
+        boot_stop
+        fail "pivot gate did not reject this non-initramfs PID1 root (no 'pivot not attempted' on the console)"
+    fi
+    echo "fx-init under test predates the pivot gate — diagnostic assertion skipped"
+fi
+
 # ─── Step 2: prove fx-init is genuinely PID1 ──────────────────────────────────
 # pid1probe (running inside the namespace) reports /proc/1/comm; it must be
 # fx-init.  The process image holding PID1 in a genuine-PID1 boot is fx-init's

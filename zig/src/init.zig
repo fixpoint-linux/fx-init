@@ -40,6 +40,7 @@ const EEXIST: c_int = 17;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ENOEXEC: c_int = 8;
+const ENOENT: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
@@ -1358,28 +1359,28 @@ fn modules_dir(out: []u8) bool {
 fn store_current_of(root: [:0]const u8) u32 {
     var p: [512]u8 = undefined;
     _ = snfmt(&p, "{s}/.db/snapshots/CURRENT", .{root});
-    if (std.c.access(@ptrCast(&p), F_OK) == 0) {
-        // CURRENT exists but is unreadable/unparsable: returning 0 makes the
-        // caller treat the store as unseeded and adopt/overwrite — a
-        // defensible recovery, but it must be LOUD.
-        const f0 = fopen(@ptrCast(&p), "r");
-        if (f0 != null) _ = fclose(f0);
-        if (f0 == null) {
-            errf("fx-init: WARNING: {s} exists but cannot be opened — treating as no store\n", .{span(@ptrCast(&p))});
-        } else {
-            var line0: [64]u8 = undefined;
-            var v0: u32 = 0;
-            if (fgets(&line0, @intCast(line0.len), f0) == null or sscanf(@ptrCast(&line0), "%u", &v0) != 1) {
-                errf("fx-init: WARNING: {s} exists but is unparsable — treating as no store\n", .{span(@ptrCast(&p))});
-            }
+    const f = fopen(@ptrCast(&p), "r") orelse {
+        // ENOENT is the ordinary unseeded case (silent, the caller's job);
+        // anything else (e.g. EACCES) deserves the old "cannot be opened"
+        // loudness — the read is being skipped for a reason the operator
+        // can fix.  Return semantics unchanged: 0 either way.
+        if (std.c._errno().* != ENOENT) {
+            errf("fx-init: WARNING: {s} cannot be opened: {s} — treating as no store\n", .{ span(@ptrCast(&p)), errnoStr() });
         }
-    }
-    const f = fopen(@ptrCast(&p), "r") orelse return 0;
+        return 0;
+    };
     defer _ = fclose(f);
     var line: [64]u8 = undefined;
-    if (fgets(&line, @intCast(line.len), f) == null) return 0;
     var v: u32 = 0;
-    if (sscanf(@ptrCast(&line), "%u", &v) != 1) return 0;
+    // CURRENT exists but is unreadable/unparsable: returning 0 makes the
+    // caller treat the store as unseeded and adopt/overwrite — a defensible
+    // recovery, but it must be LOUD.  (Open ONCE and read ONCE: the old shape
+    // fclosed the probe handle and then fgets'd it — a use-after-close whose
+    // heap corruption segfaulted the first boot that actually ran this code.)
+    if (fgets(&line, @intCast(line.len), f) == null or sscanf(@ptrCast(&line), "%u", &v) != 1) {
+        errf("fx-init: WARNING: {s} exists but is unreadable/unparsable — treating as no store\n", .{span(@ptrCast(&p))});
+        return 0;
+    }
     return v;
 }
 
@@ -1474,6 +1475,339 @@ fn ensure_disk_store() void {
 
     g_store = DISK_STORE;
     errf("fx-init: disk store mounted (current v{d})\n", .{store_current_of(DISK_STORE)});
+}
+
+// ─── M4 real rootfs: pivot_root from the initramfs to a tmpfs ─────────────
+
+/// statfs(2) constant (linux/magic.h), pinned by the unit test at the bottom
+/// of this file so a wrong constant is a TEST failure, not a boot mystery.
+/// NOTE (MEASURED, static-probe on the pinned kernel 7.1.8-1-default): with
+/// CONFIG_TMPFS=y the initramfs rootfs is TMPFS-BACKED — statfs("/") reports
+/// 0x01021994 there too, so the magic alone cannot distinguish the initramfs
+/// root from the pivoted tmpfs.  The discriminator the pivot actually uses is
+/// the /proc/mounts ROOT ENTRY FSTYPE: "rootfs" before the pivot, "tmpfs"
+/// after (probe evidence: pre "rootfs / rootfs rw,...", post "none / tmpfs
+/// rw,..." + "rootfs /oldroot rootfs ...").  TMPFS_MAGIC remains the
+/// post-pivot belt check.
+const TMPFS_MAGIC: i64 = 0x01021994;
+const MS_MOVE: c_ulong = 8192;
+const MS_BIND: c_ulong = 4096;
+const MNT_DETACH: c_int = 2;
+
+/// The /proc/mounts root-entry fstype of an initramfs root (MEASURED on the
+/// pinned kernel; see root_mount_fstype) — the gate string.  Named so the
+/// unit test can pin it: a wrong literal here is a gate that never fires.
+const ROOTFS_FST = "rootfs";
+/// The same entry AFTER a successful pivot ("none / tmpfs") — the proof
+/// string.  Must differ from ROOTFS_FST or the gate proves nothing.
+const TMPFS_FST = "tmpfs";
+
+/// The kernel filesystems that must travel into the new root.  ONE table
+/// shared by the forward pass and pivot_undo so the undo list can never
+/// drift from the moves list.
+const pivot_kernel_moves = [_][2][:0]const u8{
+    .{ "/proc", "/newroot/proc" },
+    .{ "/sys",  "/newroot/sys" },
+    .{ "/dev",  "/newroot/dev" },
+};
+
+/// The plain bind mounts the new root needs (they stay behind in /oldroot's
+/// own tree on success; pivot_undo detaches their copies from /newroot).
+const pivot_binds = [_][2][:0]const u8{
+    .{ "/lib64", "/newroot/lib64" },
+    .{ "/usr",   "/newroot/usr" },
+};
+
+/// glibc's struct statfs (x86_64) — only f_type is read.
+const Statfs = extern struct {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [4]i64,
+};
+extern "c" fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
+extern "c" fn pivot_root(new_root: [*:0]const u8, put_old: [*:0]const u8) c_int;
+extern "c" fn umount2(target: [*:0]const u8, flags: c_int) c_int;
+
+/// The kernel-reported filesystem magic of a path (0 when statfs fails).
+fn fs_magic(path: [:0]const u8) i64 {
+    var st: Statfs = undefined;
+    if (statfs(path.ptr, &st) != 0) return 0;
+    return st.f_type;
+}
+
+/// The fstype of the /proc/mounts entry for the ROOT mount, "" when it cannot
+/// be read.  This — not the statfs magic — is what distinguishes an initramfs
+/// root ("rootfs"; MEASURED) from every harness root (btrfs on the host,
+/// whatever bwrap --binds) and from the pivoted tmpfs ("tmpfs").
+fn root_mount_fstype(out: []u8) []const u8 {
+    const f = fopen("/proc/mounts", "r") orelse return "";
+    defer _ = fclose(f);
+    var line: [512]u8 = undefined;
+    while (fgets(&line, @intCast(line.len), f)) |_| {
+        var spec: [128]u8 = undefined;
+        var mnt: [128]u8 = undefined;
+        var fst: [64]u8 = undefined;
+        if (sscanf(@ptrCast(&line), "%127s %127s %63s", &spec, &mnt, &fst) == 3) {
+            if (strcmp(@ptrCast(&mnt), "/") == 0) {
+                const n = @min(std.mem.sliceTo(&fst, 0).len, out.len - 1);
+                @memcpy(out[0..n], fst[0..n]);
+                out[n] = 0;
+                return out[0..n];
+            }
+        }
+    }
+    return "";
+}
+
+/// Mount src on dst by MOVING it (MS_MOVE); fall back to a bind mount so a
+/// subtree that is not itself a mountpoint still rides along (MEASURED:
+/// MS_MOVE of a non-mountpoint dir — a baked /dev — fails EINVAL).  Returns
+/// 0 on success, -1 when both attempts failed.
+fn move_or_bind(src: [:0]const u8, dst: [*:0]const u8) c_int {
+    if (mount(src.ptr, dst, "", MS_MOVE, null) == 0) return 0;
+    if (mount(src.ptr, dst, "", MS_BIND, null) == 0) return 0;
+    return -1;
+}
+
+/// Best-effort ROLLBACK of a half-finished pivot (see pivot_root_to_tmpfs).
+/// Moves every already-moved mount BACK to its original location — the disk
+/// mount first (g_store's path must resolve to the real store again before
+/// anything re-reads it), then the first n_moves kernel filesystems in
+/// REVERSE order — and detaches every bind laid onto /newroot, plus the
+/// tmpfs itself.  n_moves is how many of pivot_kernel_moves COMPLETED: an
+/// entry that never moved must not be "moved back" (the fallback bind would
+/// graft an empty dir over the live filesystem — worse than the failure it
+/// was recovering from).
+///
+/// The contract of every "staying on initramfs root" return is that the
+/// initramfs root is genuinely WORKING afterwards: canonical /proc, /sys,
+/// /dev back in place, g_store pointing at an openable store.  Where the
+/// kernel refuses a move-back, that contract is only partially met — the
+/// WARNING names what could not be restored (and, for the disk store, the
+/// fallback repoints g_store at the ramfs store so the boot at least has a
+/// store to read).
+fn pivot_undo(n_moves: usize, disk_moved: bool, fx_bound: bool) void {
+    // binds first (they sit ON /newroot; detaching is order-free among them)
+    for (pivot_binds) |b| _ = umount2(@ptrCast(b[1].ptr), MNT_DETACH);
+    if (fx_bound) _ = umount2("/newroot/fx", MNT_DETACH);
+    // the disk mount back under /fx — g_store's path must resolve to the
+    // ext4 store again BEFORE anything re-reads it.
+    if (disk_moved) {
+        if (move_or_bind("/newroot/fx/disk", DISK_MOUNT) == 0) {
+            errf("fx-init: pivot: rolled back {s} -> {s}\n", .{ "/newroot/fx/disk", DISK_MOUNT });
+        } else {
+            // nothing was DESTROYED (the ext4 mount lives on under
+            // /newroot/fx/disk) — but g_store's path is now an empty dir,
+            // so fall back to the ramfs store the image still carries.
+            g_store = DEFAULT_STORE;
+            errf("fx-init: pivot: WARNING: could not move the disk store back to {s} ({s}) — falling back to the ramfs store {s}\n", .{ DISK_MOUNT, errnoStr(), DEFAULT_STORE });
+        }
+    }
+    // the kernel filesystems that DID move, REVERSED (mirrors the forward
+    // order; whatever submounts /proc or /sys carry ride back with them)
+    var i: usize = n_moves;
+    while (i > 0) {
+        i -= 1;
+        const m = pivot_kernel_moves[i];
+        if (move_or_bind(m[1], @ptrCast(m[0].ptr)) == 0) {
+            errf("fx-init: pivot: rolled back {s} -> {s}\n", .{ m[1], m[0] });
+        } else {
+            errf("fx-init: pivot: WARNING: could not move {s} back to {s} ({s}) — the initramfs root is WITHOUT a canonical {s}\n", .{ m[1], m[0], errnoStr(), m[0] });
+        }
+    }
+    // the tmpfs itself: by now empty of ours.  MNT_DETACH (not UMOUNT) so a
+    // still-referenced mount cannot block the rollback; if even that fails
+    // (EBUSY) leave it mounted — an empty tmpfs is harmless.
+    _ = umount2("/newroot", MNT_DETACH);
+}
+
+/// Materialize a REAL rootfs (a tmpfs) and pivot_root onto it, leaving the
+/// initramfs under /oldroot (M4 image increment, plan section B; the gate
+/// deviates from the plan for a measured reason — see root_mount_fstype).
+///
+/// GATES — this must be INERT everywhere but a genuine rdinit boot:
+///   getpid() == 1  — fxinit_boot.sh (bwrap) is never PID1;
+///   the /proc/mounts ROOT entry's fstype is "rootfs" — true ONLY of an
+///     initramfs root.  fxinit_pid1.sh IS PID1 but its root is the host fs
+///     (btrfs there), so the fstype check alone keeps the pivot off that
+///     harness too.
+///
+/// The pivot point is load-bearing: main calls this IMMEDIATELY after
+/// ensure_disk_store() and BEFORE the pipe/signal setup — at that instant no
+/// store handle is open (the first fx_store_open is inside
+/// decide_boot_version), /run/fx does not exist yet, and the ctrl socket +
+/// state.db + log.db are created ON the new root, so nothing has to be
+/// re-homed afterwards.  dhake is fork+exec'd after the pivot, so its
+/// ABSOLUTE Mkdir/Copy/Symlink targets (/etc, /bin, /run) land in the NEW
+/// root for free (absolute paths resolve at the process root) — no path
+/// rewriting anywhere.  EVERY step is non-fatal: a failure warns and RETURNS,
+/// leaving the boot to continue on the initramfs root — a pivot failure must
+/// never take down a boot that would otherwise have succeeded.
+///
+/// FAILURE CONTRACT (the order below is what makes the claim above true):
+///   phase 1 — every cheap, non-destructive precondition (mkdirs, source
+///     existence, the tmpfs) runs BEFORE anything is moved; a failure there
+///     leaves a root indistinguishable from a no-pivot boot;
+///   phase 2 — the BIND mounts (/fx ramfs arm, /lib64, /usr) land ON the
+///     new root only: the old root's own mounts are untouched, and the undo
+///     detaches them;
+///   phase 3 — only the MS_MOVEs remain, immediately before the pivot, so
+///     the window in which a failure needs rollback is minimal;
+///   undo  — any failure after phase 2 begins runs pivot_undo(): the moves
+///     are reversed (disk mount first, then /proc,/sys,/dev in reverse) and
+///     the binds detached, so "staying on initramfs root" means the root is
+///     genuinely working again — /proc,/sys,/dev at their canonical paths,
+///     and g_store back on a real store (moved back, or repointed at the
+///     ramfs store when the disk mount cannot return).
+fn pivot_root_to_tmpfs() void {
+    if (std.c.getpid() != 1) return; // harness/bwrap path: inert
+    var fst: [64]u8 = undefined;
+    const root_fst = root_mount_fstype(&fst);
+    if (!std.mem.eql(u8, root_fst, ROOTFS_FST)) {
+        // Visible, not silent: if this fires on a path that SHOULD pivot, the
+        // gate is mis-wired and the console says so instead of the pivot line
+        // just being mysteriously absent.  fxinit_pid1.sh boots PID1 on the
+        // host fs, where this line is EXPECTED (and asserted by that harness).
+        errf("fx-init: root fstype is '{s}' (not {s}) — pivot not attempted\n", .{ if (root_fst.len == 0) "?" else root_fst, ROOTFS_FST });
+        return;
+    }
+
+    // ── phase 1: cheap, non-destructive preconditions ─────────────────────
+    // Everything that can fail WITHOUT touching the mount table goes FIRST:
+    // a failure here leaves the system identical to a boot that never
+    // attempted the pivot (only some /newroot dirs were created).
+    const dirs = [_][*:0]const u8{
+        "/newroot", "/newroot/proc", "/newroot/sys", "/newroot/dev", "/newroot/run",
+        "/newroot/fx", "/newroot/fx/disk", "/newroot/lib64", "/newroot/usr", "/newroot/oldroot",
+    };
+    for (dirs) |d| {
+        if (std.c.mkdir(d, 0o755) != 0 and std.c._errno().* != EEXIST) {
+            errf("fx-init: warning: pivot: mkdir {s} failed: {s} — staying on initramfs root\n", .{ span(d), errnoStr() });
+            return;
+        }
+    }
+    // bind sources must exist in the OLD root — a missing /fx, /lib64 or /usr
+    // in the image is a build error, caught here BEFORE the tmpfs mount so a
+    // failure still changes nothing about the root.
+    const bind_sources = [_][*:0]const u8{ "/fx", "/lib64", "/usr" };
+    for (bind_sources) |s| {
+        if (std.c.access(s, F_OK) != 0) {
+            errf("fx-init: warning: pivot: bind source {s} absent: {s} — staying on initramfs root\n", .{ span(s), errnoStr() });
+            return;
+        }
+    }
+    // /proc must be up: it is both the gate's source and a move target below.
+    if (std.c.access("/proc", F_OK) != 0) {
+        errf("fx-init: warning: pivot: /proc absent: {s} — staying on initramfs root\n", .{errnoStr()});
+        return;
+    }
+    if (mount("none", "/newroot", "tmpfs", 0, null) != 0) {
+        errf("fx-init: warning: pivot: tmpfs on /newroot failed: {s} — staying on initramfs root\n", .{errnoStr()});
+        return;
+    }
+    // /newroot's subdirs must exist ON the tmpfs (the mkdirs above created
+    // them in the initramfs layer before the mount covered them).
+    for (dirs[1..]) |d| {
+        if (std.c.mkdir(d, 0o755) != 0 and std.c._errno().* != EEXIST) {
+            errf("fx-init: warning: pivot: mkdir {s} failed: {s} — staying on initramfs root\n", .{ span(d), errnoStr() });
+            return;
+        }
+    }
+
+    // ── phase 2: reversible mounts ONTO the new root ──────────────────────
+    // From here a failure leaves a bind ON the tmpfs — detached by the undo;
+    // the OLD root's own mounts are still untouched.
+    const disk_arm = std.mem.eql(u8, span(g_store), DISK_STORE);
+    var fx_bound = false;
+    if (!disk_arm) {
+        // The ramfs-store arm: bind the PARENT /fx, NEVER /fx/store itself
+        // (fx_store_open puts its .build scratch SIBLING of the root and
+        // rejects a root whose sibling lands on another st_dev — a store
+        // root that is itself a mountpoint cannot be opened at all; the
+        // same rejection ensure_disk_store's /fx/disk layout avoids).
+        if (mount("/fx", "/newroot/fx", "", MS_BIND, null) != 0) {
+            errf("fx-init: warning: pivot: bind /fx failed: {s} — staying on initramfs root\n", .{errnoStr()});
+            pivot_undo(0, false, false);
+            return;
+        }
+        fx_bound = true;
+    }
+    // Keep the new root a complete runtime for the store's dynamic binaries
+    // (fx-activate needs the loader + libc; /usr carries busybox for later
+    // store ops).  B itself needs neither — dhake/fakesvc are static.
+    for (pivot_binds) |b| {
+        if (mount(b[0].ptr, @ptrCast(b[1].ptr), "", MS_BIND, null) != 0) {
+            errf("fx-init: warning: pivot: bind {s} failed: {s} — staying on initramfs root\n", .{ b[0], errnoStr() });
+            pivot_undo(0, false, fx_bound);
+            return;
+        }
+    }
+
+    // ── phase 3: the MS_MOVEs — the irreversible window, kept minimal ─────
+    // Every mount the new root needs is already in place; only the moves,
+    // the chdir and pivot_root remain.  A failure inside this window runs
+    // pivot_undo, which moves everything already moved BACK (reverse order).
+    var done: usize = 0;
+    for (pivot_kernel_moves) |m| {
+        if (move_or_bind(m[0], @ptrCast(m[1].ptr)) != 0) {
+            errf("fx-init: warning: pivot: move {s} failed: {s} — staying on initramfs root\n", .{ m[0], errnoStr() });
+            pivot_undo(done, false, fx_bound);
+            return;
+        }
+        done += 1;
+    }
+
+    // The store, disk arm: g_store == /fx/disk/store — MS_MOVE the whole
+    // disk MOUNT into the new root (the mount travels; /oldroot/fx/disk
+    // becomes an empty dir).  This is the LAST move: it needs nothing the
+    // kernel-fs moves provide, and undoing it is g_store's path restore.
+    var disk_moved = false;
+    if (disk_arm) {
+        if (move_or_bind(DISK_MOUNT, "/newroot/fx/disk") != 0) {
+            errf("fx-init: warning: pivot: move {s} failed: {s} — staying on initramfs root\n", .{ DISK_MOUNT, errnoStr() });
+            pivot_undo(pivot_kernel_moves.len, false, fx_bound);
+            return;
+        }
+        disk_moved = true;
+    }
+
+    // ── phase 4: the pivot itself ─────────────────────────────────────────
+    if (std.c.chdir("/newroot") != 0) {
+        errf("fx-init: warning: pivot: chdir /newroot failed: {s} — staying on initramfs root\n", .{errnoStr()});
+        pivot_undo(pivot_kernel_moves.len, disk_moved, fx_bound);
+        return;
+    }
+    if (pivot_root(".", "oldroot") != 0) {
+        errf("fx-init: warning: pivot_root failed: {s} — staying on initramfs root\n", .{errnoStr()});
+        // back to the old root FIRST — the undo's move-back targets
+        // (/proc, /sys, /dev, /fx/disk) are old-root paths.
+        _ = std.c.chdir("/");
+        pivot_undo(pivot_kernel_moves.len, disk_moved, fx_bound);
+        return;
+    }
+    _ = std.c.chdir("/");
+
+    // PROOF (both conditions are impossible on the initramfs root, MEASURED):
+    // the /proc/mounts root entry is "rootfs <anything> rootfs" there, and
+    // becomes "none / tmpfs" only after the pivot; the statfs magic is the
+    // belt (identical pre/post on a CONFIG_TMPFS=y kernel — see the comment
+    // at TMPFS_MAGIC — so it cannot carry the proof alone).
+    var fst2: [64]u8 = undefined;
+    const new_fst = root_mount_fstype(&fst2);
+    if (std.mem.eql(u8, new_fst, TMPFS_FST) and fs_magic("/") == TMPFS_MAGIC) {
+        errf("fx-init: pivoted to tmpfs root (magic 0x1021994)\n", .{});
+    } else {
+        errf("fx-init: warning: post-pivot root fstype '{s}' magic 0x{x:0>8} (want {s}/0x01021994)\n", .{ if (new_fst.len == 0) "?" else new_fst, @as(u32, @truncate(@as(u64, @bitCast(fs_magic("/"))))), TMPFS_FST });
+    }
 }
 
 fn evaluate_boot_ok() void {
@@ -2228,6 +2562,11 @@ pub fn main(init: std.process.Init) !void {
     // ANY store handle is opened — the first open is inside
     // decide_boot_version below.
     ensure_disk_store();
+    // the real-rootfs pivot: must run at THIS instant — after the disk store
+    // (so its mount can travel into the new root) and before the pipe/signal
+    // setup, the first store open, and /run/fx (all of which then land ON the
+    // new root).  Inert unless PID1 on an initramfs rootfs (see the gates).
+    pivot_root_to_tmpfs();
 
     if (std.c.pipe(&g_sigpipe) != 0) {
         errf("fx-init: pipe: {s}\n", .{errnoStr()});
@@ -2321,6 +2660,39 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // ─── tests (pure parts: parse_on, boot_decision, next_timeout, on_ready) ──
+
+test "pivot gate constants (linux/magic.h + the measured rootfs fstype)" {
+    // The pivot gate/proof depend on kernel-fixed values.  A wrong constant
+    // here is a silent boot regression (the gate never fires, or the proof
+    // line never prints), so pin them: TMPFS_MAGIC from linux/magic.h, and
+    // the /proc/mounts root-entry fstype strings MEASURED on the pinned
+    // kernel 7.1.8-1-default (initramfs root = "rootfs", pivoted new root =
+    // "tmpfs").  Note statfs("/") reports TMPFS_MAGIC on the initramfs root
+    // TOO when CONFIG_TMPFS=y (measured) — which is exactly why the fstype
+    // strings, not the magic, carry the gate; this test pins all of them.
+    try std.testing.expectEqual(@as(i64, 0x01021994), TMPFS_MAGIC);
+    try std.testing.expectEqual(@as(c_ulong, 8192), MS_MOVE);
+    try std.testing.expectEqual(@as(c_ulong, 4096), MS_BIND);
+    // the gate/proof fstype literals are LOAD-BEARING and kernel-fixed:
+    // "rootfs" is what mounts(5) reports for the root entry of an
+    // initramfs root and "tmpfs" for the pivoted new root (both MEASURED
+    // via a static rdinit probe pre/post pivot_root on the pinned kernel).
+    // The gate would silently never fire (and the proof never print) if
+    // either literal were edited to anything else — including each OTHER,
+    // so assert they differ too.
+    try std.testing.expectEqualStrings("rootfs", ROOTFS_FST);
+    try std.testing.expectEqualStrings("tmpfs", TMPFS_FST);
+    try std.testing.expect(!std.mem.eql(u8, ROOTFS_FST, TMPFS_FST));
+    // the moves the undo reverses must be exactly the canonical kernel
+    // filesystems — a dropped entry leaves the initramfs root without it
+    // after a rolled-back pivot; a wrong path fails the move itself.
+    try std.testing.expectEqualStrings("/proc", pivot_kernel_moves[0][0]);
+    try std.testing.expectEqualStrings("/sys", pivot_kernel_moves[1][0]);
+    try std.testing.expectEqualStrings("/dev", pivot_kernel_moves[2][0]);
+    try std.testing.expectEqualStrings("/newroot/proc", pivot_kernel_moves[0][1]);
+    try std.testing.expectEqualStrings("/newroot/sys", pivot_kernel_moves[1][1]);
+    try std.testing.expectEqualStrings("/newroot/dev", pivot_kernel_moves[2][1]);
+}
 
 fn argstr(arg: [*]u8) []const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(arg)));
