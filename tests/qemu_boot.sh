@@ -31,6 +31,12 @@
 #       fxstore-built store + a store-built fx-activate; provisioning is the
 #       caller's job.  Present only so the same harness runs on a full host.
 #
+# Sources are FROZEN into the scratch dir before anything else (see the
+# freeze_src block below): the fxstore derivation hash content-addresses
+# each package's whole clean src tree, and the shared sibling checkouts can
+# be edited concurrently by other agents — the same shield as
+# qemu_boot_rollback.sh / qemu_ctrl.sh.
+#
 # Env:
 #   FXSTORE       path to a built fxstore binary       (enables path (b))
 #   FX_ACTIVATE   path to the fx-activate under test   (enables path (b))
@@ -88,6 +94,55 @@ STORE="$WORK/store"
 ROOT="$WORK/root"
 mkdir -p "$STORE" "$ROOT/run/fx" "$ROOT/etc" "$ROOT/bin" "$ROOT/tmp"
 
+# ─── freeze the package sources ────────────────────────────────────────────
+# The fxstore derivation hash content-addresses each package's WHOLE clean
+# src tree, and the shared sibling checkouts (../../datalog-dafsa etc.) can
+# be MODIFIED CONCURRENTLY by their own agents/runs (MEASURED: activation
+# reported the closure "not built" because the tree hash drifted between
+# this harness's provisioning step and its activation step).  EVERY hash
+# computation below — provisioning AND activation — must see the same
+# trees, so freeze FIRST and run everything against the frozen copies:
+#   - snapshot the siblings + the repo src into the scratch dir, skipping
+#     exactly the trees the clean walk itself excludes (copying them would
+#     only waste space; skipping them keeps the snapshot's clean-tree hash
+#     identical to the live tree's at snapshot time);
+#   - rewrite m3/package-set.dhall's `Path = "..."` values to the frozen
+#     absolute locations (relative paths resolve against the package-set
+#     file, which is why the rewrite must be total).
+# This is a HARNESS-only stabilization: it changes no store semantics.
+freeze_src() { # freeze_src SRC DST
+    mkdir -p "$2"
+    ( cd "$1" && find . \
+        -not -path "./.git/*"       -not -name ".git" \
+        -not -path "./build-tmp/*"  -not -name "build-tmp" \
+        -not -path "./zig-out/*"    -not -name "zig-out" \
+        -not -path "./zig/zig-out/*" \
+        -not -path "./zig/.zig-cache/*" -not -path "./zig/.zig-global/*" \
+        -not -path "./node_modules/*" -not -name "node_modules" \
+        -not -path "./elm-stuff/*" -not -name "elm-stuff" \
+        -not -path "./dist/*"     -not -name "dist" \
+        -not -name "*.o" -not -name "*.a" -not -name "*.so" -not -name "*.com" \
+        -not -name "dl-test-*" -not -name ".ape-*" \
+        -print0 | cpio -pdm0 "$2" ) >/dev/null 2>&1 \
+        || fail "cannot snapshot $1 -> $2"
+}
+echo "=== qemu-boot: freezing package sources (concurrent-writer shield) ==="
+SIBS="$(cd "$REPO/.." && pwd)"
+mkdir -p "$WORK/frozen/siblings"
+freeze_src "$SIBS/datalog-dafsa" "$WORK/frozen/siblings/datalog-dafsa"
+freeze_src "$SIBS/dhall-c"       "$WORK/frozen/siblings/dhall-c"
+freeze_src "$SIBS/fxstore"       "$WORK/frozen/siblings/fxstore"
+freeze_src "$REPO"               "$WORK/frozen/fx-init"
+sed -e "s|< Path = \"../../datalog-dafsa\" >|< Path = \"$WORK/frozen/siblings/datalog-dafsa\" >|" \
+    -e "s|< Path = \"../../dhall-c\" >|< Path = \"$WORK/frozen/siblings/dhall-c\" >|" \
+    -e "s|< Path = \"../../fxstore\" >|< Path = \"$WORK/frozen/siblings/fxstore\" >|" \
+    -e "s|< Path = \"..\" >|< Path = \"$WORK/frozen/fx-init\" >|" \
+    -e "s|< Path = \"../vendor/dhake\" >|< Path = \"$WORK/frozen/fx-init/vendor/dhake\" >|" \
+    "$REPO/m3/package-set.dhall" > "$WORK/frozen/package-set.dhall"
+grep -q "$WORK/frozen" "$WORK/frozen/package-set.dhall" \
+    || fail "package-set rewrite produced no frozen paths"
+PKGSET="$WORK/frozen/package-set.dhall"
+
 # ─── provisioning path (a): toolchain-free ────────────────────────────────
 FXS="${FXSTORE:-}"
 FXA="${FX_ACTIVATE:-}"
@@ -134,7 +189,7 @@ if [ -z "$FXS" ] || [ -z "$FXA" ]; then
     # their dirs carry a marker file (their CONTENT never executes at boot).
     echo "--- provisioning store closure at $STORE ---"
     PATHS=$(LD_LIBRARY_PATH="$DL" "$ZB/activate_paths" \
-        --store "$STORE" --package-set "$REPO/m3/package-set.dhall" \
+        --store "$STORE" --package-set "$PKGSET" \
         dhake fx-init fxctl fx-activate fake-service datalog-dafsa dhall-c fxstore) \
         || fail "activate_paths failed"
     [ -n "$PATHS" ] || fail "activate_paths printed no closure"
@@ -170,7 +225,7 @@ case "$QEMU_CONFIG" in /*) ;; *) QEMU_CONFIG="$REPO/$QEMU_CONFIG" ;; esac
 
 echo "=== qemu-boot: activating $(basename "$QEMU_CONFIG") ==="
 ACT_OUT=$(LD_LIBRARY_PATH="$DLDIR" "$FXACT" --store "$STORE" \
-    --package-set "$REPO/m3/package-set.dhall" --config "$QEMU_CONFIG" 2>&1) \
+    --package-set "$PKGSET" --config "$QEMU_CONFIG" 2>&1) \
     || fail "activate failed: $ACT_OUT"
 echo "$ACT_OUT"
 # "activated <genhash> as version <N>; buildfile <path>"
