@@ -3005,10 +3005,72 @@ fn usage(o: *FILE) void {
         DEFAULT_STORE, DEFAULT_RUN, @as(c_int, DEFAULT_PROBE_S), @as(c_ulonglong, DEFAULT_LOG_CAP), @as(c_uint, DEFAULT_GRACE_MS));
 }
 
+/// Backing for a store path taken from the kernel command line — g_store
+/// points here, so the storage must outlive apply_kernel_store's frame.
+var g_store_buf: [256]u8 = [_]u8{0} ** 256;
+
+/// Find the `fx.store=<path>` token in a kernel command line and return the
+/// path, or null when there is none to use (the FIRST token-start occurrence
+/// wins).  The kernel passes rdinit NO argv (measured), so /proc/cmdline is
+/// the only channel a boot has to name a store without rebuilding the image.
+/// `fx.store=` matches only at a TOKEN start (start of string or after a
+/// space) — a token that merely CONTAINS the substring (`notfx.store=`) must
+/// not match — and an empty value is rejected rather than yielding an empty
+/// path.  The value ends at the next space or any control byte (the trailing
+/// newline of /proc/cmdline included).
+fn parse_kernel_store(text: []const u8) ?[]const u8 {
+    const key = "fx.store=";
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, key)) |hit| {
+        if (hit != 0 and rest[hit - 1] != ' ') {
+            rest = rest[hit + key.len ..]; // substring of another token: skip it
+            continue;
+        }
+        const val = rest[hit + key.len ..];
+        var end: usize = 0;
+        while (end < val.len and val[end] > ' ') end += 1;
+        return if (end == 0) null else val[0..end];
+    }
+    return null;
+}
+
+/// Apply the kernel command line's `fx.store=` (B5) between mount_early()
+/// (which made /proc readable) and the boot-start banner, so the banner names
+/// the store the boot will use.  SCOPE — honest: this makes the command line
+/// authoritative for the PRE-DISK default only; an explicit --store always
+/// wins (the operator's direct intent), and ensure_disk_store() may still
+/// relocate g_store to /fx/disk/store afterwards — that precedence is
+/// deliberate and unchanged (the disk is the durable store; the command line
+/// only names where the image's own store is sought).  A missing/unreadable
+/// /proc/cmdline, or no fx.store= token, is the NORMAL case: silent, default
+/// untouched.  g_probe_root (--probe-fixture-root, the probe module's
+/// convention) re-roots the read so tests can fixture it.
+fn apply_kernel_store(store_explicit: bool) void {
+    if (store_explicit) return;
+    var p: [512]u8 = undefined;
+    const root: []const u8 = if (g_probe_root) |r| span(r) else "";
+    _ = snfmt(&p, "{s}/proc/cmdline", .{root});
+    const f = fopen(@ptrCast(&p), "r") orelse return;
+    defer _ = fclose(f);
+    // COMMAND_LINE_SIZE is 2048 on Linux — 4k is ample and bounds the read
+    var buf: [4096]u8 = undefined;
+    const n = fread(&buf, 1, buf.len, f);
+    const store = parse_kernel_store(std.mem.sliceTo(buf[0..n], 0)) orelse return;
+    if (store.len >= g_store_buf.len) {
+        errf("fx-init: WARNING: fx.store= path longer than {d} bytes — keeping default {s}\n", .{ g_store_buf.len, span(g_store) });
+        return;
+    }
+    @memcpy(g_store_buf[0..store.len], store);
+    g_store_buf[store.len] = 0;
+    g_store = @ptrCast(&g_store_buf);
+    errf("fx-init: store from kernel command line fx.store={s}\n", .{store});
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     g_io = init.io;
 
+    var store_explicit = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a: [:0]const u8 = args[i];
@@ -3019,6 +3081,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             }
             g_store = args[i].ptr;
+            store_explicit = true;
         } else if (std.mem.eql(u8, a, "--run-dir")) {
             i += 1;
             if (i >= args.len) {
@@ -3077,6 +3140,12 @@ pub fn main(init: std.process.Init) !void {
     // by the one console line proving PID1 itself started (fd 2 is
     // /dev/console for a rdinit PID1; a captured stderr in the harnesses).
     mount_early();
+    // B5: the kernel command line's fx.store= (rdinit gets NO argv — the
+    // command line is the only channel) names the PRE-DISK store.  Must run
+    // after mount_early (/proc just came up) and before the banner, so the
+    // banner shows the chosen store; ensure_disk_store below keeps its
+    // existing precedence and may still relocate g_store afterwards.
+    apply_kernel_store(store_explicit);
     errf("fx-init: boot start store {s}\n", .{span(g_store)});
     // the persistent store must be up (and g_store repointed at it) before
     // ANY store handle is opened — the first open is inside
@@ -3213,6 +3282,42 @@ test "pivot gate constants (linux/magic.h + the measured rootfs fstype)" {
     try std.testing.expectEqualStrings("/newroot/proc", pivot_kernel_moves[0][1]);
     try std.testing.expectEqualStrings("/newroot/sys", pivot_kernel_moves[1][1]);
     try std.testing.expectEqualStrings("/newroot/dev", pivot_kernel_moves[2][1]);
+}
+
+test "parse_kernel_store: the shapes a kernel command line actually has" {
+    // MUST match: first/middle/last token, multiple spaces around it, and
+    // the trailing newline /proc/cmdline carries.
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("fx.store=/alt").?);
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("fx.store=/alt console=ttyS0").?);
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("console=ttyS0 fx.store=/alt").?);
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("console=ttyS0,115200 rdinit=/fx/store/x/fx-init fx.store=/alt panic=-1 oops=panic\n").?);
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("a=1  fx.store=/alt  b=2").?);
+    try std.testing.expectEqualStrings("/fx/store-alt", parse_kernel_store("fx.store=/fx/store-alt\n").?);
+    // tab is a control byte: the value ends there (kernel splits on spaces,
+    // but a control byte can never be part of a path we want to use)
+    try std.testing.expectEqualStrings("/alt", parse_kernel_store("fx.store=/alt\tconsole=ttyS0").?);
+    // a SPACE terminates the value: the kernel itself splits the command
+    // line on spaces, so a token can never contain one — fx.store=/a b/c
+    // means fx.store=/a plus the unrelated token b/c
+    try std.testing.expectEqualStrings("/a", parse_kernel_store("fx.store=/a b/c").?);
+    // MUST NOT match: a token that merely CONTAINS the substring
+    try std.testing.expect(parse_kernel_store("notfx.store=/alt") == null);
+    try std.testing.expect(parse_kernel_store("console=ttyS0 notfx.store=/alt") == null);
+    // ...and a mid-token skip must not hide a later REAL token
+    try std.testing.expectEqualStrings("/real", parse_kernel_store("notfx.store=/x fx.store=/real").?);
+    // MUST NOT match: no token at all / no key / key without '='
+    try std.testing.expect(parse_kernel_store("") == null);
+    try std.testing.expect(parse_kernel_store("console=ttyS0 rdinit=/init panic=-1\n") == null);
+    try std.testing.expect(parse_kernel_store("fx.store /alt") == null);
+    // MUST be rejected: empty value (a usable path cannot be empty)
+    try std.testing.expect(parse_kernel_store("fx.store=") == null);
+    try std.testing.expect(parse_kernel_store("fx.store= console=ttyS0") == null);
+    // "empty" via a control byte right after '=' is the same rejection
+    try std.testing.expect(parse_kernel_store("fx.store=\n") == null);
+    // first occurrence wins, and the FIRST match's emptiness is decisive: no
+    // falling through to a later non-empty token
+    try std.testing.expectEqualStrings("/first", parse_kernel_store("fx.store=/first fx.store=/second").?);
+    try std.testing.expect(parse_kernel_store("fx.store= fx.store=/second") == null);
 }
 
 fn argstr(arg: [*]u8) []const u8 {

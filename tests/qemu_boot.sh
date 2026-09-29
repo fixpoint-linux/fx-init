@@ -48,6 +48,10 @@
 #   QEMU_DISK     path to the virtio disk image (default: a fresh 512M
 #                 qemu-img in the scratch dir; the rollback harness points
 #                 this at ONE shared disk across its 3 boots)
+#   QEMU_STORE_ARG  fx.store= value appended to the kernel command line
+#                 (default /fx/store — today's value, so the default run is
+#                 unchanged; B5: fx-init parses it as the pre-disk store, and
+#                 the banner assertion below proves it with a non-default)
 #   FX_SIBLINGS   dir with the sibling checkouts (default: repo ../..)
 #   QEMU_KEEP=1   keep the scratch dir (debugging; prints its path)
 set -u
@@ -255,10 +259,11 @@ RDINIT="/fx/store/$(basename "$FXD")/fx-init"
 echo "=== qemu-boot: booting (rdinit=$RDINIT, expecting version v$V, disk=$DISK) ==="
 CONSOLE="$WORK/console.log"
 : > "$CONSOLE"
+QEMU_STORE_ARG="${QEMU_STORE_ARG:-/fx/store}"
 timeout "$QEMU_BOOT_TIMEOUT" qemu-system-x86_64 \
     -machine q35 -accel kvm -cpu host -m 2048 -smp 1 \
     -kernel "$KERNEL" -initrd "$WORK/initrd.cpio.gz" \
-    -append "console=ttyS0,115200 rdinit=$RDINIT fx.store=/fx/store panic=-1 oops=panic" \
+    -append "console=ttyS0,115200 rdinit=$RDINIT fx.store=$QEMU_STORE_ARG panic=-1 oops=panic" \
     -nographic -no-reboot -monitor none -serial file:"$CONSOLE" \
     -drive file="$DISK",format=raw,if=virtio \
     >"$WORK/qemu.out" 2>&1
@@ -275,6 +280,14 @@ if grep -q 'disk store disabled\|insmod .* FAILED' "$CONSOLE"; then
     echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
     fail "disk store bring-up FAILED (insmod/mkfs/mount)"
 fi
+# the banner must name the store the command line carried ($QEMU_STORE_ARG,
+# default /fx/store): guards the knob's wiring into -append AND that fx-init
+# applied it (boot 2 proves the parse with a non-default; this pins that the
+# DEFAULT path parses identically)
+if ! grep -q "fx-init: boot start store $QEMU_STORE_ARG" "$CONSOLE"; then
+    echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
+    fail "banner does not name the command-line store $QEMU_STORE_ARG"
+fi
 # PERSISTENCE: the disk image must have been WRITTEN (mkfs/seed), not just
 # read — its sha must differ from the pre-boot blank image
 DISK_SHA_AFTER=$(sha256sum "$DISK" | awk '{print $1}')
@@ -290,12 +303,60 @@ if grep -q 'fx-init: boot-FAILED' "$CONSOLE"; then
     echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
     fail "boot-FAILED v (want boot-ok v$V) — negative control red as designed"
 fi
-if grep -q "fx-init: boot-ok v$V" "$CONSOLE"; then
-    echo "qemu-boot: PASS (boot-ok v$V on serial)"
-    exit 0
-fi
 # timeout / crash / silent death
-echo "--- qemu exit $QRC; last 40 console lines ---"
-tail -40 "$CONSOLE"
-[ -s "$WORK/qemu.out" ] && { echo "--- qemu stderr ---"; tail -5 "$WORK/qemu.out"; }
-fail "no boot-ok v$V verdict within ${QEMU_BOOT_TIMEOUT}s (exit $QRC)"
+if ! grep -q "fx-init: boot-ok v$V" "$CONSOLE"; then
+    echo "--- qemu exit $QRC; last 40 console lines ---"
+    tail -40 "$CONSOLE"
+    [ -s "$WORK/qemu.out" ] && { echo "--- qemu stderr ---"; tail -5 "$WORK/qemu.out"; }
+    fail "no boot-ok v$V verdict within ${QEMU_BOOT_TIMEOUT}s (exit $QRC)"
+fi
+
+# ─── B5: the kernel command line's fx.store= is AUTHORITATIVE for the
+# PRE-DISK store (rdinit gets no argv — the command line is the only channel
+# a boot has to name one).  Second boot, same image, ONE variable changed:
+# fx.store=/fx/store-alt.  The assertion PAIR is the asymmetry the feature
+# needs:
+#   (a) the banner names /fx/store-alt — with parsing ABSENT the banner
+#       prints the built-in default /fx/store and this FAILS (proves the
+#       command line was actually read and applied);
+#   (b) the boot still SUCCEEDS with the disk store mounted — the disk arm
+#       relocated g_store to /fx/disk/store afterwards exactly as before
+#       (proves the fx.store= parse did not break the disk path or change
+#       its precedence).
+STORE_ALT="/fx/store-alt"
+CONSOLE2="$WORK/console-alt.log"
+DISK2="$WORK/disk-alt.img"
+: > "$CONSOLE2"
+qemu-img create -q "$DISK2" 512M || fail "qemu-img create (alt) failed"
+echo "=== qemu-boot: booting with fx.store=$STORE_ALT (expecting banner + boot-ok v$V) ==="
+timeout "$QEMU_BOOT_TIMEOUT" qemu-system-x86_64 \
+    -machine q35 -accel kvm -cpu host -m 2048 -smp 1 \
+    -kernel "$KERNEL" -initrd "$WORK/initrd.cpio.gz" \
+    -append "console=ttyS0,115200 rdinit=$RDINIT fx.store=$STORE_ALT panic=-1 oops=panic" \
+    -nographic -no-reboot -monitor none -serial file:"$CONSOLE2" \
+    -drive file="$DISK2",format=raw,if=virtio \
+    >"$WORK/qemu-alt.out" 2>&1
+QRC2=$?
+if ! grep -q "fx-init: store from kernel command line fx.store=$STORE_ALT" "$CONSOLE2"; then
+    echo "--- last 40 console-alt lines ---"; tail -40 "$CONSOLE2"
+    fail "no 'store from kernel command line' line for $STORE_ALT (fx.store= not applied?)"
+fi
+if ! grep -q "fx-init: boot start store $STORE_ALT" "$CONSOLE2"; then
+    echo "--- last 40 console-alt lines ---"; tail -40 "$CONSOLE2"
+    fail "banner does not name the kernel-command-line store $STORE_ALT (fx.store= not parsed?)"
+fi
+if ! grep -q 'fx-init: disk store mounted (current v' "$CONSOLE2"; then
+    echo "--- last 40 console-alt lines ---"; tail -40 "$CONSOLE2"
+    fail "no 'disk store mounted' line with fx.store=$STORE_ALT — the disk arm did not run"
+fi
+if grep -q 'fx-init: boot-FAILED' "$CONSOLE2"; then
+    echo "--- last 40 console-alt lines ---"; tail -40 "$CONSOLE2"
+    fail "boot-FAILED with fx.store=$STORE_ALT (disk arm broken by the cmdline store?)"
+fi
+if ! grep -q "fx-init: boot-ok v$V" "$CONSOLE2"; then
+    echo "--- qemu exit $QRC2; last 40 console-alt lines ---"; tail -40 "$CONSOLE2"
+    [ -s "$WORK/qemu-alt.out" ] && { echo "--- qemu stderr ---"; tail -5 "$WORK/qemu-alt.out"; }
+    fail "no boot-ok v$V with fx.store=$STORE_ALT (exit $QRC2)"
+fi
+echo "qemu-boot: PASS (boot-ok v$V on serial, cmdline store $STORE_ALT honored pre-disk)"
+exit 0
