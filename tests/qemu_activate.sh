@@ -171,6 +171,11 @@ PKGSET="$WORK/frozen/package-set.dhall"
 # exec without a reboot — the plan's honest v1 scope.  The CLOSURE is
 # unchanged (same 5 packages) but the SERVICES differ, so the genhash
 # differs: a genuinely NEW config, not a re-activation.
+# The hostname is ALSO different ("fixbox-alt", 10 bytes, vs config-good's
+# "fixbox", 6 bytes — fx-activate writes cfg.hostname VERBATIM, no trailing
+# newline): the F1 hot-apply observable.  A `put`+`activate` must land the
+# new /etc/hostname on the RUNNING root, which the probe's file relation
+# (/etc/hostname size+mtime) and the fresh dhake log lines both see.
 cat > "$WORK/config-alt.dhall" <<'EOF'
 let Probe = < Tcp : Natural | Unix : Text | File : Text >
 let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
@@ -178,7 +183,7 @@ let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
                 probe : Optional Probe,
                 env : Optional (List { key : Text, value : Text }) }
 let User = { name : Text, uid : Natural, groups : List Text }
-in  { hostname = "fixbox"
+in  { hostname = "fixbox-alt"
     , packages = [ "dhake", "fx-init", "fxctl", "fx-activate", "fake-service" ]
     , users = [ { name = "root", uid = 0, groups = [] : List Text } ]
     , services =
@@ -353,6 +358,17 @@ run_boot() { # run_boot CONSOLE WITH_SESSION
     echo 'q service_runtime'
     echo 'grep heartbeat'
 } > "$WORK/req2.txt"
+# req3 — the F1 HOT-APPLY proof: force a probe refresh, read the /etc/hostname
+# row (file relation: path, size, mode, uid, gid, mtime), and grep the dhake
+# actions the hot-apply ran.  BOOT's own run_dhake already logged dhake lines
+# for v_good (hostname 6 bytes); the in-guest activate's re-run must show
+# /etc/hostname copied AGAIN with the NEW size (10) — a fresh row that could
+# only come from materializing config-alt on the RUNNING root.
+{
+    echo 'probe'
+    echo 'q file'
+    echo 'grep hostname'
+} > "$WORK/req3.txt"
 
 echo "=== boot 1: channel boot — seed the disk at v$V_GOOD, then put+activate config-alt IN-GUEST ==="
 SHA0=$(disk_sha)
@@ -410,6 +426,31 @@ grep -q 'heartbeat from heartbeat' "$WORK/ctrl2.log" \
     || { cat "$WORK/ctrl2.log"; kill "$QPID" 2>/dev/null; fail "grep: no 'heartbeat from heartbeat' line"; }
 grep -q 'heartbeat from second' "$WORK/ctrl2.log" \
     || { cat "$WORK/ctrl2.log"; kill "$QPID" 2>/dev/null; fail "grep: no 'heartbeat from second' line (the new service's output is not in the log DB)"; }
+
+# ── the F1 HOT-APPLY proof: the new /etc CONTENT is on the RUNNING root ──
+# (not merely rc=0 — the /etc/hostname ROW must change: config-good wrote
+# "fixbox" (6 bytes) at BOOT, config-alt is "fixbox-alt" (10 bytes).  The
+# probe command forces fx_probe_refresh, so q file reads the file the
+# hot-apply rewrote, and grep hostname shows the fresh dhake Copy of the
+# new etc file — both could only exist if run_dhake re-materialized the
+# activated generation on the live root.)
+CTRL_TRANSCRIPT="$WORK/ctrl3.log"
+ctrl_session "$SOCK" "$WORK/req3.txt" "$CTRL_TRANSCRIPT"
+echo "--- ctrl3 transcript (hot-apply proof) ---"; cat "$CTRL_TRANSCRIPT"; echo "-----------------------------------------"
+# q file row: "/etc/hostname<TAB>10<TAB>33188<TAB>0<TAB>0<TAB>mtime" — the
+# SIZE column is the honest observable (config-good's would be 6).
+FILE_ROW=$(grep '^/etc/hostname' "$CTRL_TRANSCRIPT" | head -1)
+[ -n "$FILE_ROW" ] \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "q file: no /etc/hostname row (the file probe saw nothing)"; }
+FILE_SIZE=$(echo "$FILE_ROW" | awk -F'\t' '{print $2}')
+[ "$FILE_SIZE" = "10" ] \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "q file: /etc/hostname size is $FILE_SIZE, want 10 ('fixbox-alt' hot-applied; 6 = the boot's 'fixbox' still there — the activate did NOT re-materialize /etc)"; }
+# dhake's own action echo for the new etc file (run_dhake pipes the child's
+# stdout into the log DB as svc=dhake): "cp <store>/...-system-generation/etc/hostname /etc/hostname"
+grep -q 'cp.*-system-generation/etc/hostname /etc/hostname' "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "grep hostname: no dhake Copy of etc/hostname (the hot-apply did not run)"; }
+grep -q 'chmod 0644 /etc/hostname' "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "grep hostname: no dhake chmod on /etc/hostname (the hot-apply did not run)"; }
 
 # negative-control hook: invert one assertion to prove the detector can fail
 if [ "${QEMU_ACT_NEGATE:-0}" = "1" ]; then

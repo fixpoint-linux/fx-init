@@ -2481,6 +2481,32 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
+            // HOT-APPLY: read_store_facts just swapped g_buildfile to the
+            // NEW generation's Dhakefile, but nothing put its /etc + /bin on
+            // the RUNNING root — the boot path's run_dhake() does exactly
+            // that (idempotent: dhake Rm's before each Symlink and Copy
+            // overwrites), so re-run it here on the live (post-pivot tmpfs)
+            // root.  Post-activate the running root IS the tmpfs root, and
+            // /fx/disk/store is reachable from it, so the rewritten
+            // buildfile's absolute from-paths resolve.
+            const drc = run_dhake();
+            if (drc != 0) {
+                // The generation IS activated in the store (published above
+                // by the child, CURRENT committed) — do NOT roll it back.
+                // But answering OK would be a lie about the RUNNING system,
+                // so surface the reapply failure in the response (run_dhake
+                // already logged the per-action detail as svc=dhake).
+                rt_txn_begin();
+                rt_effect(txn, "activate", "dhake-failed");
+                _ = rt_txn_commit();
+                var dm: [96]u8 = undefined;
+                _ = snfmt(&dm, "activated version {d} (rootfs reapply FAILED, rc {d})", .{ g_current_version, drc });
+                // same loss window as the OK path below: the child's
+                // snapshot manifest must be on disk before the response.
+                syncfs_store();
+                resp_err(o, @ptrCast(&dm));
+                return;
+            }
             _ = fprintf(o, "activated version %u\n", g_current_version);
             rt_txn_begin();
             rt_effect(txn, "version", "");
