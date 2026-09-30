@@ -15,11 +15,16 @@
 # TTY, PRINTK — and two M5 discoveries: FILE_LOCKING, without which
 # dl_open's F_SETLK fails EACCES and the boot dies before a verdict, and
 # the CRYPTO chain =y, without which jbd2.ko fails to insmod).  This
-# first M5 artifact is the BELT build: the five disk-path modules below
-# are =m exactly as the M4 mechanism ships them; the zero-module build
-# (=y everywhere, no modules tree) supersedes it in the next step.
+# kernel is the ZERO-MODULE build: every disk-path driver (virtio_blk,
+# ext4 + jbd2/mbcache/crc16) is =y — no modules/ tree, no /lib/modules in
+# the image, no insmod at boot; the whole M4 module mechanism is deleted.
 # Repacked deterministically (tar --sort=name, owner/group/mtime 0,
 # gzip -n).
+#
+# Belt build note: an intermediate artifact (m5-kernel-6.12.19-m5) shipped
+# these five modules as =m with the M4 mechanism intact, proving the new
+# kernel booted the OLD image unchanged before the mechanism was deleted;
+# its commit is the bisect boundary.
 #
 # HONEST RISK (unchanged): a GitHub release asset CAN be replaced or
 # deleted by anyone with repo admin — the same trust domain as this
@@ -33,36 +38,24 @@
 #   tar_sha256      pin of the whole tarball (a cached copy failing this
 #                   hash is re-fetched, never trusted)
 #   tar_size        early sanity check before the hash
-#   kernel_version  the /lib/modules/<version> tree name; the image's
-#                   /lib/modules/<version> dir — the single place the
-#                   version string lives
+#   kernel_version  the kernel's version string (informational since M5:
+#                   no /lib/modules dir is created anywhere — the single
+#                   place the version string lives)
 #   vmlinuz_path    vmlinuz, relative to the tarball root (top level)
 #   vmlinuz_sha256  pin of the EXTRACTED vmlinuz (verified after the
 #                   unpack AND by tests/qemu_*.sh: a mismatch FAILS)
 #   config_path     the kernel's own config, relative to the tarball root
 #                   (kept for future config assertions)
-#   module          one disk-path module per line, relative to the
-#                   tarball's modules/ tree (6.12 in-tree paths: note
-#                   crc16 lives at lib/crc16.ko and mbcache at
-#                   fs/mbcache.ko in this tree, unlike the RPM's
-#                   kernel/lib/crc/... layout).  insmod order is
-#                   zig/src/init.zig's DISK_MODULE_ORDER:
-#                   crc16 mbcache jbd2 ext4 virtio_blk.
 #
 # Kernel config facts this increment depends on (all =y in the shipped
-# config): BLK_DEV_INITRD, RD_GZIP, DEVTMPFS(+MOUNT), TMPFS,
-# SERIAL_8250_CONSOLE, VIRTIO, VIRTIO_PCI, VIRTIO_CONSOLE, PRINTK,
-# FILE_LOCKING.  =m: VIRTIO_BLK, EXT4_FS (+JBD2/CRC16/FS_MBCACHE, the
-# module lines below).
-url https://github.com/fixpoint-linux/fx-init/releases/download/m5-kernel-6.12.19-m5/fixpoint-kernel-6.12.19-m5.tar.gz
-tar_sha256 029006d4b0ebf876bfb225d5ca9d3095e3a06169343803a61f5ef369f3169fa8
-tar_size 2383917
-kernel_version 6.12.19-m5
+# config, MEASURED — zero =m lines): BLK_DEV_INITRD, RD_GZIP,
+# DEVTMPFS(+MOUNT), TMPFS, SERIAL_8250_CONSOLE, VIRTIO, VIRTIO_PCI,
+# VIRTIO_BLK, VIRTIO_CONSOLE, EXT4_FS (+JBD2/FS_MBCACHE/CRC16), PRINTK,
+# FILE_LOCKING, plus the CRYPTO chain ext4's checksums select.
+url https://github.com/fixpoint-linux/fx-init/releases/download/m5-kernel-6.12.19-tiny/fixpoint-kernel-6.12.19-tiny.tar.gz
+tar_sha256 ad096118dde37c801b391a177450f5fa296045e89d2735391028fd9503890088
+tar_size 1911476
+kernel_version 6.12.19-tiny
 vmlinuz_path vmlinuz
-vmlinuz_sha256 269d088168b4d6d39f61c4decf63ca1800a7fc658153d837df8aa6cb873a02f1
+vmlinuz_sha256 51b226c62e0ce48a9720984be71ce7729d7860132cf40767dbde9b3e38193db5
 config_path config
-module lib/crc16.ko.zst
-module fs/mbcache.ko.zst
-module fs/jbd2/jbd2.ko.zst
-module fs/ext4/ext4.ko.zst
-module drivers/block/virtio_blk.ko.zst

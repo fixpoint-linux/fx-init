@@ -1398,13 +1398,6 @@ const DISK_STORE = "/fx/disk/store";
 const DISK_DEV = "/dev/vda";
 const DISK_STORE_DB = DISK_STORE ++ "/.db";
 const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
-// insmod order (from the pinned kernel's modules.dep): ext4 depends on
-// crc16 + mbcache + jbd2; virtio_blk has no deps.  MEASURED on the pinned
-// 7.2.7 RPM: ext4.ko has 10 UNDEFINED mb_cache_* symbols resolved by
-// mbcache.ko.  Keep in lockstep with the `module` lines in
-// scripts/kernel-pin.txt (mkinitramfs ships exactly those).
-const DISK_MODULE_ORDER = [_][]const u8{ "crc16.ko", "mbcache.ko", "jbd2.ko", "ext4.ko", "virtio_blk.ko" };
-
 const Dirent = extern struct {
     d_ino: u64,
     d_off: i64,
@@ -1449,22 +1442,6 @@ fn dev_is_devtmpfs() bool {
         if (sscanf(@ptrCast(&line), "%127s %127s %63s", &spec, &mnt, &fst) == 3) {
             if (strcmp(@ptrCast(&mnt), "/dev") == 0 and strcmp(@ptrCast(&fst), "devtmpfs") == 0) return true;
         }
-    }
-    return false;
-}
-
-/// The single /lib/modules/<ver> entry the image ships (tests/mkinitramfs.sh
-/// writes exactly one, version-locked to the pinned kernel at BUILD time).
-fn modules_dir(out: []u8) bool {
-    const d = opendir("/lib/modules") orelse return false;
-    defer _ = closedir(d);
-    while (readdir(d)) |e| {
-        const name = std.mem.sliceTo(&e.d_name, 0);
-        if (name.len == 0 or name[0] == '.') continue;
-        if (name.len + 1 > out.len) continue;
-        @memcpy(out[0..name.len], name);
-        out[name.len] = 0;
-        return true;
     }
     return false;
 }
@@ -1524,21 +1501,9 @@ fn ensure_disk_store() void {
         return; // /dev already kernel-populated and no virtio disk: host / harness
     }
 
-    // modules first: virtio_blk makes the disk appear, ext4 mounts it.
-    var mdir: [256]u8 = undefined;
-    if (!modules_dir(&mdir)) {
-        errf("fx-init: warning: no /lib/modules — disk store disabled\n", .{});
-        return;
-    }
-    for (DISK_MODULE_ORDER) |mod| {
-        var mp: [512]u8 = undefined;
-        _ = snfmt(&mp, "/lib/modules/{s}/{s}", .{ span(@ptrCast(&mdir)), mod });
-        const rc = run_bb("insmod", @ptrCast(&mp), null, null);
-        if (rc != 0) {
-            errf("fx-init: disk: insmod {s} FAILED (exit {d}) — disk store disabled\n", .{ mod, rc });
-            return;
-        }
-    }
+    // (the M5 zero-module kernel builds virtio_blk + the ext4 stack =y, so
+    // there is nothing to insmod — /dev/vda appears as soon as the device
+    // is there; the old insmod walk is gone with the module mechanism)
     if (std.c.access(DISK_DEV, F_OK) != 0) {
         errf("fx-init: disk store: no {s} — using ramfs store\n", .{DISK_DEV});
         return;
@@ -2872,8 +2837,8 @@ fn handle_conn(cfd: c_int) void {
 
 // ─── virtio-serial control channel (M4: tests/qemu_ctrl.sh) ───────────────
 
-/// Is there a /dev/vport<p>n<p> node?  Scans (opendir/readdir, mirrors
-/// modules_dir) rather than hardcoding vport0p1 — the first virtserialport is
+/// Is there a /dev/vport<p>n<p> node?  Scans (opendir/readdir) rather
+/// than hardcoding vport0p1 — the first virtserialport is
 /// INTERPRETED to land at vport0p1, but the node name is the kernel's to pick.
 fn find_vport(out: []u8) bool {
     return find_vport_nth(out, 0);

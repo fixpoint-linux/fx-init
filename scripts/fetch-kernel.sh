@@ -5,31 +5,30 @@
 # makes it a download any machine can reproduce.
 #
 # The pinned input is a TRIMMED TARBALL hosted as a release asset of THIS
-# repo (fixpoint-kernel-7.2.7-1-default.tar.gz: vmlinuz + config + the
-# five disk-path modules, cut from the openSUSE kernel-default-base RPM —
-# see the provenance comment in scripts/kernel-pin.txt).  Self-hosting the
-# pin removes the last external URL that rots (openSUSE PRUNES old
-# packages, which is what killed the previous pin).  The RPM fetch path
-# this script used to carry is gone — one pinned input, no second truth;
-# it lives in git history.
+# repo (vmlinuz + config — see the provenance comment in
+# scripts/kernel-pin.txt).  Self-hosting the pin removes the last external
+# URL that rots (openSUSE PRUNES old packages, which is what killed the
+# previous pin).  The RPM fetch path this script used to carry is gone —
+# one pinned input, no second truth; it lives in git history, as does the
+# M4 module-shipping layout this M5 zero-module kernel deletes (every
+# disk-path driver is built =y, so there is no modules/ tree to fetch,
+# stage or insmod).
 #
 # Downloads the pinned tarball, verifies the sha256 of the DOWNLOADED FILE
 # against scripts/kernel-pin.txt (the pin is the trust anchor: a replaced
-# or deleted asset fails here, loudly), unpacks vmlinuz + config + the
-# modules into the cache layout the harnesses consume, and verifies the
-# EXTRACTED vmlinuz sha256 against the pin as well (the belt: a tarball
-# that hashes right but unpacks wrong is still caught).
+# or deleted asset fails here, loudly), unpacks vmlinuz + config into the
+# cache layout the harnesses consume, and verifies the EXTRACTED vmlinuz
+# sha256 against the pin as well (the belt: a tarball that hashes right
+# but unpacks wrong is still caught).
 #
 # Cache layout (CACHE defaults to $REPO/.kernel-cache, FX_KERNEL_CACHE
 # overrides; the dir is gitignored):
-#   CACHE/<tarball name>         the verified tarball (18 MB; kept so a
+#   CACHE/<tarball name>         the verified tarball (2 MB; kept so a
 #                                 second run never re-downloads)
 #   CACHE/kernel/vmlinuz         the kernel the harnesses boot (-kernel)
 #   CACHE/kernel/config          the kernel's own config
-#   CACHE/kernel/modules/<...>   the .ko.zst files at their in-tarball
-#                                 relative paths (mkinitramfs decompresses
-#                                 them into /lib/modules/<version>/)
-# (a CACHE/rpm from the old pin is inert — nothing reads it anymore.)
+# (CACHE/rpm and CACHE/kernel/modules from the M4 pins are inert — nothing
+#  reads them anymore.)
 #
 # IDEMPOTENT: a cache hit (kernel dir hashes ok) does NO work and prints
 # "cache hit".  A cached tarball that FAILS its pin hash is re-fetched,
@@ -78,17 +77,9 @@ CONFIG_PATH=$(pin config_path)
     || fail "scripts/kernel-pin.txt malformed (needs url, tar_sha256, kernel_version, vmlinuz_sha256)"
 pin_path_ok "$VMLINUX_PATH" || fail "vmlinuz_path '$VMLINUX_PATH' is not a plain tarball-relative path"
 pin_path_ok "$CONFIG_PATH"  || fail "config_path '$CONFIG_PATH' is not a plain tarball-relative path"
-# every module line, in pin order
-MODULES=$(sed -n 's/^module //p' "$PIN")
-[ -n "$MODULES" ] || fail "scripts/kernel-pin.txt has no 'module ...' lines"
-for m in $MODULES; do
-    pin_path_ok "$m" || fail "module path '$m' is not a plain tarball-relative path"
-done
-
 CACHE="${FX_KERNEL_CACHE:-$REPO/.kernel-cache}"
 KERNEL_DIR="$CACHE/kernel"
 VMLINUZ="$KERNEL_DIR/vmlinuz"
-MOD_DIR="$KERNEL_DIR/modules"
 TARBALL="$CACHE/$(basename "$URL")"
 
 sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
@@ -97,9 +88,6 @@ sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 extracted_ok() {
     [ "$(sha_of "$VMLINUZ")" = "$VMLINUZ_SHA" ] || return 1
     [ -f "$KERNEL_DIR/config" ] || return 1
-    for m in $MODULES; do
-        [ -f "$MOD_DIR/$m" ] || return 1
-    done
     return 0
 }
 if extracted_ok; then
@@ -142,7 +130,7 @@ fi
 # ─── 3. unpack into the cache layout ───────────────────────────────────────
 echo "fetch-kernel: unpacking kernel $KVER from the pinned tarball"
 rm -rf "$KERNEL_DIR"
-mkdir -p "$KERNEL_DIR" "$MOD_DIR" || fail "cannot create $KERNEL_DIR"
+mkdir -p "$KERNEL_DIR" || fail "cannot create $KERNEL_DIR"
 EXT="$CACHE/extract.$$"
 rm -rf "$EXT"
 mkdir -p "$EXT" || fail "cannot create extraction dir"
@@ -153,23 +141,13 @@ fi
 
 [ -f "$EXT/$VMLINUX_PATH" ] || { rm -rf "$EXT"; fail "vmlinuz missing from the tarball at $VMLINUX_PATH (pin out of date?)"; }
 [ -f "$EXT/$CONFIG_PATH" ]  || { rm -rf "$EXT"; fail "config missing from the tarball at $CONFIG_PATH (pin out of date?)"; }
-for m in $MODULES; do
-    [ -f "$EXT/modules/$m" ] || { rm -rf "$EXT"; fail "module $m missing from the tarball (pin out of date?)"; }
-done
 
-# move into the cache layout; keep modules at their in-tarball relative
-# paths so mkinitramfs can stage them by bare name
 mv "$EXT/$VMLINUX_PATH" "$VMLINUZ" || fail "cannot stage vmlinuz"
 mv "$EXT/$CONFIG_PATH" "$KERNEL_DIR/config" || fail "cannot stage config"
-for m in $MODULES; do
-    d="$MOD_DIR/$(dirname "$m")"
-    mkdir -p "$d" || fail "cannot create module dir $d"
-    mv "$EXT/modules/$m" "$MOD_DIR/$m" || fail "cannot stage module $m"
-done
 rm -rf "$EXT"
 
 GOT=$(sha_of "$VMLINUZ")
 [ "$GOT" = "$VMLINUZ_SHA" ] \
     || fail "EXTRACTED vmlinuz sha256 $GOT != pinned $VMLINUZ_SHA (tarball verified but contents differ — update scripts/kernel-pin.txt)"
 chmod 444 "$VMLINUZ" 2>/dev/null
-echo "fetch-kernel: OK — $VMLINUZ ($(wc -c < "$VMLINUZ") bytes, kernel $KVER, $(printf '%s\n' "$MODULES" | wc -l) modules)"
+echo "fetch-kernel: OK — $VMLINUZ ($(wc -c < "$VMLINUZ") bytes, kernel $KVER, zero modules by construction)"

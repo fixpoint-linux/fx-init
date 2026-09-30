@@ -39,7 +39,8 @@
 #
 # Channel: qemu -chardev socket,server=on,wait=off -device virtio-serial-pci
 # -device virtserialport,chardev=fxctl0,name=fxctl0 (CONFIG_VIRTIO_CONSOLE=y
-# + CONFIG_VIRTIO_PCI=y built into the pinned kernel — no module to ship).
+# + CONFIG_VIRTIO_PCI=y built into the pinned kernel — no module to ship;
+#   since M5 every disk-path driver is built in, module-free by construction).
 # Host writer: nc -w 5 -U (NOT -N: MEASURED on this host, -N's half-close makes
 # qemu tear the chardev down before the guest's response write, silently
 # dropping it); the guest needs no EOF — requests are newline-delimited, so nc
@@ -285,8 +286,8 @@ qemu-img create -q "$DISK" 512M || fail "qemu-img create failed"
 # dies at __ext4_new_inode:1284 "doubly allocated?" (MEASURED: e2fsck -fn
 # on a killed nojournal disk shows both missing allocations and missing
 # frees in the bitmaps).  A journal makes the kill crash-safe the same way
-# ext4 does on a real power cut.  The guest's ext4.ko already pulls in
-# jbd2.ko (DISK_MODULE_ORDER in init.zig), so it mounts a journaled fs
+# ext4 does on a real power cut.  The kernel's ext4 driver is built =y with
+# jbd2 (M5 zero-module kernel), so it mounts a journaled fs
 # unchanged; ensure_disk_store's blank-disk mkfs path is simply never taken.
 # MEASURED: the host (uid 1001) can mke2fs a regular image file (no block
 # device needed); the journal size 4M is ample for a 512M fs.

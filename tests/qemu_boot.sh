@@ -251,9 +251,10 @@ sh "$REPO/tests/mkinitramfs.sh" -s "$STORE" -r "$ROOT" -k "$KERNEL" -o "$WORK/in
     || fail "mkinitramfs failed"
 
 # ─── the persistent disk store (M4): a blank virtio-blk image; the GUEST
-# insmods virtio_blk+ext4, mkfs.ext2 -F's it, seeds it from the ramfs store
-# and mounts it at /fx/disk/store (ensure_disk_store in zig/src/init.zig).
-# The host cannot mkfs/populate an fs image as uid 1001 — the guest does.
+# (kernel drivers built =y since M5) mkfs.ext2 -F's it, seeds it from the
+# ramfs store and mounts it at /fx/disk/store (ensure_disk_store in
+# zig/src/init.zig).  The host cannot mkfs/populate an fs image as uid
+# 1001 — the guest does.
 DISK="${QEMU_DISK:-$WORK/disk.img}"
 if [ ! -f "$DISK" ]; then
     qemu-img create -q "$DISK" 512M || fail "qemu-img create failed"
@@ -279,15 +280,15 @@ timeout "$QEMU_BOOT_TIMEOUT" qemu-system-x86_64 \
 QRC=$?
 
 # the disk path ran: fx-init's ensure_disk_store succeeded (the negative
-# insmod/mkfs/mount warnings all end in "disk store disabled", so grepping
-# for the success line + NOT the disabled marker covers both directions)
+# mkfs/mount warnings all end in "disk store disabled", so grepping for
+# the success line + NOT the disabled marker covers both directions)
 if ! grep -q 'fx-init: disk store mounted (current v' "$CONSOLE"; then
     echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
     fail "no 'disk store mounted' line — the disk store path did not run"
 fi
-if grep -q 'disk store disabled\|insmod .* FAILED' "$CONSOLE"; then
+if grep -q 'disk store disabled' "$CONSOLE"; then
     echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
-    fail "disk store bring-up FAILED (insmod/mkfs/mount)"
+    fail "disk store bring-up FAILED (mkfs/mount)"
 fi
 # the banner must name the store the command line carried ($QEMU_STORE_ARG,
 # default /fx/store): guards the knob's wiring into -append AND that fx-init
