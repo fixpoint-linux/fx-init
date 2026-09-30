@@ -1,0 +1,38 @@
+# scripts/kernel-pin-aarch64.txt — the lane-3 aarch64 boot path's pinned
+# kernel input (sibling of scripts/kernel-pin.txt, which stays the x86 pin —
+# two pins, two caches, no shared file with lane 2).
+#
+# PROVENANCE: linux-6.12.19.tar.xz from kernel.org, built in a debian:stable
+# container (gcc-aarch64-linux-gnu 14.2) with `make ARCH=arm64 defconfig` +
+# `make Image.gz` — the arm64 defconfig carries every symbol the boot path
+# needs as =y (MEASURED in the shipped config): SERIAL_AMBA_PL011_CONSOLE
+# (console=ttyAMA0), BLK_DEV_INITRD + RD_GZIP, DEVTMPFS(+_MOUNT), TMPFS,
+# EXT4_FS, VIRTIO_BLK/VIRTIO_PCI/VIRTIO_MMIO, so the artifact ships NO
+# modules and the image carries no /lib/modules — the aarch64 guest's
+# ensure_disk_store needs no insmod (the disk path runs built-in).
+#
+# The tarball was packed deterministically (tar --sort=name, owner/group
+# mtime 0, gzip -n) so a rebuild from the same Image.gz+config yields the
+# same tar_sha256; the pin is the trust anchor (same policy as the x86 pin:
+# a swapped asset fails the hash, a deleted one 404s — no fallback).
+#
+# Keys consumed by scripts/fetch-kernel-aarch64.sh + tests/qemu_boot_aarch64.sh:
+#   url             the release asset to download (cache dir: $FX_KERNEL_CACHE
+#                   is the x86 cache's dir — this fetch stages under
+#                   kernel-aarch64/ inside it, disjoint from the x86 kernel/)
+#   tar_sha256      pin of the whole tarball
+#   tar_size        early sanity check before the hash
+#   kernel_version  the version string this build was tagged with (record
+#                   only — no /lib/modules dir is staged, there are none)
+#   vmlinuz_path    Image.gz, relative to the tarball root (arm64 boots the
+#                   uncompressed-payload gzip Image, not a bzImage)
+#   vmlinuz_sha256  pin of the EXTRACTED Image.gz (verified after unpack AND
+#                   by tests/qemu_boot_aarch64.sh: a mismatch FAILS)
+#   config_path     the kernel's own config, relative to the tarball root
+url https://github.com/fixpoint-linux/fx-init/releases/download/m5-kernel-6.12.19-arm64/fixpoint-kernel-6.12.19-arm64.tar.gz
+tar_sha256 dd88945beabd88e82877724c8e6d9a7b8bb8e8e1c6d68884b4fd9864e3acc22a
+tar_size 13814620
+kernel_version 6.12.19-arm64
+vmlinuz_path fixpoint-kernel-6.12.19-arm64/Image.gz
+vmlinuz_sha256 5b434a2c279fb269d0efe9392339ca6ab5e0aa24a2db001145927c3c84a1dc7f
+config_path fixpoint-kernel-6.12.19-arm64/config
