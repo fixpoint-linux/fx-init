@@ -46,6 +46,7 @@ const EPERM: c_int = 1;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
+const O_WRONLY: c_int = 1;
 const O_RDWR: c_int = 0o2;
 const O_RDONLY: c_int = 0o0;
 const O_DIRECTORY: c_int = 0o200000; // x86_64 (asm-generic): directory-only open
@@ -144,6 +145,12 @@ var g_vio_wf: ?*FILE = null;
 var g_vio_peer_gone: bool = true;
 var g_vio_carry: [REQ_MAX]u8 = undefined;
 var g_vio_carry_len: usize = 0;
+// M4 log stream (tests/qemu_logs.sh): a SECOND virtserialport, write-only,
+// carrying one "ts svc lvl msg" line per log_line call — logs flow OUT
+// continuously instead of being polled with `grep` over the request
+// channel.  Inert everywhere else (the setup gate needs BOTH pid1 AND a
+// second vport node, which only a two-port virtio-serial guest has).
+var g_vlog_fd: c_int = -1;
 // M4 in-guest activate: the `put <path>` upload state (config transport
 // over the line-oriented channel — base64 lines until a lone `.`).  The
 // pump calls handle_request once per COMPLETE line, so the multi-line
@@ -497,6 +504,20 @@ fn svc_find(name: [*:0]const u8) ?*Svc {
 
 fn log_line(svc: [*:0]const u8, level: [*:0]const u8, msg: [*:0]const u8) void {
     if (g_log) |l| _ = fx_log_emit(l, now_s(), svc, level, msg);
+    // M4 log stream: mirror the same record (ts svc lvl msg, one line) to
+    // the second virtserialport when it exists.  DROP-AND-CONTINUE on any
+    // failure (EAGAIN from a port with no reader is the ordinary
+    // disconnected case — see the g_vio_peer_gone hazard note): the log DB
+    // above is the durable record; this is a best-effort tap that must
+    // never block or spin PID1.
+    if (g_vlog_fd >= 0) {
+        var line: [640]u8 = undefined;
+        const n = snprintf(&line, line.len, "%u %s %s %s\n", now_s(), svc, level, msg);
+        if (n > 0) {
+            const un: usize = @min(@as(usize, @intCast(n)), line.len - 1);
+            _ = std.c.write(g_vlog_fd, &line, un);
+        }
+    }
 }
 
 fn parse_on(s: [*:0]const u8, kind: *FxOnKind, arg: [*]u8, cap: usize) void {
@@ -2724,11 +2745,24 @@ fn handle_conn(cfd: c_int) void {
 /// modules_dir) rather than hardcoding vport0p1 — the first virtserialport is
 /// INTERPRETED to land at vport0p1, but the node name is the kernel's to pick.
 fn find_vport(out: []u8) bool {
+    return find_vport_nth(out, 0);
+}
+
+/// The skip-th vport node in readdir order (legacy ordinal form — see
+/// find_vport_named for why NEW call sites must not rely on it: MEASURED with
+/// two ports, /dev readdir returned vport0p2 BEFORE vport0p1, so ordinal
+/// order is NOT device order).
+fn find_vport_nth(out: []u8, skip: usize) bool {
     const d = opendir("/dev") orelse return false;
     defer _ = closedir(d);
+    var seen: usize = 0;
     while (readdir(d)) |e| {
         const name = std.mem.sliceTo(&e.d_name, 0);
         if (std.mem.startsWith(u8, name, "vport") and std.mem.indexOf(u8, name, "p") != null) {
+            if (seen < skip) {
+                seen += 1;
+                continue;
+            }
             if (name.len + ("/dev/".len) > out.len) continue;
             @memcpy(out[0.."/dev/".len], "/dev/");
             @memcpy(out["/dev/".len .. "/dev/".len + name.len], name);
@@ -2739,13 +2773,51 @@ fn find_vport(out: []u8) bool {
     return false;
 }
 
+/// The vport whose QEMU name= is `want` (the name travels in the device's
+/// sysfs node, /sys/class/virtio-ports/<node>/name).  THE deterministic
+/// port selector: QEMU assigns vportXpY numbers in -device order, but /dev
+/// readdir order does not follow (MEASURED: two ports, vport0p2 listed
+/// first), so a port must be identified by its NAME — every harness names
+/// the control port fxctl0.
+fn find_vport_named(out: []u8, want: []const u8) bool {
+    const d = opendir("/sys/class/virtio-ports") orelse return false;
+    defer _ = closedir(d);
+    while (readdir(d)) |e| {
+        const node = std.mem.sliceTo(&e.d_name, 0);
+        if (node.len == 0 or node[0] == '.') continue;
+        var np: [512]u8 = undefined;
+        const w = snfmt(&np, "/sys/class/virtio-ports/{s}/name", .{node});
+        const f = fopen(@ptrCast(w.ptr), "r") orelse continue;
+        defer _ = fclose(f);
+        var nb: [128]u8 = undefined;
+        const got = fgets(&nb, @intCast(nb.len), f) orelse continue;
+        // NB: span the POINTER (got), never &got (that reads the pointer's
+        // own bytes as a string — a bug this line carried once).
+        var nm: []const u8 = std.mem.span(got);
+        // sysfs strings carry a trailing newline; trim whitespace both ends
+        while (nm.len > 0 and (nm[nm.len - 1] == '\n' or nm[nm.len - 1] == ' ' or nm[nm.len - 1] == '\t')) nm = nm[0 .. nm.len - 1];
+        if (!std.mem.eql(u8, nm, want)) continue;
+        if (node.len + ("/dev/".len) > out.len) continue;
+        @memcpy(out[0.."/dev/".len], "/dev/");
+        @memcpy(out["/dev/".len .. "/dev/".len + node.len], node);
+        out["/dev/".len + node.len] = 0;
+        return true;
+    }
+    return false;
+}
+
 /// Open the guest end of the virtserialport, if this boot can have one:
 /// PID1 (a harness running as a normal process must stay inert) AND an actual
 /// vport node (no virtio-serial device attached => none exists => inert).
 fn setup_virtio_ctrl() void {
     if (std.c.getpid() != 1) return;
     var vp: [256]u8 = undefined;
-    if (!find_vport(&vp)) return;
+    // Prefer the port NAMED fxctl0 (every harness names it): with a second
+    // port attached, /dev readdir order does not follow device order
+    // (MEASURED — see find_vport_named), so the name is the only
+    // deterministic selector.  The ordinal fallback keeps a single UNNAMED
+    // port working (the pre-name contract).
+    if (!find_vport_named(&vp, "fxctl0") and !find_vport(&vp)) return;
     const fd = open(@ptrCast(&vp), O_RDWR | O_NONBLOCK, 0);
     if (fd < 0) {
         errf("fx-init: warning: virtio control: open {s}: {s}\n", .{ span(@ptrCast(&vp)), errnoStr() });
@@ -2771,6 +2843,27 @@ fn setup_virtio_ctrl() void {
     // session must still be able to answer.
     _ = setvbuf(wf, null, _IONBF, 0);
     errf("fx-init: virtio control up ({s})\n", .{span(@ptrCast(&vp))});
+}
+
+/// Open the SECOND virtserialport as a guest->host LOG STREAM (M4 D:
+/// tests/qemu_logs.sh): O_WRONLY|O_NONBLOCK, one "ts svc lvl msg" line per
+/// log_line call.  Same gate shape as setup_virtio_ctrl (pid1 + a node) —
+/// with fewer ports this is a no-op.  WRITE-ONLY deliberately: the port is
+/// never in the poll set, never read, and cannot stall PID1 — a write to a
+/// port with no reader returns EAGAIN (the disconnected-port hazard at the
+/// top of this file) and is DROPPED (see log_line), never retried, never
+/// blocking.
+fn setup_virtio_log() void {
+    if (std.c.getpid() != 1) return;
+    var vp: [256]u8 = undefined;
+    if (!find_vport_named(&vp, "fxlog0")) return;
+    const fd = open(@ptrCast(&vp), O_WRONLY | O_NONBLOCK, 0);
+    if (fd < 0) {
+        errf("fx-init: warning: virtio log: open {s}: {s}\n", .{ span(@ptrCast(&vp)), errnoStr() });
+        return;
+    }
+    g_vlog_fd = fd;
+    errf("fx-init: virtio log up ({s})\n", .{span(@ptrCast(&vp))});
 }
 
 /// One POLLIN dispatch on the virtio port: a single read, appended to the
@@ -2900,6 +2993,10 @@ fn do_shutdown() void {
         if (g_vio_wf) |wf| _ = fclose(wf) else _ = std.c.close(g_vio_fd);
         g_vio_fd = -1;
         g_vio_wf = null;
+    }
+    if (g_vlog_fd >= 0) {
+        _ = std.c.close(g_vlog_fd);
+        g_vlog_fd = -1;
     }
     if (g_rt) |r| dl_close(r);
     if (g_log) |l| fx_log_close(l);
@@ -3321,6 +3418,7 @@ pub fn main(init: std.process.Init) !void {
     g_ctrl_fd = setup_ctrl();
     if (g_ctrl_fd < 0) errf("fx-init: warning: control socket failed\n", .{});
     setup_virtio_ctrl();
+    setup_virtio_log();
 
     log_line("fx-init", "info", "entered main loop");
     main_loop();
