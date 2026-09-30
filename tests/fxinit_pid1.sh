@@ -46,6 +46,29 @@ command -v unshare     >/dev/null 2>&1 || skip "unshare not found — cannot cre
 [ -x "$FXSTORE" ]     || skip "fxstore not executable: $FXSTORE"
 [ -x "$FX_ACTIVATE" ] || skip "fx-activate not executable: $FX_ACTIVATE"
 
+# the m3 fixture builds this repo's Zig port (same prework as fxinit_boot.sh:
+# see its header note): zig must be on PATH; cosmocc builds dhake +
+# fake-service; fxstore's package-set evaluation needs the palisade stage3.
+REPO_PARENT="$(cd "$(dirname "$0")/../.." && pwd)"
+export FX_SIBLINGS="${FX_SIBLINGS:-$REPO_PARENT}"
+command -v zig >/dev/null 2>&1 || skip "zig not found — the m3 fixture builds the Zig port"
+command -v cosmocc >/dev/null 2>&1 || skip "cosmocc not found — the m3 fixture builds dhake + fake-service"
+COSMOBIN="$(dirname "$(command -v cosmocc)")"
+FXSTORE_STAGE3="${FXSTORE_STAGE3:-}"
+if [ -z "$FXSTORE_STAGE3" ]; then
+    FXSTORE_DIR="$(cd "$(dirname "$FXSTORE")" && pwd)"
+    FXSTORE_STAGE3="$FXSTORE_DIR/../../vendor/palisade/bin/stage3"
+fi
+[ -x "$FXSTORE_STAGE3" ] || skip "palisade stage3 not executable: $FXSTORE_STAGE3 (build it in the fxstore repo, or set FXSTORE_STAGE3)"
+
+# libdatalog.so dir the Zig fxctl/fx-activate need at runtime (fx-activate
+# RUNPATH is the authoritative location).  Same fallback as fxinit_boot.sh.
+if command -v readelf >/dev/null 2>&1; then
+    DLIBDIR=$(readelf -d "$FX_ACTIVATE" | sed -n 's/.*Library runpath: \[\(.*\)\].*/\1/p' | head -1)
+fi
+[ -n "${DLIBDIR:-}" ] || DLIBDIR="$REPO_PARENT/datalog-dafsa/zig-out/lib"
+[ -f "$DLIBDIR/libdatalog.so" ] || fail "libdatalog.so not found at $DLIBDIR (fx-activate RUNPATH)"
+
 cd "$(dirname "$0")/.." || fail "cannot cd to repo root"
 REPO="$PWD"
 
@@ -56,7 +79,27 @@ ROOT="$WORK/root"
 mkdir -p "$STORE" "$ROOT/run/fx"
 
 echo "=== fxinit-pid1: building closure into $STORE ==="
-( cd "$REPO/m3" && "$FXSTORE" build --store "$STORE" ) || fail "fxstore build failed"
+# Merged-usr hosts (/bin a symlink): fxstore's hermetic bwrap cannot
+# --ro-bind /bin, so hide bwrap from its startup probe and take fxstore's
+# sanctioned LOUD NON-HERMETIC fallback (same deliberate detour as
+# fxinit_boot.sh — the build sandbox is not what this harness exercises).
+BIN_LINK=$( (readlink /bin 2>/dev/null || echo /bin) )
+if [ "$BIN_LINK" = "/bin" ]; then
+    ( cd "$REPO/m3" && FXSTORE_STAGE3="$FXSTORE_STAGE3" "$FXSTORE" build --store "$STORE" ) \
+        || fail "fxstore build failed"
+else
+    echo "fxinit-pid1: NOTE: merged-usr host (/bin -> $BIN_LINK): fixture build runs via"
+    echo "fxinit-pid1: NOTE: fxstore's LOUD NON-HERMETIC fallback (PATH hides bwrap from its probe)"
+    PPATH="$WORK/path"
+    mkdir -p "$PPATH"
+    for t in sh cp ln rm mv cat mkdir file zig; do
+        ln -sf "$(command -v "$t")" "$PPATH/$t" 2>/dev/null || \
+            fail "merged-usr fallback needs '$t' on PATH"
+    done
+    ( cd "$REPO/m3" && FXSTORE_STAGE3="$FXSTORE_STAGE3" \
+        PATH="$COSMOBIN:$PPATH" "$FXSTORE" build --store "$STORE" ) \
+        || fail "fxstore build (non-hermetic) failed"
+fi
 
 # locate the built fx-init + fxctl APEs in the store (content-addressed dirs).
 # FX_INIT_BIN (optional) overrides the fx-init under test (e.g. the Zig port):
@@ -79,12 +122,14 @@ FXCTL_BIN=$(ls "$STORE"/*-fxctl/fxctl 2>/dev/null | head -1)
 [ -n "$FXCTL_BIN" ] || fail "fxctl not found in store ($STORE/*-fxctl/fxctl)"
 
 # fxctl helper: connect to the chroot's control socket from the host.
-fxctl() { FX_RUN="$ROOT/run/fx" "$FXCTL_BIN" "$@"; }
+# LD_LIBRARY_PATH: the store-built fxctl links libdatalog.so (its RUNPATH is
+# the sibling checkout's absolute path, which resolves on the host).
+fxctl() { FX_RUN="$ROOT/run/fx" LD_LIBRARY_PATH="$DLIBDIR" "$FXCTL_BIN" "$@"; }
 
 activate() {
     # $1 = config path (absolute); same as fxinit_boot.sh.
     cfg="$1"
-    out=$( "$FX_ACTIVATE" --store "$STORE" \
+    out=$( LD_LIBRARY_PATH="$DLIBDIR" "$FX_ACTIVATE" --store "$STORE" \
         --package-set "$REPO/m3/package-set.dhall" \
         --config "$cfg" 2>&1 ) || fail "activate $cfg failed: $out"
     echo "$out"
@@ -93,10 +138,14 @@ activate() {
 # bwrap_fs runs bwrap with the fs/mount namespace args shared by the userns
 # probe and the real boot, exec'ing the given inner command as $@ (after the
 # bwrap `--` separator).  PATH is exported; no FX_INIT_FORCE is set.
+# The store-built fx-init is the Zig port: it needs libdatalog.so, whose
+# RUNPATH is useless inside the chroot — bind the libdatalog dir at its real
+# host path (fxinit_boot.sh precedent).
 bwrap_fs() {
     "$BWRAP" \
         --bind "$ROOT" / \
         --bind "$STORE" /fx/store \
+        --ro-bind "$DLIBDIR" "$DLIBDIR" \
         --ro-bind /bin/sh /bin/sh \
         --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
         --dev /dev \
