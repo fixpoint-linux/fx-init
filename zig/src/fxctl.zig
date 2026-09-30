@@ -23,6 +23,24 @@
 //     error before OK/ERR -> "no response (timeout/disconnect)" rc 1.
 // The socket syscalls go through the same libc externs the sibling ports
 // use (std.posix has no socket/connect in 0.16 — see supervise.zig).
+//
+// Chardev mode (this port's addition; no C original): `--chardev PATH`
+// anywhere in argv, or a non-empty FX_CHARDEV env, selects a bidirectional
+// virtio chardev connection (a qemu unix chardev socket or a /dev/vportNpM
+// node) opened O_RDWR INSTEAD of the control socket.  The request grammar
+// is IDENTICAL — the guest side (init.zig handle_virtio) feeds the same
+// lines to handle_request — so requestLine/readResponse are reused
+// unchanged.  Two deliberate differences from the socket path:
+//   - NO half-close, ever: MEASURED (init.zig handle_virtio), a chardev
+//     write-side shutdown makes qemu tear the port down before the guest's
+//     response write, silently dropping it — the fd is closed only after
+//     readResponse returns.
+//   - a plain fd has no SO_RCVTIMEO, so PollSource gates every read with
+//     poll(2) under the same 5s budget connectSock sets on the socket; a
+//     silent guest cannot wedge the client.
+// usage() is deliberately NOT extended: its bytes are pinned by the
+// fxctl_diff.sh goldens (zig/golden/fxctl-live) and the fixture oracle
+// zig/fxctl_dump.c, neither of which this change may touch.
 const std = @import("std");
 
 pub const LINE_MAX_REQ: usize = 4096;
@@ -40,6 +58,8 @@ const EAFNOSUPPORT: c_int = 97;
 const ENOTSUP: c_int = 95; // == EOPNOTSUPP on Linux
 const EPROTONOSUPPORT: c_int = 93;
 const ECONNREFUSED: c_int = 111;
+const EAGAIN: c_int = 11;
+const ENXIO: c_int = 6;
 
 const Timeval = extern struct { tv_sec: i64, tv_usec: i64 };
 
@@ -50,6 +70,13 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern "c" fn __errno_location() *c_int;
 extern "c" fn strerror(errnum: c_int) [*:0]const u8;
+
+// open(2) for the chardev path, exactly as the guest-facing ports call it
+// (init.zig): O_RDWR = 2.  No O_NONBLOCK — a blocking chardev read is fine
+// because PollSource only calls it after poll(2) reports data (and the one
+// consumer of a non-socket fd needs no socket timeouts).
+const O_RDWR: c_int = 2;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 
 fn errno() c_int {
     return __errno_location().*;
@@ -151,6 +178,73 @@ pub fn connectSock(path: []const u8) c_int {
     }
     return fd;
 }
+
+/// Chardev transport selection (this port's addition): `--chardev PATH`
+/// (a leading-`--` flag, so it is dropped from the request line) or the
+/// FX_CHARDEV env (same non-empty rule as FX_SOCKET) picks the chardev
+/// transport; null keeps the control-socket path.  The flag wins over the
+/// env (FX_CHARDEV is the default, --chardev the explicit override).
+pub fn chardevPath(argv: []const []const u8, fx_chardev: ?[]const u8) ?[]const u8 {
+    for (argv, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--chardev")) {
+            // bare flag: the next arg is PATH; a trailing bare flag has no
+            // path, so chardev mode cannot engage (the token rides as an
+            // unknown subcommand, like any other non-flag word).
+            if (i + 1 < argv.len) return argv[i + 1];
+            return null;
+        }
+        if (a.len > 10 and std.mem.eql(u8, a[0..10], "--chardev=")) return a[10..];
+    }
+    if (fx_chardev) |p| {
+        if (p.len > 0) return p;
+    }
+    return null;
+}
+
+/// open(2) O_RDWR on the chardev path — the bidirectional connection the
+/// plan names (NO half-close: the fd is closed only after readResponse).
+/// A real virtio char device (/dev/vportNpM) opens here; a qemu unix
+/// chardev SOCKET cannot be open(2)'d (MEASURED on this host: ENXIO), so
+/// the miss falls through to the same AF_UNIX connect the control socket
+/// uses (its 5s sockopts are harmless alongside PollSource's poll gate —
+/// poll returns as soon as data lands).  -1 on failure, errno left set for
+/// main's message (the connectSock contract).
+pub fn openChardev(path: []const u8) c_int {
+    var buf: [512]u8 = undefined;
+    const n = @min(path.len, buf.len - 1);
+    @memcpy(buf[0..n], path[0..n]);
+    buf[n] = 0;
+    const fd = open(buf[0..n :0].ptr, O_RDWR);
+    if (fd >= 0) return fd;
+    if (errno() != ENXIO) return -1;
+    return connectSock(path);
+}
+
+/// The read(2) source for readResponse over a plain (non-socket) chardev
+/// fd: a plain fd has no SO_RCVTIMEO, so poll(2) gates every read under the
+/// same 5s budget connectSock sets on the socket.  -1 on timeout/error
+/// (readResponse's EOF/error contract; glibc stdio gives up on both).
+pub const PollSource = struct {
+    fd: c_int,
+    timeout_ms: i32 = 5000,
+
+    pub fn read(this: *PollSource, dst: []u8) isize {
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = this.fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        // std.posix.poll retries EINTR itself; 0 = the budget ran out.  A
+        // transport error maps to read -1 (readResponse treats it like the
+        // socket path's EAGAIN: no response).
+        _ = std.posix.poll(&pfd, this.timeout_ms) catch return -1;
+        if (pfd[0].revents == 0) {
+            __errno_location().* = EAGAIN; // the SO_RCVTIMEO-equivalent outcome
+            return -1;
+        }
+        return std.c.read(this.fd, dst.ptr, dst.len);
+    }
+};
 
 /// send_line() (fxctl.c:67-80): the line capped at LINE_MAX_REQ, written
 /// whole with EINTR retry, then the single '\n' terminator (EINTR retry on
@@ -286,27 +380,69 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var req: [LINE_MAX_REQ]u8 = undefined;
-    const line = requestLine(&req, args[1..]);
 
-    var pbuf: [512]u8 = undefined;
-    const path = sockPath(&pbuf, env("FX_SOCKET"), env("FX_RUN"));
-
-    const fd = connectSock(path);
-    if (fd < 0) {
-        const e = errno();
-        if (e == ENOENT or e == ECONNREFUSED) {
-            std.debug.print("fxctl: fx-init not running ({s})\n", .{path});
-        } else if (e == EAFNOSUPPORT or e == ENOTSUP or e == EPROTONOSUPPORT) {
-            std.debug.print(
-                "fxctl: cannot connect to {s}: Unix-domain sockets are not " ++
-                    "supported on this platform (browser wasm) — fx-init's PID1 " ++
-                    "control.sock is not running here\n",
-                .{path},
-            );
-        } else {
-            std.debug.print("fxctl: connect {s}: {s}\n", .{ path, std.mem.span(strerror(e)) });
+    // chardev mode: --chardev PATH / --chardev=PATH / FX_CHARDEV selects the
+    // bidirectional virtio chardev transport instead of the control socket.
+    // The flag pair is STRIPPED from argv before requestLine so the request
+    // line is byte-identical to the socket path's (the guest grammar is the
+    // socket's); usage()/rc 2 still fire first when there is no subcommand.
+    const chardev = chardevPath(args[1..], env("FX_CHARDEV"));
+    var argv_req: []const []const u8 = args[1..];
+    if (chardev != null) {
+        const al = init.arena.allocator();
+        const compact = try al.alloc([]const u8, args.len - 1);
+        var keep: usize = 0;
+        var skip_next = false;
+        for (args[1..]) |a| {
+            if (skip_next) {
+                skip_next = false; // the bare flag's PATH operand
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--chardev")) {
+                skip_next = true;
+                continue;
+            }
+            if (a.len > 10 and std.mem.eql(u8, a[0..10], "--chardev=")) continue;
+            compact[keep] = a;
+            keep += 1;
         }
-        std.process.exit(1);
+        argv_req = compact[0..keep];
+    }
+    const line = requestLine(&req, argv_req);
+
+    var fd: c_int = -1;
+    if (chardev) |cp| {
+        fd = openChardev(cp);
+        if (fd < 0) {
+            const e = errno();
+            if (e == ENOENT) {
+                std.debug.print("fxctl: chardev not present ({s})\n", .{cp});
+            } else {
+                std.debug.print("fxctl: open {s}: {s}\n", .{ cp, std.mem.span(strerror(e)) });
+            }
+            std.process.exit(1);
+        }
+    } else {
+        var pbuf: [512]u8 = undefined;
+        const path = sockPath(&pbuf, env("FX_SOCKET"), env("FX_RUN"));
+
+        fd = connectSock(path);
+        if (fd < 0) {
+            const e = errno();
+            if (e == ENOENT or e == ECONNREFUSED) {
+                std.debug.print("fxctl: fx-init not running ({s})\n", .{path});
+            } else if (e == EAFNOSUPPORT or e == ENOTSUP or e == EPROTONOSUPPORT) {
+                std.debug.print(
+                    "fxctl: cannot connect to {s}: Unix-domain sockets are not " ++
+                        "supported on this platform (browser wasm) — fx-init's PID1 " ++
+                        "control.sock is not running here\n",
+                    .{path},
+                );
+            } else {
+                std.debug.print("fxctl: connect {s}: {s}\n", .{ path, std.mem.span(strerror(e)) });
+            }
+            std.process.exit(1);
+        }
     }
     if (!sendLine(fd, line)) {
         const e = errno();
@@ -314,9 +450,21 @@ pub fn main(init: std.process.Init) !void {
         _ = close(fd);
         std.process.exit(1);
     }
-    var src = FdSource{ .fd = fd };
-    const rc = readResponse(&src, out);
-    _ = close(fd); // the C's fclose(fdopen(fd)) closes it on every path
+    // The read source mirrors the transport: the socket's SO_RCVTIMEO does
+    // the timing; a plain chardev fd has no such option, so PollSource
+    // gates each read with poll(2) under the same 5s budget.
+    const rc = if (chardev != null) blk: {
+        var src = PollSource{ .fd = fd };
+        break :blk readResponse(&src, out);
+    } else blk: {
+        var src = FdSource{ .fd = fd };
+        break :blk readResponse(&src, out);
+    };
+    // NO half-close on the chardev path: the fd closes only HERE, after the
+    // responses (MEASURED: an earlier write-side shutdown makes qemu tear
+    // the chardev down before the guest's response write).  The socket path
+    // is the C's fclose(fdopen(fd)) on every exit — same point.
+    _ = close(fd);
     out.flush() catch {};
     if (rc < 0) {
         std.debug.print("fxctl: no response (timeout/disconnect)\n", .{});
@@ -373,6 +521,65 @@ test "requestLine: cap at buf.len-1 (LINE_MAX_REQ=4096)" {
     try std.testing.expectEqualStrings("status!", requestLine(&tiny, &.{"status!!"}));
     // cap lands mid-arg: 7 chars kept, the closing quote dropped
     try std.testing.expectEqualStrings("a \"b c\"", requestLine(&tiny, &.{ "a", "b c" }));
+}
+
+test "chardevPath: --chardev flag / = form / FX_CHARDEV precedence" {
+    const none: ?[]const u8 = null;
+    // no flag, no env -> socket mode
+    try std.testing.expect(chardevPath(&.{"status"}, null) == null);
+    try std.testing.expect(chardevPath(&.{"status"}, none) == null);
+    try std.testing.expect(chardevPath(&.{"status"}, "") == null);
+    // bare flag eats the NEXT arg as PATH, anywhere in argv
+    try std.testing.expectEqualStrings("/dev/vport0p1", chardevPath(&.{ "--chardev", "/dev/vport0p1" }, null).?);
+    try std.testing.expectEqualStrings("/dev/vport0p1", chardevPath(&.{ "status", "--chardev", "/dev/vport0p1" }, null).?);
+    try std.testing.expectEqualStrings("p", chardevPath(&.{ "--chardev", "p", "status" }, null).?);
+    // = form
+    try std.testing.expectEqualStrings("/tmp/s.sock", chardevPath(&.{ "--chardev=/tmp/s.sock", "status" }, null).?);
+    // flag beats env
+    try std.testing.expectEqualStrings("/dev/flag", chardevPath(&.{ "--chardev", "/dev/flag" }, "/dev/env").?);
+    try std.testing.expectEqualStrings("/dev/env", chardevPath(&.{"status"}, "/dev/env").?);
+    // lookalikes are NOT the flag
+    try std.testing.expect(chardevPath(&.{ "--chardevx", "p" }, null) == null);
+    try std.testing.expect(chardevPath(&.{ "--chardev2=p" }, null) == null);
+    // single-char = form
+    try std.testing.expectEqualStrings("p", chardevPath(&.{"--chardev=p"}, null).?);
+    // trailing bare flag (no operand) cannot engage chardev mode
+    try std.testing.expect(chardevPath(&.{"--chardev"}, null) == null);
+    // empty = form selects nothing itself; the env still applies
+    try std.testing.expectEqualStrings("/dev/env", chardevPath(&.{"--chardev="}, "/dev/env").?);
+    try std.testing.expect(chardevPath(&.{"--chardev="}, null) == null);
+}
+
+test "openChardev: errno shaped like connectSock; a real node opens O_RDWR" {
+    try std.testing.expect(openChardev("/nonexistent/fxctl-chardev-test") < 0);
+    try std.testing.expectEqual(@as(c_int, 2), errno()); // ENOENT, not a stale errno
+    // ENXIO fallback shape is live-probed in the harness smoke; the unit
+    // contract here is only: a real rw node OPENS.
+    const fd = openChardev("/dev/null");
+    try std.testing.expect(fd >= 0);
+    _ = close(fd);
+}
+
+test "PollSource: poll-gated read over a pipe (data, EOF, timeout)" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&fds));
+    var src = PollSource{ .fd = fds[0], .timeout_ms = 250 };
+
+    // nothing to read: the poll budget runs out -> -1 with EAGAIN set (the
+    // SO_RCVTIMEO-equivalent the plan names)
+    var dst: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, -1), src.read(&dst));
+    try std.testing.expectEqual(@as(c_int, EAGAIN), errno());
+
+    // data arrives: the read returns exactly the payload
+    try std.testing.expectEqual(@as(usize, 4), @as(usize, @intCast(std.c.write(fds[1], "OK\n\n", 4))));
+    try std.testing.expectEqual(@as(isize, 4), src.read(&dst));
+    try std.testing.expectEqualStrings("OK\n\n", dst[0..4]);
+
+    // peer closes: poll reports HUP -> read 0 = EOF (readResponse rc -1)
+    _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(isize, 0), src.read(&dst));
+    _ = std.c.close(fds[0]);
 }
 
 test "sockPath: env precedence + snprintf truncation" {
