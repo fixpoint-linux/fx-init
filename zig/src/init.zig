@@ -41,9 +41,12 @@ const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ENOEXEC: c_int = 8;
 const ENOENT: c_int = 2;
+const EISDIR: c_int = 21;
+const EPERM: c_int = 1;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
+const O_WRONLY: c_int = 1;
 const O_RDWR: c_int = 0o2;
 const O_RDONLY: c_int = 0o0;
 const O_DIRECTORY: c_int = 0o200000; // x86_64 (asm-generic): directory-only open
@@ -142,6 +145,20 @@ var g_vio_wf: ?*FILE = null;
 var g_vio_peer_gone: bool = true;
 var g_vio_carry: [REQ_MAX]u8 = undefined;
 var g_vio_carry_len: usize = 0;
+// M4 log stream (tests/qemu_logs.sh): a SECOND virtserialport, write-only,
+// carrying one "ts svc lvl msg" line per log_line call — logs flow OUT
+// continuously instead of being polled with `grep` over the request
+// channel.  Inert everywhere else (the setup gate needs BOTH pid1 AND a
+// second vport node, which only a two-port virtio-serial guest has).
+var g_vlog_fd: c_int = -1;
+// M4 in-guest debug shell (tests/qemu_shell.sh): the `shell` command forks
+// a child that dups the CONTROL vport onto 0/1/2 and execs /bin/sh -i; the
+// channel session becomes the terminal.  The parent NEVER blocks: while the
+// child owns the port, handle_virtio must not read it (the child consumes
+// the fd), so a live shell latches g_shell_pid and the poll path skips the
+// port; reap_children clears the latch on SIGCHLD.  One shell at a time —
+// a second `shell` while one lives is an ERR, not a queue.
+var g_shell_pid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0);
 // M4 in-guest activate: the `put <path>` upload state (config transport
 // over the line-oriented channel — base64 lines until a lone `.`).  The
 // pump calls handle_request once per COMPLETE line, so the multi-line
@@ -495,6 +512,20 @@ fn svc_find(name: [*:0]const u8) ?*Svc {
 
 fn log_line(svc: [*:0]const u8, level: [*:0]const u8, msg: [*:0]const u8) void {
     if (g_log) |l| _ = fx_log_emit(l, now_s(), svc, level, msg);
+    // M4 log stream: mirror the same record (ts svc lvl msg, one line) to
+    // the second virtserialport when it exists.  DROP-AND-CONTINUE on any
+    // failure (EAGAIN from a port with no reader is the ordinary
+    // disconnected case — see the g_vio_peer_gone hazard note): the log DB
+    // above is the durable record; this is a best-effort tap that must
+    // never block or spin PID1.
+    if (g_vlog_fd >= 0) {
+        var line: [640]u8 = undefined;
+        const n = snprintf(&line, line.len, "%u %s %s %s\n", now_s(), svc, level, msg);
+        if (n > 0) {
+            const un: usize = @min(@as(usize, @intCast(n)), line.len - 1);
+            _ = std.c.write(g_vlog_fd, &line, un);
+        }
+    }
 }
 
 fn parse_on(s: [*:0]const u8, kind: *FxOnKind, arg: [*]u8, cap: usize) void {
@@ -1968,7 +1999,12 @@ fn reap_children() void {
                 break;
             }
         }
-        if (sv == null) continue;
+        if (sv == null) {
+            // the debug shell child (no Svc): just clear the latch — the
+            // port belongs to the main loop again.
+            if (g_shell_pid.load(.monotonic) == pid) g_shell_pid.store(0, .monotonic);
+            continue;
+        }
         const s = sv.?;
         const st_u32: u32 = @bitCast(status);
         const exited_ok = std.os.linux.W.IFEXITED(st_u32) and std.os.linux.W.EXITSTATUS(st_u32) == 0;
@@ -2080,14 +2116,37 @@ fn resp_err(o: *FILE, msg: [*:0]const u8) void {
     _ = fflush(o);
 }
 
+/// "OK rm <path>" (the rm arm's success line — resp_ok plus the operand, so
+/// the round trip names what it removed).
+fn resp_ok_rm(o: *FILE, path: [*:0]const u8) void {
+    _ = fprintf(o, "OK rm %s\n", path);
+    _ = fflush(o);
+}
+
 // ─── put <path> (M4 in-guest activate: config upload over the channel) ────
 //
 // Framing: `put <path>` opens, raw base64 lines accumulate (RFC 4648,
 // padding allowed, lines short enough for REQ_MAX), a lone `.` decodes +
 // writes + answers "OK put <n> bytes" or "ERR ...".  The write target is
-// WHITELISTED to /run/ — the channel must not be able to write arbitrary
-// guest files (a config is the only intended payload, and /run/fx is where
-// the activate handler's consumers live).
+// allowlisted (put_allowlisted below) — the same list `rm` is gated to.
+const PUT_ALLOW = [_][]const u8{ "/run/", "/etc/", "/tmp/" };
+
+/// Channel write/delete gate: an ABSOLUTE path under one of the allowlist
+/// roots, with no `..` component (a lexical symlink-escape guard — the
+/// image's /run,/etc,/tmp contain no symlinks, and realpath(3) is not in
+/// the linked surface; a `..`-free absolute path cannot lexically leave
+/// its root).  HONEST SCOPE: the channel is root-equivalent by design in
+/// this context (its `activate` arm already rewrites the whole running
+/// root via dhake), so this list is HYGIENE against fat-fingered payloads,
+/// not a security boundary.
+fn put_allowlisted(p: []const u8) bool {
+    if (p.len == 0 or p[0] != '/') return false;
+    if (std.mem.indexOf(u8, p, "..") != null) return false;
+    for (PUT_ALLOW) |root| {
+        if (std.mem.startsWith(u8, p, root) and p.len > root.len) return true;
+    }
+    return false;
+}
 
 fn putAbort() void {
     g_put_open = false;
@@ -2099,9 +2158,9 @@ fn putAbort() void {
 
 fn putBegin(o: *FILE, path: [*:0]u8) void {
     const p = span(path);
-    // whitelist: /run/ only (and an absolute path — no CWD games)
-    if (p.len < "/run/x".len or p[0] != '/' or !std.mem.startsWith(u8, p, "/run/")) {
-        resp_err(o, "put: path must be under /run/");
+    // allowlist: /run/, /etc/, /tmp/ (absolute, no .. — see put_allowlisted)
+    if (!put_allowlisted(p)) {
+        resp_err(o, "put: path must be under /run/, /etc/ or /tmp/");
         return;
     }
     if (g_put_open) putAbort(); // a stale open put: reset before starting
@@ -2243,6 +2302,112 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             return;
         };
         putBegin(o, arg);
+        return;
+    }
+
+    // rm <path> — unlink(2) with an rmdir(2) fallback for empty dirs, gated
+    // to the SAME allowlist as put (put_allowlisted): /run/, /etc/, /tmp/,
+    // absolute, no `..`.  ERR on failure (errno), "OK rm <path>" on success.
+    if (strcmp(cmd, "rm") == 0) {
+        const arg = strtok_r(null, " \t", &save) orelse {
+            resp_err(o, "rm <path>");
+            return;
+        };
+        const p = span(arg);
+        if (!put_allowlisted(p)) {
+            resp_err(o, "rm: path must be under /run/, /etc/ or /tmp/");
+            return;
+        }
+        if (std.c.unlink(arg) == 0) {
+            resp_ok_rm(o, arg);
+            return;
+        }
+        const saved_errno = std.c._errno().*;
+        // EISDIR (or EPERM on some filesystems for a directory): retry as
+        // rmdir — the empty-dir case.  Any other failure (or a non-empty
+        // dir's ENOTEMPTY) falls through to the ERR below.
+        if (saved_errno == EISDIR or saved_errno == EPERM) {
+            if (std.c.rmdir(arg) == 0) {
+                resp_ok_rm(o, arg);
+                return;
+            }
+        }
+        var m: [160]u8 = undefined;
+        _ = snfmt(&m, "rm {s}: {s}", .{ p, errnoStr() });
+        resp_err(o, @ptrCast(&m));
+        return;
+    }
+
+    // shell — M4 F: fork a child that dups the CONTROL vport onto 0/1/2 and
+    // execs /bin/sh -i (busybox ash; TERM=dumb so it emits no ANSI).  The
+    // session then IS the terminal: every shell output line is
+    // indistinguishable from a protocol response, so the HOST treats the
+    // session as opaque until an agreed SENTINEL (the harness echoes a
+    // marker and exits).  The parent answers OK and returns to the main
+    // loop immediately (never blocks); while the shell lives, the port is
+    // the child's — handle_virtio/main_loop skip it via the g_shell_pid
+    // latch, and a second `shell` is an ERR.  The shell inherits NO other
+    // fds (the sigpipe/ctrl/vlog/service fds are closed in the child).
+    if (strcmp(cmd, "shell") == 0) {
+        if (g_vio_fd < 0) {
+            resp_err(o, "shell: no virtio control channel");
+            return;
+        }
+        const prev = g_shell_pid.load(.monotonic);
+        // kill(pid, 0): existence probe (signal 0 sends nothing)
+        if (prev != 0 and std.c.kill(prev, @enumFromInt(0)) == 0) {
+            var sm: [96]u8 = undefined;
+            _ = snfmt(&sm, "shell: already running (pid {d})", .{prev});
+            resp_err(o, @ptrCast(&sm));
+            return;
+        }
+        g_shell_pid.store(0, .monotonic); // stale: reaped or gone
+        const pid = std.c.fork();
+        if (pid < 0) {
+            resp_err(o, "shell: fork failed");
+            return;
+        }
+        if (pid == 0) {
+            // CHILD: the port becomes stdio; everything else closes so the
+            // shell cannot write protocol-shaped noise into other fds.
+            // CLEAR O_NONBLOCK first: the control port is nonblocking by
+            // nature, and a shell reading O_NONBLOCK stdin gets EAGAIN —
+            // which ash treats as EOF, printing one prompt and exiting 0
+            // (MEASURED: "shell 123 reaped (status 0)" right after the
+            // first prompt).  A blocking stdio is what a shell expects.
+            _ = std.c.fcntl(g_vio_fd, F_SETFL, std.c.fcntl(g_vio_fd, F_GETFL) & ~O_NONBLOCK);
+            _ = std.c.dup2(g_vio_fd, 0);
+            _ = std.c.dup2(g_vio_fd, 1);
+            _ = std.c.dup2(g_vio_fd, 2);
+            if (g_vio_fd > 2) _ = std.c.close(g_vio_fd);
+            if (g_sigpipe[0] >= 0) _ = std.c.close(g_sigpipe[0]);
+            if (g_sigpipe[1] >= 0) _ = std.c.close(g_sigpipe[1]);
+            if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
+            if (g_vlog_fd >= 0) _ = std.c.close(g_vlog_fd);
+            var si: c_int = 0;
+            while (si < g_nsvc) : (si += 1) {
+                if (g_svc.?[@intCast(si)].out_fd >= 0) _ = std.c.close(g_svc.?[@intCast(si)].out_fd);
+            }
+            _ = setenv("TERM", "dumb", 1);
+            _ = setenv("PS1", "fx# ", 1);
+            _ = setenv("PATH", "/bin:/usr/bin", 1);
+            _ = std.posix.sigaction(std.posix.SIG.CHLD, &std.mem.zeroes(std.posix.Sigaction), null);
+            // /usr/bin/busybox, NOT /bin/sh: the image's /bin/sh lives on the
+            // INITRAMFS root, which the pivot left behind at /oldroot — the
+            // pivoted /bin carries only the generation's package symlinks.
+            // /usr is one of the pivot binds, so busybox is on the new root;
+            // argv[0]="sh" selects the ash applet.
+            const av = [_:null]?[*:0]const u8{ "sh", "-i" };
+            _ = execvp("/usr/bin/busybox", @ptrCast(&av));
+            _ = std.c.write(2, "fx-init: shell exec failed\n", "fx-init: shell exec failed\n".len);
+            std.c._exit(127);
+        }
+        g_shell_pid.store(pid, .monotonic);
+        var pm: [64]u8 = undefined;
+        _ = snfmt(&pm, "OK shell pid {d}", .{pid});
+        _ = fputs(@ptrCast(&pm), o);
+        _ = fputc('\n', o);
+        _ = fflush(o);
         return;
     }
 
@@ -2485,6 +2650,22 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
+            // RE-ARM the boot decision for the activated generation (M4 C:
+            // tests/qemu_boot_rollback.sh).  The boot-ok verdict latched for
+            // the OLD generation must not stand for the new one: the grace
+            // window restarts (a fresh deadline — reusing g_boot_start_ms
+            // would expire it instantly and the FIRST post-activate
+            // evaluate_boot_ok, which runs in the SAME main-loop pass that
+            // forked the new services, would emit a WRONG boot-ok before the
+            // crasher ever exited), so the activated generation gets its own
+            // verdict — including its own (v, failed) DISK .bootlog entry for
+            // the next boot's roll-forward to read.  read_store_facts just
+            // rebuilt the service table with every service ST_PENDING (svc_name_cb),
+            // so the restarted window genuinely re-judges the new generation.
+            g_boot_decided = 0;
+            g_boot_failed = 0;
+            g_boot_start_ms = now_ms();
+            g_boot_deadline_ms = sup.fx_boot_deadline_ms(g_boot_start_ms, g_grace_ms);
             // HOT-APPLY: read_store_facts just swapped g_buildfile to the
             // NEW generation's Dhakefile, but nothing put its /etc + /bin on
             // the RUNNING root — the boot path's run_dhake() does exactly
@@ -2650,11 +2831,24 @@ fn handle_conn(cfd: c_int) void {
 /// modules_dir) rather than hardcoding vport0p1 — the first virtserialport is
 /// INTERPRETED to land at vport0p1, but the node name is the kernel's to pick.
 fn find_vport(out: []u8) bool {
+    return find_vport_nth(out, 0);
+}
+
+/// The skip-th vport node in readdir order (legacy ordinal form — see
+/// find_vport_named for why NEW call sites must not rely on it: MEASURED with
+/// two ports, /dev readdir returned vport0p2 BEFORE vport0p1, so ordinal
+/// order is NOT device order).
+fn find_vport_nth(out: []u8, skip: usize) bool {
     const d = opendir("/dev") orelse return false;
     defer _ = closedir(d);
+    var seen: usize = 0;
     while (readdir(d)) |e| {
         const name = std.mem.sliceTo(&e.d_name, 0);
         if (std.mem.startsWith(u8, name, "vport") and std.mem.indexOf(u8, name, "p") != null) {
+            if (seen < skip) {
+                seen += 1;
+                continue;
+            }
             if (name.len + ("/dev/".len) > out.len) continue;
             @memcpy(out[0.."/dev/".len], "/dev/");
             @memcpy(out["/dev/".len .. "/dev/".len + name.len], name);
@@ -2665,13 +2859,51 @@ fn find_vport(out: []u8) bool {
     return false;
 }
 
+/// The vport whose QEMU name= is `want` (the name travels in the device's
+/// sysfs node, /sys/class/virtio-ports/<node>/name).  THE deterministic
+/// port selector: QEMU assigns vportXpY numbers in -device order, but /dev
+/// readdir order does not follow (MEASURED: two ports, vport0p2 listed
+/// first), so a port must be identified by its NAME — every harness names
+/// the control port fxctl0.
+fn find_vport_named(out: []u8, want: []const u8) bool {
+    const d = opendir("/sys/class/virtio-ports") orelse return false;
+    defer _ = closedir(d);
+    while (readdir(d)) |e| {
+        const node = std.mem.sliceTo(&e.d_name, 0);
+        if (node.len == 0 or node[0] == '.') continue;
+        var np: [512]u8 = undefined;
+        const w = snfmt(&np, "/sys/class/virtio-ports/{s}/name", .{node});
+        const f = fopen(@ptrCast(w.ptr), "r") orelse continue;
+        defer _ = fclose(f);
+        var nb: [128]u8 = undefined;
+        const got = fgets(&nb, @intCast(nb.len), f) orelse continue;
+        // NB: span the POINTER (got), never &got (that reads the pointer's
+        // own bytes as a string — a bug this line carried once).
+        var nm: []const u8 = std.mem.span(got);
+        // sysfs strings carry a trailing newline; trim whitespace both ends
+        while (nm.len > 0 and (nm[nm.len - 1] == '\n' or nm[nm.len - 1] == ' ' or nm[nm.len - 1] == '\t')) nm = nm[0 .. nm.len - 1];
+        if (!std.mem.eql(u8, nm, want)) continue;
+        if (node.len + ("/dev/".len) > out.len) continue;
+        @memcpy(out[0.."/dev/".len], "/dev/");
+        @memcpy(out["/dev/".len .. "/dev/".len + node.len], node);
+        out["/dev/".len + node.len] = 0;
+        return true;
+    }
+    return false;
+}
+
 /// Open the guest end of the virtserialport, if this boot can have one:
 /// PID1 (a harness running as a normal process must stay inert) AND an actual
 /// vport node (no virtio-serial device attached => none exists => inert).
 fn setup_virtio_ctrl() void {
     if (std.c.getpid() != 1) return;
     var vp: [256]u8 = undefined;
-    if (!find_vport(&vp)) return;
+    // Prefer the port NAMED fxctl0 (every harness names it): with a second
+    // port attached, /dev readdir order does not follow device order
+    // (MEASURED — see find_vport_named), so the name is the only
+    // deterministic selector.  The ordinal fallback keeps a single UNNAMED
+    // port working (the pre-name contract).
+    if (!find_vport_named(&vp, "fxctl0") and !find_vport(&vp)) return;
     const fd = open(@ptrCast(&vp), O_RDWR | O_NONBLOCK, 0);
     if (fd < 0) {
         errf("fx-init: warning: virtio control: open {s}: {s}\n", .{ span(@ptrCast(&vp)), errnoStr() });
@@ -2699,6 +2931,27 @@ fn setup_virtio_ctrl() void {
     errf("fx-init: virtio control up ({s})\n", .{span(@ptrCast(&vp))});
 }
 
+/// Open the SECOND virtserialport as a guest->host LOG STREAM (M4 D:
+/// tests/qemu_logs.sh): O_WRONLY|O_NONBLOCK, one "ts svc lvl msg" line per
+/// log_line call.  Same gate shape as setup_virtio_ctrl (pid1 + a node) —
+/// with fewer ports this is a no-op.  WRITE-ONLY deliberately: the port is
+/// never in the poll set, never read, and cannot stall PID1 — a write to a
+/// port with no reader returns EAGAIN (the disconnected-port hazard at the
+/// top of this file) and is DROPPED (see log_line), never retried, never
+/// blocking.
+fn setup_virtio_log() void {
+    if (std.c.getpid() != 1) return;
+    var vp: [256]u8 = undefined;
+    if (!find_vport_named(&vp, "fxlog0")) return;
+    const fd = open(@ptrCast(&vp), O_WRONLY | O_NONBLOCK, 0);
+    if (fd < 0) {
+        errf("fx-init: warning: virtio log: open {s}: {s}\n", .{ span(@ptrCast(&vp)), errnoStr() });
+        return;
+    }
+    g_vlog_fd = fd;
+    errf("fx-init: virtio log up ({s})\n", .{span(@ptrCast(&vp))});
+}
+
 /// One POLLIN dispatch on the virtio port: a single read, appended to the
 /// carry buffer, split on newlines; each COMPLETE line runs the EXISTING
 /// handle_request (the command grammar is the socket's, not a copy).
@@ -2709,6 +2962,9 @@ fn setup_virtio_ctrl() void {
 /// connected (or reconnected) and the port is live again.
 fn handle_virtio() void {
     const wf = g_vio_wf orelse return;
+    // While the debug shell owns the port, the SHELL consumes the reads —
+    // touching the fd here would race the child's stdio.
+    if (g_shell_pid.load(.monotonic) != 0) return;
     var buf: [4096]u8 = undefined;
     const n = std.c.read(g_vio_fd, &buf, buf.len);
     if (n < 0) return; // EAGAIN or a transient error: nothing to do
@@ -2827,6 +3083,10 @@ fn do_shutdown() void {
         g_vio_fd = -1;
         g_vio_wf = null;
     }
+    if (g_vlog_fd >= 0) {
+        _ = std.c.close(g_vlog_fd);
+        g_vlog_fd = -1;
+    }
     if (g_rt) |r| dl_close(r);
     if (g_log) |l| fx_log_close(l);
 }
@@ -2873,7 +3133,7 @@ fn main_loop() void {
         // poll set — a disconnected virtserialport is POLLIN|POLLHUP-readable
         // FOREVER and would spin poll at 100% — and reprobe it once per
         // iteration below instead (MEASURED on the first qemu_ctrl run).
-        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+        if (g_vio_fd >= 0 and !g_vio_peer_gone and g_shell_pid.load(.monotonic) == 0) {
             pf[nfd] = .{ .fd = g_vio_fd, .events = std.posix.POLL.IN, .revents = 0 };
             nfd += 1;
         }
@@ -2903,14 +3163,14 @@ fn main_loop() void {
                 }
             }
         }
-        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+        if (g_vio_fd >= 0 and !g_vio_peer_gone and g_shell_pid.load(.monotonic) == 0) {
             pi = 0;
             while (pi < nfd) : (pi += 1) {
                 if (pf[pi].fd == g_vio_fd and (pf[pi].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                     handle_virtio();
                 }
             }
-        } else if (g_vio_fd >= 0) {
+        } else if (g_vio_fd >= 0 and g_shell_pid.load(.monotonic) == 0) {
             // reprobe: ONE nonblocking read per main-loop iteration — the
             // latched port may have a host again (qemu's chardev accepts a
             // new connection without touching the guest).  A poll() with a
@@ -3247,6 +3507,7 @@ pub fn main(init: std.process.Init) !void {
     g_ctrl_fd = setup_ctrl();
     if (g_ctrl_fd < 0) errf("fx-init: warning: control socket failed\n", .{});
     setup_virtio_ctrl();
+    setup_virtio_log();
 
     log_line("fx-init", "info", "entered main loop");
     main_loop();
@@ -3326,6 +3587,30 @@ test "parse_kernel_store: the shapes a kernel command line actually has" {
 
 fn argstr(arg: [*]u8) []const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(arg)));
+}
+
+test "put_allowlisted: the three roots, absolute, no .." {
+    // allowed roots (a NON-root child: the root itself is not a writable target)
+    try std.testing.expect(put_allowlisted("/run/fx/config.dhall"));
+    try std.testing.expect(put_allowlisted("/etc/hostname"));
+    try std.testing.expect(put_allowlisted("/tmp/x"));
+    // the bare root prefix (and "/") are not targets
+    try std.testing.expect(!put_allowlisted("/run/"));
+    try std.testing.expect(!put_allowlisted("/etc"));
+    try std.testing.expect(!put_allowlisted("/"));
+    // relative paths (no CWD games)
+    try std.testing.expect(!put_allowlisted("run/x"));
+    try std.testing.expect(!put_allowlisted(""));
+    // outside the list
+    try std.testing.expect(!put_allowlisted("/bin/sh"));
+    try std.testing.expect(!put_allowlisted("/fx/store/x"));
+    try std.testing.expect(!put_allowlisted("/root/../etc/hostname"));
+    // lexical escape guard (even under an allowed root)
+    try std.testing.expect(!put_allowlisted("/run/../etc/shadow"));
+    try std.testing.expect(!put_allowlisted("/etc/../etc/hostname"));
+    try std.testing.expect(!put_allowlisted("/tmp/a..b"));
+    // ^ a filename CONTAINING ".." is rejected too — deliberately strict:
+    // configs are generated names; the false-positive cost is nil.
 }
 
 test "parse_on mirrors the lenient on= grammar" {
