@@ -122,18 +122,16 @@ else
 fi
 echo "qemu-ctrl: channel writer: $CTRL_TOOL"
 
-# ctrl_session SOCK V_BAD TRANSCRIPT — send "status" + "rollback $V_BAD"
-# (newline-terminated) over the chardev socket in ONE connection, capture
-# the guest's answers.  NO half-close (-N is deliberately NOT used —
-# MEASURED: it makes qemu tear the chardev down before the guest's response
-# write, silently dropping it); requests are newline-delimited, so the
-# guest needs no EOF.  nc idles out via -w 5 after the responses arrive;
-# timeout(1) is the hard backstop.
-ctrl_session() { # ctrl_session SOCK V_BAD TRANSCRIPT
-    _sock=$1 _vb=$2 _out=$3
-    printf 'status\nrollback %s\n' "$_vb" > "$WORK/req.txt"
+# ctrl_session SOCK REQFILE TRANSCRIPT — send the request file's lines over
+# the chardev socket in ONE connection (NO half-close — MEASURED: -N makes
+# qemu tear the chardev down before the guest's response write, silently
+# dropping it); requests are newline-delimited, so the guest needs no EOF.
+# nc idles out via -w 5 after the responses arrive; timeout(1) is the hard
+# backstop.
+ctrl_session() { # ctrl_session SOCK REQFILE TRANSCRIPT
+    _sock=$1 _req=$2 _out=$3
     case "$CTRL_TOOL" in
-        nc) timeout 30 nc -w 5 -U "$_sock" < "$WORK/req.txt" > "$_out" 2>&1 ;;
+        nc) timeout 30 nc -w 5 -U "$_sock" < "$_req" > "$_out" 2>&1 ;;
         python3) timeout 30 python3 -c '
 import socket, sys, time
 sock, req = sys.argv[1], sys.argv[2]
@@ -154,7 +152,7 @@ while time.time() < deadline:
         break
     chunks.append(b)
 sys.stdout.write(b"".join(chunks).decode("utf-8", "replace"))
-' "$_sock" "$WORK/req.txt" > "$_out" 2>&1 ;;
+' "$_sock" "$_req" > "$_out" 2>&1 ;;
     esac
 }
 
@@ -376,7 +374,8 @@ SHA1=$(disk_sha)
 
 # ── the in-guest control session (QEMU still running) ─────────────────────
 CTRL_TRANSCRIPT="$WORK/ctrl.log"
-ctrl_session "$SOCK" "$V_BAD" "$CTRL_TRANSCRIPT" \
+printf 'status\nrollback %s\n' "$V_BAD" > "$WORK/req.txt"
+ctrl_session "$SOCK" "$WORK/req.txt" "$CTRL_TRANSCRIPT" \
     || { cat "$CTRL_TRANSCRIPT"; fail "ctrl session: the channel write failed (exit $? — connect/timeout)"; }
 echo "--- ctrl transcript ---"; cat "$CTRL_TRANSCRIPT"; echo "-----------------------"
 
@@ -395,6 +394,39 @@ V_CTRL=$(sed -n "s/^rolled back to version $V_BAD (current \([0-9][0-9]*\))$/\1/
     || { kill "$QPID" 2>/dev/null; fail "rollback: new current v$V_CTRL not above v$V_GOOD (republish must be monotonic)"; }
 sed -n "/^rolled back to version/,\$p" "$CTRL_TRANSCRIPT" | grep -q '^OK$' \
     || { kill "$QPID" 2>/dev/null; fail "rollback: no OK after the rollback line"; }
+
+# ── the put/rm round trip (M4 E): put under /etc/ (OUTSIDE the old /run/
+# whitelist) + rm it back; a negative rm on an allowlist-escape path proves
+# the gate.  Same connection discipline (no half-close).
+{
+    echo 'put /etc/probe-e.dhall'
+    base64 -w 76 "$CFG_GOOD"
+    echo '.'
+    echo 'rm /etc/probe-e.dhall'
+    echo 'rm /bin/sh'
+    echo 'put /bin/sh'
+} > "$WORK/req-e.txt"
+CTRL_TRANSCRIPT="$WORK/ctrl-e.log"
+ctrl_session "$SOCK" "$WORK/req-e.txt" "$CTRL_TRANSCRIPT"
+echo "--- ctrl-e transcript (put/rm round trip) ---"; cat "$CTRL_TRANSCRIPT"; echo "----------------------------------------------"
+ETC_BYTES=$(wc -c < "$CFG_GOOD" | tr -d ' ')
+# put /etc/probe-e.dhall opened + landed with the byte-count line
+grep -q '^OK$' "$CTRL_TRANSCRIPT" || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "put/rm: no OK in transcript"; }
+grep -q "^OK put $ETC_BYTES bytes\$" "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "put: no 'OK put $ETC_BYTES bytes' line (the /etc/ widen did not take)"; }
+# rm of the just-put file succeeded
+grep -q '^OK rm /etc/probe-e.dhall$' "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "rm: no 'OK rm /etc/probe-e.dhall' line"; }
+# the allowlist gate: /bin/sh is outside /run/,/etc/,/tmp/ -> ERR both ways
+grep -q "^ERR rm: path must be under" "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "rm /bin/sh: no ERR line (the allowlist gate did not reject it)"; }
+grep -q '^ERR put: path must be under' "$CTRL_TRANSCRIPT" \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "put /bin/sh: no ERR line (the allowlist gate did not reject it)"; }
+# and the guest still HAS its /bin/sh (the rm never ran) — the ERR above is
+# the gate proof; belt-and-braces: exactly ONE 'OK rm' line in the transcript
+# (the /etc/probe-e.dhall one), never a second for /bin/sh.
+[ "$(grep -c '^OK rm ' "$CTRL_TRANSCRIPT")" = "1" ] \
+    || { cat "$CTRL_TRANSCRIPT"; kill "$QPID" 2>/dev/null; fail "rm: expected exactly one 'OK rm' line (got $(grep -c '^OK rm ' "$CTRL_TRANSCRIPT")) — the /bin/sh rm must not succeed"; }
 
 # ── quiescence kill: the ctrl-session writes must be ON THE DISK before the
 # abrupt kill (the rollback branch's sync() flushes CURRENT; this poll waits

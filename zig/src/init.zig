@@ -41,6 +41,8 @@ const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ENOEXEC: c_int = 8;
 const ENOENT: c_int = 2;
+const EISDIR: c_int = 21;
+const EPERM: c_int = 1;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x800;
@@ -2080,14 +2082,37 @@ fn resp_err(o: *FILE, msg: [*:0]const u8) void {
     _ = fflush(o);
 }
 
+/// "OK rm <path>" (the rm arm's success line — resp_ok plus the operand, so
+/// the round trip names what it removed).
+fn resp_ok_rm(o: *FILE, path: [*:0]const u8) void {
+    _ = fprintf(o, "OK rm %s\n", path);
+    _ = fflush(o);
+}
+
 // ─── put <path> (M4 in-guest activate: config upload over the channel) ────
 //
 // Framing: `put <path>` opens, raw base64 lines accumulate (RFC 4648,
 // padding allowed, lines short enough for REQ_MAX), a lone `.` decodes +
 // writes + answers "OK put <n> bytes" or "ERR ...".  The write target is
-// WHITELISTED to /run/ — the channel must not be able to write arbitrary
-// guest files (a config is the only intended payload, and /run/fx is where
-// the activate handler's consumers live).
+// allowlisted (put_allowlisted below) — the same list `rm` is gated to.
+const PUT_ALLOW = [_][]const u8{ "/run/", "/etc/", "/tmp/" };
+
+/// Channel write/delete gate: an ABSOLUTE path under one of the allowlist
+/// roots, with no `..` component (a lexical symlink-escape guard — the
+/// image's /run,/etc,/tmp contain no symlinks, and realpath(3) is not in
+/// the linked surface; a `..`-free absolute path cannot lexically leave
+/// its root).  HONEST SCOPE: the channel is root-equivalent by design in
+/// this context (its `activate` arm already rewrites the whole running
+/// root via dhake), so this list is HYGIENE against fat-fingered payloads,
+/// not a security boundary.
+fn put_allowlisted(p: []const u8) bool {
+    if (p.len == 0 or p[0] != '/') return false;
+    if (std.mem.indexOf(u8, p, "..") != null) return false;
+    for (PUT_ALLOW) |root| {
+        if (std.mem.startsWith(u8, p, root) and p.len > root.len) return true;
+    }
+    return false;
+}
 
 fn putAbort() void {
     g_put_open = false;
@@ -2099,9 +2124,9 @@ fn putAbort() void {
 
 fn putBegin(o: *FILE, path: [*:0]u8) void {
     const p = span(path);
-    // whitelist: /run/ only (and an absolute path — no CWD games)
-    if (p.len < "/run/x".len or p[0] != '/' or !std.mem.startsWith(u8, p, "/run/")) {
-        resp_err(o, "put: path must be under /run/");
+    // allowlist: /run/, /etc/, /tmp/ (absolute, no .. — see put_allowlisted)
+    if (!put_allowlisted(p)) {
+        resp_err(o, "put: path must be under /run/, /etc/ or /tmp/");
         return;
     }
     if (g_put_open) putAbort(); // a stale open put: reset before starting
@@ -2243,6 +2268,39 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             return;
         };
         putBegin(o, arg);
+        return;
+    }
+
+    // rm <path> — unlink(2) with an rmdir(2) fallback for empty dirs, gated
+    // to the SAME allowlist as put (put_allowlisted): /run/, /etc/, /tmp/,
+    // absolute, no `..`.  ERR on failure (errno), "OK rm <path>" on success.
+    if (strcmp(cmd, "rm") == 0) {
+        const arg = strtok_r(null, " \t", &save) orelse {
+            resp_err(o, "rm <path>");
+            return;
+        };
+        const p = span(arg);
+        if (!put_allowlisted(p)) {
+            resp_err(o, "rm: path must be under /run/, /etc/ or /tmp/");
+            return;
+        }
+        if (std.c.unlink(arg) == 0) {
+            resp_ok_rm(o, arg);
+            return;
+        }
+        const saved_errno = std.c._errno().*;
+        // EISDIR (or EPERM on some filesystems for a directory): retry as
+        // rmdir — the empty-dir case.  Any other failure (or a non-empty
+        // dir's ENOTEMPTY) falls through to the ERR below.
+        if (saved_errno == EISDIR or saved_errno == EPERM) {
+            if (std.c.rmdir(arg) == 0) {
+                resp_ok_rm(o, arg);
+                return;
+            }
+        }
+        var m: [160]u8 = undefined;
+        _ = snfmt(&m, "rm {s}: {s}", .{ p, errnoStr() });
+        resp_err(o, @ptrCast(&m));
         return;
     }
 
@@ -3342,6 +3400,30 @@ test "parse_kernel_store: the shapes a kernel command line actually has" {
 
 fn argstr(arg: [*]u8) []const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(arg)));
+}
+
+test "put_allowlisted: the three roots, absolute, no .." {
+    // allowed roots (a NON-root child: the root itself is not a writable target)
+    try std.testing.expect(put_allowlisted("/run/fx/config.dhall"));
+    try std.testing.expect(put_allowlisted("/etc/hostname"));
+    try std.testing.expect(put_allowlisted("/tmp/x"));
+    // the bare root prefix (and "/") are not targets
+    try std.testing.expect(!put_allowlisted("/run/"));
+    try std.testing.expect(!put_allowlisted("/etc"));
+    try std.testing.expect(!put_allowlisted("/"));
+    // relative paths (no CWD games)
+    try std.testing.expect(!put_allowlisted("run/x"));
+    try std.testing.expect(!put_allowlisted(""));
+    // outside the list
+    try std.testing.expect(!put_allowlisted("/bin/sh"));
+    try std.testing.expect(!put_allowlisted("/fx/store/x"));
+    try std.testing.expect(!put_allowlisted("/root/../etc/hostname"));
+    // lexical escape guard (even under an allowed root)
+    try std.testing.expect(!put_allowlisted("/run/../etc/shadow"));
+    try std.testing.expect(!put_allowlisted("/etc/../etc/hostname"));
+    try std.testing.expect(!put_allowlisted("/tmp/a..b"));
+    // ^ a filename CONTAINING ".." is rejected too — deliberately strict:
+    // configs are generated names; the false-positive cost is nil.
 }
 
 test "parse_on mirrors the lenient on= grammar" {
