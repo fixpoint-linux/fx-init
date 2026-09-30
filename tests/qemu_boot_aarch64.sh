@@ -96,13 +96,13 @@ else
     $PODMAN run --rm -v "$RUNTIME":/out:Z debian:stable sh -c '
         set -eu
         export DEBIAN_FRONTEND=noninteractive
+        dpkg --add-architecture arm64
         apt-get update -qq
-        apt-get install -y -qq wget binutils >/dev/null
+        apt-get install -y -qq binutils >/dev/null
         cd /tmp
-        # busybox-static:arm64 + libc6:arm64 (armhf/arm64 ports are on the
-        # default debian mirrors: ports-wise, arm64 is a release arch)
-        apt-get download -qq busybox-static:arm64 libc6:arm64 2>/dev/null \
-            || { echo FETCH-FAIL apt-get download; exit 1; }
+        # arm64 is a release arch: the default deb.debian.org mirror serves
+        # busybox-static:arm64 + libc6:arm64 once the foreign arch is added
+        apt-get download -qq busybox-static:arm64 libc6:arm64
         for d in busybox-static_*arm64.deb libc6_*arm64.deb; do
             dpkg-deb -x "$d" /tmp/x || { echo FETCH-FAIL dpkg-deb; exit 1; }
         done
