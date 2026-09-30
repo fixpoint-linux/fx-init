@@ -1,57 +1,67 @@
 # scripts/kernel-pin.txt — the M4 image increment's pinned kernel input.
 #
-# DESIGN.md §8.5 decision for v1 (REVISED, was "take the HOST kernel"):
-# the image takes its kernel from a PINNED, FETCHABLE artifact — the
-# openSUSE kernel-default-base RPM below, downloaded + sha256-verified by
-# scripts/fetch-kernel.sh.  The host's /boot and /usr/lib/modules are NO
-# LONGER inputs: the image is reproducible on any machine that can reach
-# the URL (nothing about the kernel depends on the build host anymore).
+# DESIGN.md §8.5 decision for v1 (REVISED twice): the image takes its
+# kernel from a PINNED, FETCHABLE artifact — now a TRIMMED TARBALL hosted
+# as a release asset in THIS repo, downloaded + sha256-verified by
+# scripts/fetch-kernel.sh.  The host's /boot and /usr/lib/modules were
+# never inputs; with this pin nothing about the kernel depends on the
+# build host OR on download.opensuse.org anymore.
 #
-# KNOWN LIMITATION (honest): openSUSE Tumbleweed PRUNES old packages from
-# download.opensuse.org — 7.1.8-1.1 (this host's kernel, the pre-revision
-# pin) is ALREADY GONE, so this URL WILL eventually 404 and the pin will
-# need moving to whatever current build carries the config facts below.
-# The DURABLE fix is to host a trimmed artifact (~19 MB: vmlinuz + the 4
-# modules + config) as a release asset in a fixpoint-linux repo and pin
-# THAT URL instead — flagged as the follow-up increment, not done here.
+# PROVENANCE: the tarball (vmlinuz + config + the five .ko.zst modules
+# below) was extracted from the openSUSE kernel-default-base RPM
+#   kernel-default-base-7.2.7-1.1.36.8.x86_64.rpm
+#   (rpm_sha256 eea8f5e4a1d3614b4cd7ea00b41fd48216cc6c63b6affe95655e13d19cfcad29,
+#    rpm_size 56177546, from
+#    https://download.opensuse.org/tumbleweed/repo/oss/x86_64/)
+# and repacked deterministically (tar --sort=name, owner/group/mtime 0,
+# gzip -n) so any rebuild from the same cache yields the tar_sha256 below.
+# The RPM itself is no longer pinned input — the tarball is.
+#
+# HONEST RISK: a GitHub release asset CAN be replaced or deleted by anyone
+# with repo admin — the same trust domain as this repo's code.  The pin's
+# tar_sha256 makes replacement LOUD, not impossible: a swapped asset fails
+# the hash check (and a deleted one 404s) and fetch-kernel exits non-zero,
+# so no unverified kernel ever reaches -kernel.  There is no fallback.
 #
 # Keys consumed by scripts/fetch-kernel.sh + tests/mkinitramfs.sh:
-#   url             the RPM to download (cache dir: $FX_KERNEL_CACHE,
-#                   default .kernel-cache/, gitignored)
-#   rpm_sha256      pin of the whole RPM (a cached copy failing this hash
-#                   is re-fetched, never trusted)
-#   rpm_size        early sanity check before the hash
-#   kernel_version  the /usr/lib/modules/<version> tree name in the RPM;
-#                   the image's /lib/modules/<version> dir — the single
-#                   place the version string lives
-#   vmlinuz_path    vmlinuz, relative to the RPM root
-#   vmlinuz_sha256  pin of the EXTRACTED vmlinuz (tests/qemu_*.sh verify
-#                   this after the fetch: a mismatch FAILS the harness)
-#   config_path     the kernel's own config, kept for future assertions
-#   module          one disk-path module per line, relative to
-#                   /usr/lib/modules/<kernel_version>/ in the RPM.
+#   url             the release asset to download (cache dir:
+#                   $FX_KERNEL_CACHE, default .kernel-cache/, gitignored)
+#   tar_sha256      pin of the whole tarball (a cached copy failing this
+#                   hash is re-fetched, never trusted)
+#   tar_size        early sanity check before the hash
+#   kernel_version  the /usr/lib/modules/<version> tree name the tarball
+#                   was cut from; the image's /lib/modules/<version> dir —
+#                   the single place the version string lives
+#   vmlinuz_path    vmlinuz, relative to the tarball root (top level)
+#   vmlinuz_sha256  pin of the EXTRACTED vmlinuz (verified after the
+#                   unpack AND by tests/qemu_*.sh: a mismatch FAILS)
+#   config_path     the kernel's own config, relative to the tarball root
+#                   (kept for future config assertions)
+#   module          one disk-path module per line, relative to the
+#                   tarball's modules/ tree (kept at its in-RPM path
+#                   under /usr/lib/modules/<kernel_version>/).
 #                   MEASURED on 7.2.7: the set is FIVE modules — this
-#                   RPM's ext4.ko has 10 UNDEFINED mb_cache_* symbols
-#                   (readelf) resolved by kernel/fs/mbcache.ko.zst in the
-#                   same RPM (the 7.1.8 module set also carried it).
+#                   kernel's ext4.ko has 10 UNDEFINED mb_cache_* symbols
+#                   (readelf) resolved by kernel/fs/mbcache.ko.zst from
+#                   the same RPM (the 7.1.8 module set also carried it).
 #                   insmod order is zig/src/init.zig's DISK_MODULE_ORDER:
 #                   crc16 mbcache jbd2 ext4 virtio_blk.
 #
 # Kernel config facts this increment depends on (all =y, MEASURED from
-# this RPM's own config file):
+# this kernel's own config file):
 #   CONFIG_BLK_DEV_INITRD, CONFIG_RD_GZIP (gzip'd newc cpio initrd),
 #   CONFIG_DEVTMPFS + CONFIG_DEVTMPFS_MOUNT (devtmpfs; note the automount
 #   only applies to a real rootfs — an initramfs PID1 mounts it itself),
 #   CONFIG_SERIAL_8250_CONSOLE (console=ttyS0), CONFIG_TMPFS,
 #   CONFIG_VIRTIO, CONFIG_VIRTIO_PCI, CONFIG_VIRTIO_CONSOLE.
 #   Only VIRTIO_BLK / EXT4 / JBD2 / CRC16 are =m (the module list below).
-url https://download.opensuse.org/tumbleweed/repo/oss/x86_64/kernel-default-base-7.2.7-1.1.36.8.x86_64.rpm
-rpm_sha256 eea8f5e4a1d3614b4cd7ea00b41fd48216cc6c63b6affe95655e13d19cfcad29
-rpm_size 56177546
+url https://github.com/fixpoint-linux/fx-init/releases/download/m4-kernel-7.2.7-1-default/fixpoint-kernel-7.2.7-1-default.tar.gz
+tar_sha256 f799a72ebfc97224249542f9c52b7b8fcc5332466a04bb872bf5d55478798320
+tar_size 17933949
 kernel_version 7.2.7-1-default
-vmlinuz_path usr/lib/modules/7.2.7-1-default/vmlinuz
+vmlinuz_path vmlinuz
 vmlinuz_sha256 02e853becce2efd322d6ce8fcb275cde65d80d06de5f3c9c989afe67c09babd4
-config_path usr/lib/modules/7.2.7-1-default/config
+config_path config
 module kernel/lib/crc/crc16.ko.zst
 module kernel/fs/mbcache.ko.zst
 module kernel/fs/jbd2/jbd2.ko.zst

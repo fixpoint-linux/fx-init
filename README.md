@@ -45,19 +45,23 @@ behavior under zig/golden/ (see each zig/*_diff.sh header).
 ## The pinned kernel (image input)
 
 The bootable image does NOT use the build host's kernel. `scripts/kernel-pin.txt`
-pins a fetchable artifact — an openSUSE `kernel-default-base` RPM — and
-`scripts/fetch-kernel.sh` downloads it, verifies the RPM sha256, extracts
-vmlinuz + the five disk-path modules (crc16, mbcache, jbd2, ext4, virtio_blk) + the
-kernel config into `.kernel-cache/` (gitignored; override with `FX_KERNEL_CACHE`),
-and verifies the extracted vmlinuz sha256. The QEMU harnesses call it and skip
-loudly (77) when offline — there is deliberately no host-kernel fallback.
+pins a fetchable artifact — a trimmed tarball (vmlinuz + the five disk-path
+modules crc16, mbcache, jbd2, ext4, virtio_blk + the kernel config) hosted as a
+release asset of THIS repo — and `scripts/fetch-kernel.sh` downloads it, verifies
+the sha256 of the downloaded tarball, unpacks into `.kernel-cache/` (gitignored;
+override with `FX_KERNEL_CACHE`), and verifies the extracted vmlinuz sha256 too.
+The QEMU harnesses call it and skip loudly (77) when offline — there is
+deliberately no host-kernel fallback.
 
-**Known limitation:** openSUSE prunes old packages from
-`download.opensuse.org` (the previously pinned 7.1.8 build is already gone),
-so this URL will eventually 404 and the pin will need moving. The durable
-fix — not done yet — is to host a trimmed ~19 MB artifact (vmlinuz + the 4
-modules + config) as a release asset in a fixpoint-linux repo and pin that
-instead.
+Self-hosting the pin removes the previous external dependency: openSUSE prunes
+old packages from `download.opensuse.org` (the 7.1.8 pin 404'd within weeks of
+being set, and the RPM pin inherited the same risk), so the artifact now lives
+beside the code that pins it. Provenance (the exact `kernel-default-base` RPM
+the tarball was cut from, with its sha256) is recorded in a comment in
+`scripts/kernel-pin.txt`. Honest residual risk: a GitHub release asset can be
+replaced or deleted by anyone with repo admin — the same trust domain as this
+repo's code — but the pinned `tar_sha256` turns silent substitution into a hard
+fetch failure.
 
 ## Architecture
 
