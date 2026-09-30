@@ -1,27 +1,36 @@
-# scripts/kernel-pin.txt — the M4 image increment's pinned kernel input.
+# scripts/kernel-pin.txt — the pinned kernel input (M5 increment).
 #
-# DESIGN.md §8.5 decision for v1 (REVISED twice): the image takes its
-# kernel from a PINNED, FETCHABLE artifact — now a TRIMMED TARBALL hosted
-# as a release asset in THIS repo, downloaded + sha256-verified by
-# scripts/fetch-kernel.sh.  The host's /boot and /usr/lib/modules were
-# never inputs; with this pin nothing about the kernel depends on the
-# build host OR on download.opensuse.org anymore.
+# DESIGN.md §8.5 decision for v1 (carried through M4 and now M5): the
+# image takes its kernel from a PINNED, FETCHABLE artifact — a TRIMMED
+# TARBALL hosted as a release asset in THIS repo, downloaded +
+# sha256-verified by scripts/fetch-kernel.sh.  Nothing about the kernel
+# depends on the build host.
 #
-# PROVENANCE: the tarball (vmlinuz + config + the five .ko.zst modules
-# below) was extracted from the openSUSE kernel-default-base RPM
-#   kernel-default-base-7.2.7-1.1.36.8.x86_64.rpm
-#   (rpm_sha256 eea8f5e4a1d3614b4cd7ea00b41fd48216cc6c63b6affe95655e13d19cfcad29,
-#    rpm_size 56177546, from
-#    https://download.opensuse.org/tumbleweed/repo/oss/x86_64/)
-# and repacked deterministically (tar --sort=name, owner/group/mtime 0,
-# gzip -n) so any rebuild from the same cache yields the tar_sha256 below.
-# The RPM itself is no longer pinned input — the tarball is.
+# PROVENANCE (M5, supersedes the openSUSE RPM cut): linux-6.12.19 LTS
+# from kernel.org (tarball d73bf057bec04434b169d1b61641936f7d0c97ceb923a281f32e35dd4dcc6531),
+# built in a debian:stable container (gcc 14.2, flex/bison/bc/libelf/libssl)
+# from a `make tinyconfig` base + the image fragment (BLK_DEV_INITRD,
+# RD_GZIP, DEVTMPFS(+MOUNT), TMPFS, SERIAL_8250_CONSOLE, VIRTIO*,
+# EXT4_FS... plus the hidden gates tinyconfig leaves off: VIRTIO_MENU,
+# TTY, PRINTK — and two M5 discoveries: FILE_LOCKING, without which
+# dl_open's F_SETLK fails EACCES and the boot dies before a verdict, and
+# the CRYPTO chain =y, without which jbd2.ko fails to insmod).  This
+# kernel is the ZERO-MODULE build: every disk-path driver (virtio_blk,
+# ext4 + jbd2/mbcache/crc16) is =y — no modules/ tree, no /lib/modules in
+# the image, no insmod at boot; the whole M4 module mechanism is deleted.
+# Repacked deterministically (tar --sort=name, owner/group/mtime 0,
+# gzip -n).
 #
-# HONEST RISK: a GitHub release asset CAN be replaced or deleted by anyone
-# with repo admin — the same trust domain as this repo's code.  The pin's
-# tar_sha256 makes replacement LOUD, not impossible: a swapped asset fails
-# the hash check (and a deleted one 404s) and fetch-kernel exits non-zero,
-# so no unverified kernel ever reaches -kernel.  There is no fallback.
+# Belt build note: an intermediate artifact (m5-kernel-6.12.19-m5) shipped
+# these five modules as =m with the M4 mechanism intact, proving the new
+# kernel booted the OLD image unchanged before the mechanism was deleted;
+# its commit is the bisect boundary.
+#
+# HONEST RISK (unchanged): a GitHub release asset CAN be replaced or
+# deleted by anyone with repo admin — the same trust domain as this
+# repo's code.  The pin's tar_sha256 makes replacement LOUD, not
+# impossible: a swapped asset fails the hash check (and a deleted one
+# 404s) and fetch-kernel exits non-zero.  There is no fallback.
 #
 # Keys consumed by scripts/fetch-kernel.sh + tests/mkinitramfs.sh:
 #   url             the release asset to download (cache dir:
@@ -29,41 +38,24 @@
 #   tar_sha256      pin of the whole tarball (a cached copy failing this
 #                   hash is re-fetched, never trusted)
 #   tar_size        early sanity check before the hash
-#   kernel_version  the /usr/lib/modules/<version> tree name the tarball
-#                   was cut from; the image's /lib/modules/<version> dir —
-#                   the single place the version string lives
+#   kernel_version  the kernel's version string (informational since M5:
+#                   no /lib/modules dir is created anywhere — the single
+#                   place the version string lives)
 #   vmlinuz_path    vmlinuz, relative to the tarball root (top level)
 #   vmlinuz_sha256  pin of the EXTRACTED vmlinuz (verified after the
 #                   unpack AND by tests/qemu_*.sh: a mismatch FAILS)
 #   config_path     the kernel's own config, relative to the tarball root
 #                   (kept for future config assertions)
-#   module          one disk-path module per line, relative to the
-#                   tarball's modules/ tree (kept at its in-RPM path
-#                   under /usr/lib/modules/<kernel_version>/).
-#                   MEASURED on 7.2.7: the set is FIVE modules — this
-#                   kernel's ext4.ko has 10 UNDEFINED mb_cache_* symbols
-#                   (readelf) resolved by kernel/fs/mbcache.ko.zst from
-#                   the same RPM (the 7.1.8 module set also carried it).
-#                   insmod order is zig/src/init.zig's DISK_MODULE_ORDER:
-#                   crc16 mbcache jbd2 ext4 virtio_blk.
 #
-# Kernel config facts this increment depends on (all =y, MEASURED from
-# this kernel's own config file):
-#   CONFIG_BLK_DEV_INITRD, CONFIG_RD_GZIP (gzip'd newc cpio initrd),
-#   CONFIG_DEVTMPFS + CONFIG_DEVTMPFS_MOUNT (devtmpfs; note the automount
-#   only applies to a real rootfs — an initramfs PID1 mounts it itself),
-#   CONFIG_SERIAL_8250_CONSOLE (console=ttyS0), CONFIG_TMPFS,
-#   CONFIG_VIRTIO, CONFIG_VIRTIO_PCI, CONFIG_VIRTIO_CONSOLE.
-#   Only VIRTIO_BLK / EXT4 / JBD2 / CRC16 are =m (the module list below).
-url https://github.com/fixpoint-linux/fx-init/releases/download/m4-kernel-7.2.7-1-default/fixpoint-kernel-7.2.7-1-default.tar.gz
-tar_sha256 f799a72ebfc97224249542f9c52b7b8fcc5332466a04bb872bf5d55478798320
-tar_size 17933949
-kernel_version 7.2.7-1-default
+# Kernel config facts this increment depends on (all =y in the shipped
+# config, MEASURED — zero =m lines): BLK_DEV_INITRD, RD_GZIP,
+# DEVTMPFS(+MOUNT), TMPFS, SERIAL_8250_CONSOLE, VIRTIO, VIRTIO_PCI,
+# VIRTIO_BLK, VIRTIO_CONSOLE, EXT4_FS (+JBD2/FS_MBCACHE/CRC16), PRINTK,
+# FILE_LOCKING, plus the CRYPTO chain ext4's checksums select.
+url https://github.com/fixpoint-linux/fx-init/releases/download/m5-kernel-6.12.19-tiny/fixpoint-kernel-6.12.19-tiny.tar.gz
+tar_sha256 ad096118dde37c801b391a177450f5fa296045e89d2735391028fd9503890088
+tar_size 1911476
+kernel_version 6.12.19-tiny
 vmlinuz_path vmlinuz
-vmlinuz_sha256 02e853becce2efd322d6ce8fcb275cde65d80d06de5f3c9c989afe67c09babd4
+vmlinuz_sha256 51b226c62e0ce48a9720984be71ce7729d7860132cf40767dbde9b3e38193db5
 config_path config
-module kernel/lib/crc/crc16.ko.zst
-module kernel/fs/mbcache.ko.zst
-module kernel/fs/jbd2/jbd2.ko.zst
-module kernel/fs/ext4/ext4.ko.zst
-module kernel/drivers/block/virtio_blk.ko.zst

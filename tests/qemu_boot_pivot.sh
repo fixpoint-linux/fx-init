@@ -212,9 +212,9 @@ if ! grep -q 'fx-init: disk store mounted (current v' "$CONSOLE"; then
     dump
     fail "(d) no 'disk store mounted' line — the disk store path did not run"
 fi
-if grep -q 'disk store disabled\|insmod .* FAILED' "$CONSOLE"; then
+if grep -q 'disk store disabled' "$CONSOLE"; then
     dump
-    fail "(d) disk store bring-up FAILED (insmod/mkfs/mount)"
+    fail "(d) disk store bring-up FAILED (mkfs/mount)"
 fi
 
 # (b) the contrasting diagnostic must be ABSENT: its presence means the gate
