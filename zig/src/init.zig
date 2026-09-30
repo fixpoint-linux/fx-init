@@ -2485,6 +2485,22 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
+            // RE-ARM the boot decision for the activated generation (M4 C:
+            // tests/qemu_boot_rollback.sh).  The boot-ok verdict latched for
+            // the OLD generation must not stand for the new one: the grace
+            // window restarts (a fresh deadline — reusing g_boot_start_ms
+            // would expire it instantly and the FIRST post-activate
+            // evaluate_boot_ok, which runs in the SAME main-loop pass that
+            // forked the new services, would emit a WRONG boot-ok before the
+            // crasher ever exited), so the activated generation gets its own
+            // verdict — including its own (v, failed) DISK .bootlog entry for
+            // the next boot's roll-forward to read.  read_store_facts just
+            // rebuilt the service table with every service ST_PENDING (svc_name_cb),
+            // so the restarted window genuinely re-judges the new generation.
+            g_boot_decided = 0;
+            g_boot_failed = 0;
+            g_boot_start_ms = now_ms();
+            g_boot_deadline_ms = sup.fx_boot_deadline_ms(g_boot_start_ms, g_grace_ms);
             // HOT-APPLY: read_store_facts just swapped g_buildfile to the
             // NEW generation's Dhakefile, but nothing put its /etc + /bin on
             // the RUNNING root — the boot path's run_dhake() does exactly
