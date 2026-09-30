@@ -16,10 +16,11 @@
 #     mkinitcpio use for exactly this reason).
 #   - the 5 kernel modules the M4 DISK path needs (crc16 mbcache jbd2 ext4
 #     virtio_blk), DECOMPRESSED (busybox insmod cannot read .ko.zst) from
-#   the pinned kernel's module tree, flat under /lib/modules/<ver>/ — the
-#   version-lock below FAILS the build when the modules tree's version does
-#   not match the pinned kernel (a mismatched set would only fail later,
-#   in-guest, as an insmod vermagic error).
+#     the FETCHED kernel artifact's module set (scripts/fetch-kernel.sh
+#     cache), flat under /lib/modules/<ver>/ — the pin file's
+#     kernel_version drives BOTH the module dir name and the source, so a
+#     version mismatch is impossible by construction (the old host-tree
+#     lock is gone with the host tree).
 #
 # Guest layout: /fx/store/* (the whole store minus the .build/.tmp scratch
 # dirs), /lib64/<ld + ldd closure of the shipped binaries> + libdatalog.so,
@@ -119,22 +120,26 @@ for applet in insmod mkfs.ext2 cp rm mv sync; do
     ln -sf /usr/bin/busybox "$STAGE/usr/bin/$applet"
 done
 
-# ─── the 5 disk-path kernel modules, version-locked to the pin ────────────
-# KERNEL is e.g. /boot/vmlinuz-<ver>; the modules live at
-# /usr/lib/modules/<ver>/kernel/... as .ko.zst and are decompressed to a
-# FLAT /lib/modules/<ver>/ (zig/src/init.zig insmods them by bare name, in
-# the modules.dep-derived order crc16 mbcache jbd2 ext4 virtio_blk).
+# ─── the 4 disk-path kernel modules, from the FETCHED artifact ────────────
+# -k KERNEL is the FETCHED vmlinuz (scripts/fetch-kernel.sh cache layout:
+# <cache>/kernel/vmlinuz + <cache>/kernel/modules/<...>.ko.zst); the pin
+# file (scripts/kernel-pin.txt) is the single source of truth for the
+# version and the module list.  Modules are staged FLAT as
+# /lib/modules/<ver>/<name>.ko (zig/src/init.zig insmods by bare name in
+# DISK_MODULE_ORDER: crc16 mbcache jbd2 ext4 virtio_blk).
 command -v zstd >/dev/null 2>&1 || skip "zstd not found (disk modules)"
-KVER=$(basename "$KERNEL" | sed -n 's/^vmlinuz-//p')
-[ -n "$KVER" ] || fail "cannot derive kernel version from $KERNEL (expected /boot/vmlinuz-<ver>)"
-MODTREE="/usr/lib/modules/$KVER"
-[ -d "$MODTREE" ] || fail "module tree missing for the pinned kernel: $MODTREE (version mismatch — update the kernel pin or ship modules for $KVER)"
-# insmod'd by bare name; the POC measured these exact subpaths
-MODSRC="kernel/lib/crc/crc16.ko.zst kernel/fs/mbcache.ko.zst kernel/fs/jbd2/jbd2.ko.zst kernel/fs/ext4/ext4.ko.zst kernel/drivers/block/virtio_blk.ko.zst"
+PINFILE="$REPO/scripts/kernel-pin.txt"
+[ -f "$PINFILE" ] || skip "scripts/kernel-pin.txt missing"
+KVER=$(sed -n 's/^kernel_version //p' "$PINFILE" | head -1)
+[ -n "$KVER" ] || fail "pin file has no kernel_version"
+MODCACHE="$(dirname "$KERNEL")/modules"
+[ -d "$MODCACHE" ] || fail "fetched module set missing beside $KERNEL (expected $MODCACHE — run scripts/fetch-kernel.sh; the host's /usr/lib/modules is NOT a fallback)"
+MODSRC=$(sed -n 's/^module //p' "$PINFILE")
+[ -n "$MODSRC" ] || fail "pin file has no module lines"
 mkdir -p "$STAGE/lib/modules/$KVER" || fail "cannot create modules stage"
 for m in $MODSRC; do
-    [ -f "$MODTREE/$m" ] || fail "module $m missing from $MODTREE (version-locked set incomplete)"
-    zstd -d -q -f "$MODTREE/$m" -o "$STAGE/lib/modules/$KVER/$(basename "$m" .ko.zst).ko" \
+    [ -f "$MODCACHE/$m" ] || fail "module $m missing from the fetched artifact at $MODCACHE (pin lists a module the artifact lacks)"
+    zstd -d -q -f "$MODCACHE/$m" -o "$STAGE/lib/modules/$KVER/$(basename "$m" .ko.zst).ko" \
         || fail "zstd -d failed for $m"
 done
 

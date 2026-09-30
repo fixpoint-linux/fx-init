@@ -1366,8 +1366,11 @@ const DISK_STORE = "/fx/disk/store";
 const DISK_DEV = "/dev/vda";
 const DISK_STORE_DB = DISK_STORE ++ "/.db";
 const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
-// insmod order (POC, from the pinned kernel's modules.dep): ext4 depends on
-// crc16 + mbcache + jbd2; virtio_blk has no deps.
+// insmod order (from the pinned kernel's modules.dep): ext4 depends on
+// crc16 + mbcache + jbd2; virtio_blk has no deps.  MEASURED on the pinned
+// 7.2.7 RPM: ext4.ko has 10 UNDEFINED mb_cache_* symbols resolved by
+// mbcache.ko.  Keep in lockstep with the `module` lines in
+// scripts/kernel-pin.txt (mkinitramfs ships exactly those).
 const DISK_MODULE_ORDER = [_][]const u8{ "crc16.ko", "mbcache.ko", "jbd2.ko", "ext4.ko", "virtio_blk.ko" };
 
 const Dirent = extern struct {
@@ -1562,7 +1565,8 @@ fn ensure_disk_store() void {
 
 /// statfs(2) constant (linux/magic.h), pinned by the unit test at the bottom
 /// of this file so a wrong constant is a TEST failure, not a boot mystery.
-/// NOTE (MEASURED, static-probe on the pinned kernel 7.1.8-1-default): with
+/// NOTE (MEASURED, static-probe on the pinned kernels 7.1.8-1-default and
+/// 7.2.7-1-default — qemu_boot_pivot.sh re-validated on 7.2.7): with
 /// CONFIG_TMPFS=y the initramfs rootfs is TMPFS-BACKED — statfs("/") reports
 /// 0x01021994 there too, so the magic alone cannot distinguish the initramfs
 /// root from the pivoted tmpfs.  The discriminator the pivot actually uses is
@@ -3256,7 +3260,7 @@ test "pivot gate constants (linux/magic.h + the measured rootfs fstype)" {
     // here is a silent boot regression (the gate never fires, or the proof
     // line never prints), so pin them: TMPFS_MAGIC from linux/magic.h, and
     // the /proc/mounts root-entry fstype strings MEASURED on the pinned
-    // kernel 7.1.8-1-default (initramfs root = "rootfs", pivoted new root =
+    // kernels 7.1.8-1-default + 7.2.7-1-default (initramfs root = "rootfs", pivoted new root =
     // "tmpfs").  Note statfs("/") reports TMPFS_MAGIC on the initramfs root
     // TOO when CONFIG_TMPFS=y (measured) — which is exactly why the fstype
     // strings, not the magic, carry the gate; this test pins all of them.

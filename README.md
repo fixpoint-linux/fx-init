@@ -42,6 +42,23 @@ The former C oracles were removed after the live differential harnesses
 verified the ports byte-identical; the harnesses now pin that verified
 behavior under zig/golden/ (see each zig/*_diff.sh header).
 
+## The pinned kernel (image input)
+
+The bootable image does NOT use the build host's kernel. `scripts/kernel-pin.txt`
+pins a fetchable artifact — an openSUSE `kernel-default-base` RPM — and
+`scripts/fetch-kernel.sh` downloads it, verifies the RPM sha256, extracts
+vmlinuz + the five disk-path modules (crc16, mbcache, jbd2, ext4, virtio_blk) + the
+kernel config into `.kernel-cache/` (gitignored; override with `FX_KERNEL_CACHE`),
+and verifies the extracted vmlinuz sha256. The QEMU harnesses call it and skip
+loudly (77) when offline — there is deliberately no host-kernel fallback.
+
+**Known limitation:** openSUSE prunes old packages from
+`download.opensuse.org` (the previously pinned 7.1.8 build is already gone),
+so this URL will eventually 404 and the pin will need moving. The durable
+fix — not done yet — is to host a trimmed ~19 MB artifact (vmlinuz + the 4
+modules + config) as a release asset in a fixpoint-linux repo and pin that
+instead.
+
 ## Architecture
 
 See the org design [`DESIGN.md`](https://github.com/fixpoint-linux/fixpoint-linux/blob/main/DESIGN.md)

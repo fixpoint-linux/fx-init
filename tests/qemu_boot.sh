@@ -73,13 +73,22 @@ REPO="$PWD"
 QEMU_CONFIG="${QEMU_CONFIG:-$REPO/m3/config-good.dhall}"
 QEMU_BOOT_TIMEOUT="${QEMU_BOOT_TIMEOUT:-90}"
 
-# ─── kernel pin (scripts/kernel-pin.txt) ──────────────────────────────────
+# ─── pinned kernel (scripts/kernel-pin.txt via scripts/fetch-kernel.sh) ───
+# The kernel is FETCHED from the pinned RPM and hash-verified — never the
+# build host's /boot (removing that host dependency is this increment).
+# fetch-kernel exit: 0 = verified cache, 77 = offline (SKIP loudly — there
+# is deliberately NO host-kernel fallback), anything else = real failure.
 PIN="$REPO/scripts/kernel-pin.txt"
 [ -f "$PIN" ] || skip "scripts/kernel-pin.txt missing"
-KERNEL=$(sed -n 's/^path //p' "$PIN")
-WANT_SHA=$(sed -n 's/^sha256 //p' "$PIN")
-[ -n "$KERNEL" ] && [ -n "$WANT_SHA" ] || skip "kernel pin file malformed (needs 'path ...' + 'sha256 ...')"
-[ -r "$KERNEL" ] || skip "pinned kernel not readable: $KERNEL"
+FETCH_OUT=$(sh "$REPO/scripts/fetch-kernel.sh" 2>&1)
+FETCH_RC=$?
+echo "$FETCH_OUT"
+[ "$FETCH_RC" = 0 ] || [ "$FETCH_RC" = 77 ] || fail "fetch-kernel failed (rc=$FETCH_RC)"
+[ "$FETCH_RC" = 0 ] || skip "pinned kernel artifact unavailable (offline) — no host-kernel fallback by design"
+KERNEL="${FX_KERNEL_CACHE:-$REPO/.kernel-cache}/kernel/vmlinuz"
+WANT_SHA=$(sed -n 's/^vmlinuz_sha256 //p' "$PIN")
+[ -n "$WANT_SHA" ] || skip "kernel pin file malformed (needs 'vmlinuz_sha256 ...')"
+[ -r "$KERNEL" ] || skip "fetched vmlinuz missing at $KERNEL"
 GOT_SHA=$(sha256sum "$KERNEL" | awk '{print $1}')
 # a missing/unreadable/malformed pin skips (this host lacks the fixture), but
 # a sha MISMATCH fails: a foreign or mutated kernel must never silently
