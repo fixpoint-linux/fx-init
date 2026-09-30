@@ -317,22 +317,18 @@ QRC=$?
 # ─── assertions (exit codes, not stdout tails) ─────────────────────────────
 # The increment's contract is the CONSOLE VERDICT; the disk-store and pivot
 # asserts are deliberately NOT the x86 harness's, for two MEASURED reasons:
-#   (a) DISK STORE: ensure_disk_store (zig/src/init.zig) gates on
-#       /lib/modules BEFORE touching /dev/vda — on a zero-module image (the
-#       arm64 kernel is defconfig, no modules exist) the path always exits
-#       early with 'no /lib/modules — disk store disabled'.  That gate is
-#       exactly what lane 2's module-machinery deletion removes; until it
-#       merges, 'disk store mounted' is structurally unreachable here.
-#       Asserting it would fail forever; faking it is worse.
-#   (b) PIVOT: linux 6.12 rejects pivot_root(2) FROM an initramfs rootfs
-#       with EINVAL (fs/namespace.c: the rootfs mount has no parent;
-#       MEASURED in-guest with a static probe, and kernel-documented:
-#       "you can neither pivot_root rootfs" — ramfs-rootfs-initramfs.rst).
-#       The x86 path passes because its pinned 7.2.7 kernel allows it.
-#       init.zig treats the failure as non-fatal by design: warn, roll the
-#       moves back, continue on the initramfs root.  The harness asserts the
-#       HANDLING: either a full pivot, or the failure line + ALL THREE
-#       rollback lines (a half-rolled-back root is a real failure).
+#   (a) DISK STORE: this harness attaches NO disk, so the correct outcome is
+#       the clean ramfs fallback.  (This assertion used to expect an early
+#       '/lib/modules gate' message; lane 2's zero-module kernel replaced
+#       that gate with a /dev/vda presence check, so the line changed.)
+#   (b) PIVOT: linux 6.12 rejects pivot_root(2) FROM an initramfs rootfs with
+#       EINVAL (the rootfs mount has no parent).  init.zig now handles this:
+#       it falls back to the switch_root triple (MS_MOVE + chroot), so on
+#       merged main the aarch64 boot PIVOTS SUCCESSFULLY (measured:
+#       'switch_root fallback ... applied' then 'pivoted to tmpfs root').
+#       The harness still accepts either a full pivot or the documented clean
+#       rollback (all three rollback lines) — a partial rollback is a real
+#       failure, and a bare EINVAL with no handling is too.
 if ! grep -q 'fx-init: store from kernel command line fx.store=/fx/store' "$CONSOLE"; then
     echo "--- last 40 console lines ---"; tail -40 "$CONSOLE"
     fail "no 'store from kernel command line' line (cmdline parse inert on aarch64?)"
@@ -360,10 +356,14 @@ if ! grep -q 'pivoted to tmpfs root' "$CONSOLE"; then
             || fail "pivot rollback incomplete: no 'rolled back $rb' line"
     done
 fi
-# the disk-store path's known state on THIS image (see block comment):
-# the early /lib/modules gate fired — loud, not silent
-grep -q 'no /lib/modules — disk store disabled' "$CONSOLE" \
-    || fail "disk store neither mounted nor loudly disabled (unexpected console state)"
+# the disk-store path's expected state on THIS image: this harness attaches NO
+# disk, so the correct outcome is the clean ramfs fallback (loud, not silent).
+# NOTE: this assertion originally expected the old '/lib/modules gate' message;
+# that gate was DELETED when lane 2 landed the zero-module kernel, which
+# replaced it with a /dev/vda presence check. Measured on merged main:
+#   fx-init: disk store: no /dev/vda — using ramfs store
+grep -qE 'fx-init: disk store(: no /dev/vda — using ramfs store| mounted)' "$CONSOLE" \
+    || fail "disk store neither mounted nor cleanly fell back to ramfs (unexpected console state)"
 
 echo "--- console verdict lines ---"
 grep -E 'fx-init: (boot start|store from|disk store|boot-ok|boot-FAILED)' "$CONSOLE" || true
