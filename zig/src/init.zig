@@ -151,6 +151,14 @@ var g_vio_carry_len: usize = 0;
 // channel.  Inert everywhere else (the setup gate needs BOTH pid1 AND a
 // second vport node, which only a two-port virtio-serial guest has).
 var g_vlog_fd: c_int = -1;
+// M4 in-guest debug shell (tests/qemu_shell.sh): the `shell` command forks
+// a child that dups the CONTROL vport onto 0/1/2 and execs /bin/sh -i; the
+// channel session becomes the terminal.  The parent NEVER blocks: while the
+// child owns the port, handle_virtio must not read it (the child consumes
+// the fd), so a live shell latches g_shell_pid and the poll path skips the
+// port; reap_children clears the latch on SIGCHLD.  One shell at a time —
+// a second `shell` while one lives is an ERR, not a queue.
+var g_shell_pid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0);
 // M4 in-guest activate: the `put <path>` upload state (config transport
 // over the line-oriented channel — base64 lines until a lone `.`).  The
 // pump calls handle_request once per COMPLETE line, so the multi-line
@@ -1991,7 +1999,12 @@ fn reap_children() void {
                 break;
             }
         }
-        if (sv == null) continue;
+        if (sv == null) {
+            // the debug shell child (no Svc): just clear the latch — the
+            // port belongs to the main loop again.
+            if (g_shell_pid.load(.monotonic) == pid) g_shell_pid.store(0, .monotonic);
+            continue;
+        }
         const s = sv.?;
         const st_u32: u32 = @bitCast(status);
         const exited_ok = std.os.linux.W.IFEXITED(st_u32) and std.os.linux.W.EXITSTATUS(st_u32) == 0;
@@ -2322,6 +2335,79 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
         var m: [160]u8 = undefined;
         _ = snfmt(&m, "rm {s}: {s}", .{ p, errnoStr() });
         resp_err(o, @ptrCast(&m));
+        return;
+    }
+
+    // shell — M4 F: fork a child that dups the CONTROL vport onto 0/1/2 and
+    // execs /bin/sh -i (busybox ash; TERM=dumb so it emits no ANSI).  The
+    // session then IS the terminal: every shell output line is
+    // indistinguishable from a protocol response, so the HOST treats the
+    // session as opaque until an agreed SENTINEL (the harness echoes a
+    // marker and exits).  The parent answers OK and returns to the main
+    // loop immediately (never blocks); while the shell lives, the port is
+    // the child's — handle_virtio/main_loop skip it via the g_shell_pid
+    // latch, and a second `shell` is an ERR.  The shell inherits NO other
+    // fds (the sigpipe/ctrl/vlog/service fds are closed in the child).
+    if (strcmp(cmd, "shell") == 0) {
+        if (g_vio_fd < 0) {
+            resp_err(o, "shell: no virtio control channel");
+            return;
+        }
+        const prev = g_shell_pid.load(.monotonic);
+        // kill(pid, 0): existence probe (signal 0 sends nothing)
+        if (prev != 0 and std.c.kill(prev, @enumFromInt(0)) == 0) {
+            var sm: [96]u8 = undefined;
+            _ = snfmt(&sm, "shell: already running (pid {d})", .{prev});
+            resp_err(o, @ptrCast(&sm));
+            return;
+        }
+        g_shell_pid.store(0, .monotonic); // stale: reaped or gone
+        const pid = std.c.fork();
+        if (pid < 0) {
+            resp_err(o, "shell: fork failed");
+            return;
+        }
+        if (pid == 0) {
+            // CHILD: the port becomes stdio; everything else closes so the
+            // shell cannot write protocol-shaped noise into other fds.
+            // CLEAR O_NONBLOCK first: the control port is nonblocking by
+            // nature, and a shell reading O_NONBLOCK stdin gets EAGAIN —
+            // which ash treats as EOF, printing one prompt and exiting 0
+            // (MEASURED: "shell 123 reaped (status 0)" right after the
+            // first prompt).  A blocking stdio is what a shell expects.
+            _ = std.c.fcntl(g_vio_fd, F_SETFL, std.c.fcntl(g_vio_fd, F_GETFL) & ~O_NONBLOCK);
+            _ = std.c.dup2(g_vio_fd, 0);
+            _ = std.c.dup2(g_vio_fd, 1);
+            _ = std.c.dup2(g_vio_fd, 2);
+            if (g_vio_fd > 2) _ = std.c.close(g_vio_fd);
+            if (g_sigpipe[0] >= 0) _ = std.c.close(g_sigpipe[0]);
+            if (g_sigpipe[1] >= 0) _ = std.c.close(g_sigpipe[1]);
+            if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
+            if (g_vlog_fd >= 0) _ = std.c.close(g_vlog_fd);
+            var si: c_int = 0;
+            while (si < g_nsvc) : (si += 1) {
+                if (g_svc.?[@intCast(si)].out_fd >= 0) _ = std.c.close(g_svc.?[@intCast(si)].out_fd);
+            }
+            _ = setenv("TERM", "dumb", 1);
+            _ = setenv("PS1", "fx# ", 1);
+            _ = setenv("PATH", "/bin:/usr/bin", 1);
+            _ = std.posix.sigaction(std.posix.SIG.CHLD, &std.mem.zeroes(std.posix.Sigaction), null);
+            // /usr/bin/busybox, NOT /bin/sh: the image's /bin/sh lives on the
+            // INITRAMFS root, which the pivot left behind at /oldroot — the
+            // pivoted /bin carries only the generation's package symlinks.
+            // /usr is one of the pivot binds, so busybox is on the new root;
+            // argv[0]="sh" selects the ash applet.
+            const av = [_:null]?[*:0]const u8{ "sh", "-i" };
+            _ = execvp("/usr/bin/busybox", @ptrCast(&av));
+            _ = std.c.write(2, "fx-init: shell exec failed\n", "fx-init: shell exec failed\n".len);
+            std.c._exit(127);
+        }
+        g_shell_pid.store(pid, .monotonic);
+        var pm: [64]u8 = undefined;
+        _ = snfmt(&pm, "OK shell pid {d}", .{pid});
+        _ = fputs(@ptrCast(&pm), o);
+        _ = fputc('\n', o);
+        _ = fflush(o);
         return;
     }
 
@@ -2876,6 +2962,9 @@ fn setup_virtio_log() void {
 /// connected (or reconnected) and the port is live again.
 fn handle_virtio() void {
     const wf = g_vio_wf orelse return;
+    // While the debug shell owns the port, the SHELL consumes the reads —
+    // touching the fd here would race the child's stdio.
+    if (g_shell_pid.load(.monotonic) != 0) return;
     var buf: [4096]u8 = undefined;
     const n = std.c.read(g_vio_fd, &buf, buf.len);
     if (n < 0) return; // EAGAIN or a transient error: nothing to do
@@ -3044,7 +3133,7 @@ fn main_loop() void {
         // poll set — a disconnected virtserialport is POLLIN|POLLHUP-readable
         // FOREVER and would spin poll at 100% — and reprobe it once per
         // iteration below instead (MEASURED on the first qemu_ctrl run).
-        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+        if (g_vio_fd >= 0 and !g_vio_peer_gone and g_shell_pid.load(.monotonic) == 0) {
             pf[nfd] = .{ .fd = g_vio_fd, .events = std.posix.POLL.IN, .revents = 0 };
             nfd += 1;
         }
@@ -3074,14 +3163,14 @@ fn main_loop() void {
                 }
             }
         }
-        if (g_vio_fd >= 0 and !g_vio_peer_gone) {
+        if (g_vio_fd >= 0 and !g_vio_peer_gone and g_shell_pid.load(.monotonic) == 0) {
             pi = 0;
             while (pi < nfd) : (pi += 1) {
                 if (pf[pi].fd == g_vio_fd and (pf[pi].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
                     handle_virtio();
                 }
             }
-        } else if (g_vio_fd >= 0) {
+        } else if (g_vio_fd >= 0 and g_shell_pid.load(.monotonic) == 0) {
             // reprobe: ONE nonblocking read per main-loop iteration — the
             // latched port may have a host again (qemu's chardev accepts a
             // new connection without touching the guest).  A poll() with a
