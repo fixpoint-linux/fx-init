@@ -310,7 +310,12 @@ fi
 cat "$WORK/shell.log"; echo "---------------------------------"
 
 # phase 1: the spawn answered exactly one protocol line
-grep -q '^OK shell pid [0-9][0-9]*$' "$WORK/shell.log" \
+# NOTE: unanchored on purpose — ash prints its PS1 ('fx# ') on the same
+# line as the first output, and on 6.12 the prompt can WIN THE RACE with
+# fx-init's protocol response ("fx# OK shell pid 46" vs "OK shell pid 46
+# \n"); the anchored form was only correct under the old kernel's race
+# outcome.
+grep -q 'OK shell pid [0-9][0-9]*' "$WORK/shell.log" \
     || { cat "$WORK/shell.log"; kill "$QPID" 2>/dev/null; fail "shell: no 'OK shell pid N' line"; }
 # phase 2: the OPAQUE window — assert the shell's own markers (never OK/ERR).
 # NB: the guest busybox is the multi-call binary; only the applets symlinked
@@ -351,7 +356,7 @@ tail -3 "$WORK/shell.log" | grep -q '^OK$' \
 } > "$WORK/req2.txt"
 paced_session "$SOCK" "$WORK/req2.txt" "$WORK/shell2.log"
 echo "--- second shell transcript ---"; cat "$WORK/shell2.log"; echo "--------------------------------"
-grep -q '^OK shell pid [0-9][0-9]*$' "$WORK/shell2.log" \
+grep -q 'OK shell pid [0-9][0-9]*' "$WORK/shell2.log" \
     || { cat "$WORK/shell2.log"; kill "$QPID" 2>/dev/null; fail "second shell: no 'OK shell pid N' (the latch did not clear)"; }
 grep -q 'fxmark-two' "$WORK/shell2.log" \
     || { cat "$WORK/shell2.log"; kill "$QPID" 2>/dev/null; fail "second shell: no 'fxmark-two' echo output"; }

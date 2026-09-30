@@ -37,6 +37,7 @@ const PATH_MAX: usize = 4096;
 
 // Linux errno / fcntl / stdio constants used by the C.
 const EEXIST: c_int = 17;
+const EINVAL: c_int = 22;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ENOEXEC: c_int = 8;
@@ -1651,6 +1652,7 @@ const Statfs = extern struct {
 };
 extern "c" fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
 extern "c" fn pivot_root(new_root: [*:0]const u8, put_old: [*:0]const u8) c_int;
+extern "c" fn chroot(path: [*:0]const u8) c_int;
 extern "c" fn umount2(target: [*:0]const u8, flags: c_int) c_int;
 
 /// The kernel-reported filesystem magic of a path (0 when statfs fails).
@@ -1668,6 +1670,7 @@ fn root_mount_fstype(out: []u8) []const u8 {
     const f = fopen("/proc/mounts", "r") orelse return "";
     defer _ = fclose(f);
     var line: [512]u8 = undefined;
+    var found_len: usize = 0;
     while (fgets(&line, @intCast(line.len), f)) |_| {
         var spec: [128]u8 = undefined;
         var mnt: [128]u8 = undefined;
@@ -1677,11 +1680,18 @@ fn root_mount_fstype(out: []u8) []const u8 {
                 const n = @min(std.mem.sliceTo(&fst, 0).len, out.len - 1);
                 @memcpy(out[0..n], fst[0..n]);
                 out[n] = 0;
-                return out[0..n];
+                found_len = n;
+                // LAST match, not first: after the switch_root fallback
+                // (the pivot_root EINVAL path) /proc/mounts lists BOTH the
+                // detached old rootfs and the live tmpfs as "/" (MEASURED
+                // on 6.12.19); the live root is the later entry.  With a
+                // plain pivot_root there is exactly one "/" entry, and on
+                // the initramfs root exactly one, so "last" behaves
+                // identically to "first" everywhere except the fallback.
             }
         }
     }
-    return "";
+    return out[0..found_len];
 }
 
 /// Mount src on dst by MOVING it (MS_MOVE); fall back to a bind mount so a
@@ -1902,13 +1912,44 @@ fn pivot_root_to_tmpfs() void {
         pivot_undo(pivot_kernel_moves.len, disk_moved, fx_bound);
         return;
     }
+    var switched = false; // 1 = the switch_root fallback ran (not pivot_root)
     if (pivot_root(".", "oldroot") != 0) {
-        errf("fx-init: warning: pivot_root failed: {s} — staying on initramfs root\n", .{errnoStr()});
-        // back to the old root FIRST — the undo's move-back targets
-        // (/proc, /sys, /dev, /fx/disk) are old-root paths.
-        _ = std.c.chdir("/");
-        pivot_undo(pivot_kernel_moves.len, disk_moved, fx_bound);
-        return;
+        // PORTABILITY (MEASURED on vanilla 6.12.19): pivot_root(2) returns
+        // EINVAL when the CURRENT root is the mount-namespace root — which
+        // an initramfs rootfs always is on a mainline kernel (the
+        // `mnt_has_parent(root_mnt)` check; the openSUSE 7.2.7 pin only
+        // pivoted because its rootfs sat under a parent mount).  The
+        // documented self-bind and pivot_root(".",".") dances do NOT lift
+        // this (both measured EINVAL too).  The remedy every initramfs
+        // uses (busybox/util-linux switch_root): MS_MOVE the new root onto
+        // / then chroot(".") — the root MOUNT is replaced namespace-wide,
+        // the same guarantee pivot_root gives, not a process-private
+        // chroot.  Only EINVAL takes this path; any other errno keeps the
+        // original failure handling.
+        const pv_err = std.c._errno().*;
+        // ORDER matters (busybox switch_root): MS_MOVE then chroot(".")
+        // with NO chdir("/") in between — the intermediate chdir lands the
+        // cwd on the OLD root's "/" dentry and the chroot then re-roots at
+        // the initramfs, not the tmpfs (MEASURED: /fx/disk stayed the
+        // ramfs dir; without it, the disk mount and store resolve right).
+        if (pv_err != EINVAL or mount(".", "/", "", MS_MOVE, null) != 0 or chroot(".") != 0) {
+            errf("fx-init: warning: pivot_root failed: {s} — staying on initramfs root\n", .{errnoStr()});
+            // back to the old root FIRST — the undo's move-back targets
+            // (/proc, /sys, /dev, /fx/disk) are old-root paths.
+            _ = std.c.chdir("/");
+            pivot_undo(pivot_kernel_moves.len, disk_moved, fx_bound);
+            return;
+        }
+        switched = true;
+        errf("fx-init: pivot_root EINVAL (initramfs root is the namespace root) — switch_root fallback (MS_MOVE + chroot) applied\n", .{});
+        // The MS_MOVE above replaced the / mount: every mount that was
+        // MOVED into /newroot/* in phase 3 travelled with it and stays
+        // put, but /proc must ALSO be re-listed — measured on 6.12.19 the
+        // moved /proc is unreachable at "/" (ENOENT on /proc/mounts) until
+        // a fresh proc is mounted on the new root's /proc.  A second mount
+        // of an already-mounted fs is a no-op for data; the old one rides
+        // the detached root out of the namespace.
+        _ = mount("proc", "/proc", "proc", 0, null);
     }
     _ = std.c.chdir("/");
 
@@ -1933,9 +1974,13 @@ fn pivot_root_to_tmpfs() void {
     // cannot fail EBUSY the way a plain umount can.  The system is already fully
     // up on the new root, so any failure is a WARNING only — never fatal, never
     // affects the boot or the verdict.  The /oldroot directory entry is left in
-    // place; the binds are untouched.
-    if (umount2("/oldroot", MNT_DETACH) != 0) {
-        errf("fx-init: warning: detach /oldroot failed: {s} (non-fatal — boot continues on new root)\n", .{errnoStr()});
+    // place; the binds are untouched.  (After the switch_root fallback the old
+    // root is ALREADY out of the tree — the MS_MOVE replaced the / mount — so
+    // there is nothing left to detach.)
+    if (!switched) {
+        if (umount2("/oldroot", MNT_DETACH) != 0) {
+            errf("fx-init: warning: detach /oldroot failed: {s} (non-fatal — boot continues on new root)\n", .{errnoStr()});
+        }
     }
 }
 
