@@ -387,6 +387,41 @@ pub fn build(b: *std.Build) void {
     const run_activate_tests = b.addRunArtifact(activate_tests);
     const init_tests = b.addTest(.{ .root_module = init_mod });
     const run_init_tests = b.addRunArtifact(init_tests);
+
+    // ─── fx-image (standalone disk-image builder) ────────────────────────
+    //
+    // Host-side orchestration: provisions a store (qemu_boot.sh's
+    // toolchain-free path), builds the -E initramfs, assembles the raw
+    // image with direct pwrite.  image_check pins the frozen header/MBR
+    // byte offsets stage1 (U3) and stage2 (U4) read.
+    const image_exe = b.addExecutable(.{
+        .name = "fx-image",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/image.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(image_exe);
+    const image_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/image_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "image", .module = b.createModule(.{
+                    .root_source_file = b.path("src/image.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }) },
+            },
+        }),
+    });
+    const run_image_tests = b.addRunArtifact(image_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_cfg_tests.step);
     test_step.dependOn(&run_reloc_tests.step);
@@ -396,6 +431,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_fxctl_tests.step);
     test_step.dependOn(&run_activate_tests.step);
     test_step.dependOn(&run_init_tests.step);
+    test_step.dependOn(&run_image_tests.step);
 }
 
 // Link the Zig-built datalog-dafsa engine .so (sibling ../../datalog-dafsa

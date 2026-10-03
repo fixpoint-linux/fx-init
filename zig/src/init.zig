@@ -1395,7 +1395,17 @@ fn mount_early() void {
 ///                                      the next boot's roll-forward reads.
 const DISK_MOUNT = "/fx/disk";
 const DISK_STORE = "/fx/disk/store";
-const DISK_DEV = "/dev/vda";
+/// The disk device is chosen ADAPTIVELY at ensure_disk_store time (see
+/// pick_disk_dev), never a single constant: the standalone fx-image boots
+/// carry an MBR with the boot region (stage1/FX header/stage2/kernel/
+/// initrd) OUTSIDE partition 1 (CONFIG_MSDOS_PARTITION=y means the guest
+/// kernel sees /dev/vda1), so formatting /dev/vda would run ext4 metadata
+/// over that region and the NEXT boot dies at stage1's stage2-CRC gate
+/// (MEASURED one-shot: SEH6 on boot 2).  The QEMU harness disks are BLANK
+/// (no partition table, no /dev/vda1) and must keep formatting /dev/vda
+/// byte-for-byte as before.
+const DISK_DEV_BASE = "/dev/vda";
+const DISK_DEV_PART = "/dev/vda1";
 const DISK_STORE_DB = DISK_STORE ++ "/.db";
 const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
 const Dirent = extern struct {
@@ -1477,6 +1487,16 @@ fn store_current_of(root: [:0]const u8) u32 {
     return v;
 }
 
+/// The device the disk store formats/mounts: /dev/vda1 when the kernel
+/// parsed an MBR partition (the standalone fx-image layout — the partition
+/// is where the store BELONGS; the boot region lives below LBA 65536
+/// outside it and must never be formatted over), else /dev/vda (the blank
+/// harness disks: no partition table, so vda1 never appears and behavior
+/// is byte-for-byte today's).
+fn pick_disk_dev() [:0]const u8 {
+    return if (std.c.access(DISK_DEV_PART, F_OK) == 0) DISK_DEV_PART else DISK_DEV_BASE;
+}
+
 /// Bring up the persistent disk store (see the block comment above).  Runs
 /// right after mount_early() and before any store handle is opened.
 /// Non-fatal by design (mirrors mount_early): every failure warns on the
@@ -1494,32 +1514,38 @@ fn ensure_disk_store() void {
     // this mount succeeding also separates "initramfs PID1 in the initial
     // user namespace" from every harness path (bwrap/user ns: EPERM).  If a
     // future image ships no baked /dev nodes, mount_early mounts devtmpfs
-    // itself and the `else` branch below takes over cleanly.
+    // itself and the `fresh` distinction below collapses to always-fresh.
+    var fresh = false;
     if (!dev_is_devtmpfs()) {
         if (mount("devtmpfs", "/dev", "devtmpfs", 0, null) != 0) return; // harness / bwrap: inert
-    } else if (std.c.access(DISK_DEV, F_OK) != 0) {
-        return; // /dev already kernel-populated and no virtio disk: host / harness
+        fresh = true;
     }
+    // Pick the device AFTER any devtmpfs mount above: the kernel populates
+    // the mounted /dev and /dev/vda1 appears only there — the image's BAKED
+    // /dev nodes carry no vda1, so picking before the mount would always
+    // see the whole-disk fallback on the very image that has a partition.
+    const dev = pick_disk_dev();
 
     // (the M5 zero-module kernel builds virtio_blk + the ext4 stack =y, so
     // there is nothing to insmod — /dev/vda appears as soon as the device
     // is there; the old insmod walk is gone with the module mechanism)
-    if (std.c.access(DISK_DEV, F_OK) != 0) {
-        errf("fx-init: disk store: no {s} — using ramfs store\n", .{DISK_DEV});
+    if (std.c.access(dev, F_OK) != 0) {
+        if (!fresh) return; // /dev already kernel-populated and no virtio disk: host / harness
+        errf("fx-init: disk store: no {s} — using ramfs store\n", .{dev});
         return;
     }
 
     _ = mkdirp(DISK_MOUNT);
-    if (mount(DISK_DEV, DISK_MOUNT, "ext4", 0, null) != 0) {
+    if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
         // blank disk: the GUEST formats it (the host cannot mkfs/populate
         // the image as uid 1001 — that constraint is this whole design)
-        const mk = run_bb("mkfs.ext2", "-F", DISK_DEV, null);
+        const mk = run_bb("mkfs.ext2", "-F", dev, null);
         if (mk != 0) {
             errf("fx-init: disk: mkfs.ext2 FAILED (exit {d}) — disk store disabled\n", .{mk});
             return;
         }
-        if (mount(DISK_DEV, DISK_MOUNT, "ext4", 0, null) != 0) {
-            errf("fx-init: disk: mount {s} ext4 FAILED: {s} — disk store disabled\n", .{ DISK_DEV, errnoStr() });
+        if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
+            errf("fx-init: disk: mount {s} ext4 FAILED: {s} — disk store disabled\n", .{ dev, errnoStr() });
             return;
         }
     }

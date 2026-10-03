@@ -62,6 +62,27 @@ fn errStr() []const u8 {
     return std.mem.span(strerror(std.c._errno().*));
 }
 
+/// The `generation` fact's epoch column.  Default = the wall clock (the C
+/// oracle's time(null); the diff harness normalizes it, so UNSET must stay
+/// exactly that).  FX_EPOCH overrides it for reproducible builds (fx-image
+/// exports it to every provisioning child), with SOURCE_DATE_EPOCH — the
+/// reproducible-builds convention — as fallback.  A set-but-unparseable
+/// value FAILS rather than silently falling back to the clock: a typo'd
+/// override must not produce a store that only looks reproducible.
+/// Deviation from the 1:1 C mirror (the C read no environment here).
+fn genEpoch() u32 {
+    for ([_][*:0]const u8{ "FX_EPOCH", "SOURCE_DATE_EPOCH" }) |name| {
+        const v = std.c.getenv(name) orelse continue;
+        const s = std.mem.span(v);
+        if (s.len == 0) continue; // set-but-empty behaves as unset
+        return std.fmt.parseInt(u32, s, 10) catch {
+            std.debug.print("fx-activate: {s} is set but not a u32 epoch: \"{s}\"\n", .{ name, s });
+            std.process.exit(1);
+        };
+    }
+    return @truncate(@as(u64, @bitCast(time(null))));
+}
+
 /// fx_err into the Zig ErrBuf, then fail (error value chosen by the caller).
 /// set() RETURNS the error value (config.zig's `return e.set(...)` contract)
 /// — discard it here.
@@ -1176,7 +1197,7 @@ pub fn main(init: std.process.Init) !void {
     const buildfile_rel = snfmtz(&buildfile_rel_buf, "{s}-system-generation/Dhakefile.dhall", .{genhash_s});
 
     // declare + txn: generation facts
-    const now: u32 = @truncate(@as(u64, @bitCast(time(null))));
+    const now: u32 = genEpoch();
     const Decl = struct { rel: [*:0]const u8, arity: u8 };
     const decls = [_]Decl{
         .{ .rel = "generation", .arity = 4 },

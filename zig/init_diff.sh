@@ -52,7 +52,7 @@ INIT_Z=zig/zig-out/bin/fx-init
 FXCTL=zig/zig-out/bin/fxctl
 FAKESVC=zig/zig-out/init_fakesvc
 DHAKE=zig/zig-out/init_dhake
-PATHS=zig/zig-out/activate_paths
+PATHS=zig/zig-out/bin/activate_paths
 ACT_Z=zig/zig-out/bin/fx-activate
 
 mkdir -p "$GOLDEN"

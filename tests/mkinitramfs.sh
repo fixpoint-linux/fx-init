@@ -32,7 +32,7 @@
 # default search path, so libdatalog.so also lives in /lib64 (verified live
 # by the QEMU smoke in tests/qemu_boot.sh).
 #
-# usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE]
+# usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-E]
 #   -k KERNEL is verified present and recorded but NOT packed (the runner,
 #   tests/qemu_boot.sh, owns the kernel + its pin).  Skips loudly (77) when
 #   cpio/gzip/ldd or an input is missing.  -l additionally writes the archive
@@ -47,6 +47,16 @@
 #   of the pivot binds, so the file is readable both pre- and post-pivot).
 #   Without -p the image is byte-identical to before (every existing caller
 #   unchanged).
+#   -E (OPT-IN, default off): REPRODUCIBLE — normalize the archive metadata
+#   so the .cpio.gz is byte-identical across runs given the same inputs:
+#   zeroed mtimes on the staged tree (touch -h, symlinks included — cpio
+#   2.15's --reproducible does NOT touch mtimes, MEASURED), --reproducible
+#   inode renumbering (sort order, not host fs), -R 0:0 (root/root).  The
+#   file SET, modes, symlinks and sizes are unchanged — only metadata.
+#   Without -E the archive is byte-for-byte what this script always emitted
+#   (cpio's host-fs inode numbering + real mtimes; the -l list pins the
+#   set).  Requires cpio --reproducible + touch -h (loud fail otherwise —
+#   never a silent non-deterministic -E image).
 set -u
 
 fail() { echo "mkinitramfs: FAIL: $*" >&2; exit 1; }
@@ -58,6 +68,7 @@ KERNEL=""
 OUT=""
 LIST=""
 PKGSET=""
+REPRO=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -s) [ $# -ge 2 ] || fail "-s needs a value"; STORE=$2; shift 2 ;;
@@ -66,7 +77,8 @@ while [ $# -gt 0 ]; do
         -o) [ $# -ge 2 ] || fail "-o needs a value"; OUT=$2; shift 2 ;;
         -l) [ $# -ge 2 ] || fail "-l needs a value"; LIST=$2; shift 2 ;;
         -p) [ $# -ge 2 ] || fail "-p needs a value"; PKGSET=$2; shift 2 ;;
-        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET])" ;;
+        -E) REPRO=1; shift ;;
+        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET] [-E])" ;;
     esac
 done
 [ -n "$STORE" ]   || fail "-s STORE required"
@@ -92,9 +104,27 @@ FX_DATALOG_LIB="${FX_DATALOG_LIB:-$REPO/../datalog-dafsa/zig-out/lib}"
 
 command -v busybox >/dev/null 2>&1 || skip "busybox not found (guest debug shell)"
 
+# -E needs cpio metadata normalization; probe it, never assume (an
+# unrecognized option would make cpio exit nonzero — archive empty or
+# missing — and only the "empty archive" check would see it).  touch -h is
+# probed on an owned scratch file (busybox touch lacks -h; and the probe
+# must not target /dev/null — utimes on a root-owned node is EPERM).
+REPRO_FLAGS=""
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/mkinitrd.XXXXXX")" || fail mktemp
 trap 'rm -rf "$WORK"' EXIT
 STAGE="$WORK/stage"
+mkdir -p "$STAGE"
+if [ "$REPRO" = 1 ]; then
+    if printf '' | cpio -o -H newc --reproducible -R 0:0 >/dev/null 2>&1; then
+        REPRO_FLAGS="--reproducible -R 0:0"
+    else
+        fail "cpio lacks --reproducible (needed by -E)"
+    fi
+    : > "$STAGE/.touchprobe"
+    touch -h -d @0 "$STAGE/.touchprobe" \
+        || fail "touch lacks -h (needed by -E to zero symlink mtimes)"
+    rm -f "$STAGE/.touchprobe"
+fi
 
 # ─── skeleton: mountpoints + tmp + busybox ────────────────────────────────
 mkdir -p "$STAGE/fx/store" "$STAGE/lib64" "$STAGE/usr/bin" "$STAGE/bin" \
@@ -209,8 +239,21 @@ cpio_rec() {
     cpio_rec TRAILER!!!      0  0  0
 } > "$WORK/dev.cpio"
 
+# ─── -E: zero the staged tree's mtimes (symlinks too) ────────────────────
+# --reproducible renumbers inodes but does NOT normalize mtimes on cpio
+# 2.15 (MEASURED: same bytes, different mtimes -> different archive), so -E
+# stamps epoch 0 on everything before cpio reads it.  -h covers symlinks
+# (cpio stores symlink mtimes too).  Order does not matter: every entry
+# gets the same value regardless of traversal order.
+if [ "$REPRO" = 1 ]; then
+    ( cd "$STAGE" && find . -exec touch -h -d @0 {} + ) \
+        || fail "cannot zero mtimes for the reproducible archive"
+fi
+
 # ─── assemble: early devices ++ the staged tree, gzip'd ───────────────────
-( cd "$STAGE" && find . | LC_ALL=C sort | cpio -o -H newc ) > "$WORK/main.cpio" \
+# With -E the REPRO_FLAGS normalize metadata so equal inputs give equal
+# bytes; without -E the command line is exactly what it always was.
+( cd "$STAGE" && find . | LC_ALL=C sort | cpio -o -H newc $REPRO_FLAGS ) > "$WORK/main.cpio" \
     || fail "cpio archive failed"
 cat "$WORK/dev.cpio" "$WORK/main.cpio" | gzip -9n > "$OUT" || fail "gzip failed"
 [ -s "$OUT" ] || fail "archive is empty"
