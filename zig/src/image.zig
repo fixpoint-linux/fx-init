@@ -873,13 +873,17 @@ fn provision(
     env.put("FX_SIB_DATALOG_LIB", lib_dir) catch fail(ctx, "oom", .{});
     env.put("FX_DATALOG_LIB", lib_dir) catch fail(ctx, "oom", .{}); // mkinitramfs's engine source
 
-    // zig build — gated on the four binaries we need, NOT the aggregate exit
+    // zig build -Doptimize=ReleaseSmall — the payload is seeded into the 32
+    // MiB disk partition (PART1_START_LBA 65536 of a 64 MiB image); Debug
+    // output is ~47 MB (fx-activate 20M + fx-init 13M + fxctl 12M) and cannot
+    // fit, which made init fall back to the ramfs store (no persistence).
+    // Still gated on the four binaries we need, NOT the aggregate exit
     // (log_probe_live can fail on unpopulated submodules; qemu_boot.sh:175)
     note(ctx, "=== fx-image: zig build (in the work-dir buildroot) ===\n", .{});
     {
         const zig_dir = fmt2(alloc, "{s}/zig", .{buildroot});
         const res = std.process.run(alloc, io, .{
-            .argv = &.{ "/bin/sh", "-c", "zig build" },
+            .argv = &.{ "/bin/sh", "-c", "zig build -Doptimize=ReleaseSmall" },
             .cwd = .{ .path = zig_dir },
             .environ_map = env,
         }) catch fail(ctx, "cannot spawn zig build", .{});
