@@ -6,7 +6,8 @@ let Probe = < Tcp : Natural | Unix : Text | File : Text >
 let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
                 restart : Optional Text, backoffMs : Optional Natural,
                 probe : Optional Probe,
-                env : Optional (List { key : Text, value : Text }) }
+                env : Optional (List { key : Text, value : Text }),
+                console : Optional Text }
 let User = { name : Text, uid : Natural, groups : List Text }
 in  { hostname = "fixbox-diff"
     , packages = [ "dhake", "fx-init", "fxctl", "fx-activate", "fakesvc" ]
@@ -18,28 +19,39 @@ in  { hostname = "fixbox-diff"
         [ { name = "heartbeat", argv = [ "fakesvc", "ok" ], pkg = Some "fakesvc",
             on = "all", restart = Some "always", backoffMs = Some 500,
             probe = None Probe,
-            env = None (List { key : Text, value : Text }) }
+            env = None (List { key : Text, value : Text }),
+            console = None Text }
         , { name = "ready", argv = [ "/bin/sh", "-c", "echo hi" ], pkg = None Text,
             on = "sock:tcp:4053", restart = Some "on-failure",
             backoffMs = None Natural, probe = Some (< File = "/run/ready" > : Probe),
-            env = None (List { key : Text, value : Text }) }
+            env = None (List { key : Text, value : Text }),
+            console = None Text }
         , { name = "unixy", argv = [ "fakesvc", "unix" ], pkg = Some "fakesvc",
             on = "sock:unix:/run/x.sock", restart = Some "never",
             backoffMs = Some 250, probe = Some (< Unix = "/run/x.sock" > : Probe),
             env = Some [ { key = "K", value = "V" } ]
-              : Optional (List { key : Text, value : Text }) }
+              : Optional (List { key : Text, value : Text }),
+            console = None Text }
         , { name = "gated", argv = [ "fakesvc", "gated" ], pkg = Some "fakesvc",
             on = "up:heartbeat", restart = Some "on-failure",
             backoffMs = None Natural, probe = None Probe,
-            env = None (List { key : Text, value : Text }) }
+            env = None (List { key : Text, value : Text }),
+            console = None Text }
         , { name = "timed", argv = [ "/bin/true" ], pkg = None Text,
             on = "time:250", restart = Some "never", backoffMs = None Natural,
             probe = None Probe,
-            env = None (List { key : Text, value : Text }) }
+            env = None (List { key : Text, value : Text }),
+            console = None Text }
         , { name = "netty", argv = [ "/bin/true" ], pkg = None Text,
             on = "net", restart = Some "on-failure", backoffMs = None Natural,
             probe = Some (< Tcp = 7 > : Probe),
-            env = None (List { key : Text, value : Text }) }
+            env = None (List { key : Text, value : Text }),
+            console = None Text }
+        , { name = "consh", argv = [ "/usr/fx-core/bin/fxsh" ], pkg = None Text,
+            on = "all", restart = Some "never", backoffMs = None Natural,
+            probe = None Probe,
+            env = None (List { key : Text, value : Text }),
+            console = Some "console" }
         ]
     , extraEtc =
         Some [ { path = "motd", content = "hello from fixbox\n" }

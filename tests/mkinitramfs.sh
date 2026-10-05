@@ -32,7 +32,7 @@
 # default search path, so libdatalog.so also lives in /lib64 (verified live
 # by the QEMU smoke in tests/qemu_boot.sh).
 #
-# usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-E]
+# usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET] [-b BINDIR] [-E]
 #   -k KERNEL is verified present and recorded but NOT packed (the runner,
 #   tests/qemu_boot.sh, owns the kernel + its pin).  Skips loudly (77) when
 #   cpio/gzip/ldd or an input is missing.  -l additionally writes the archive
@@ -47,6 +47,14 @@
 #   of the pivot binds, so the file is readable both pre- and post-pivot).
 #   Without -p the image is byte-identical to before (every existing caller
 #   unchanged).
+#   -b BINDIR (OPTIONAL, default off): copy the fx-core console payload
+#   (fxsh + the fx-* command set) to /usr/fx-core/bin.  /usr is one of the
+#   pivot binds, so the payload is present pre- AND post-pivot; fxsh finds
+#   its commands via its own executable dir (no FX_BIN_DIR needed).  The
+#   staged binaries join the ldd closure walk below (their libs — libc,
+#   libm, ld, libdatalog — are the same /lib64 set the image already
+#   ships).  Without -b the archive is byte-identical to before (the -p
+#   precedent).
 #   -E (OPT-IN, default off): REPRODUCIBLE — normalize the archive metadata
 #   so the .cpio.gz is byte-identical across runs given the same inputs:
 #   zeroed mtimes on the staged tree (touch -h, symlinks included — cpio
@@ -68,6 +76,7 @@ KERNEL=""
 OUT=""
 LIST=""
 PKGSET=""
+BINDIR=""
 REPRO=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -77,8 +86,9 @@ while [ $# -gt 0 ]; do
         -o) [ $# -ge 2 ] || fail "-o needs a value"; OUT=$2; shift 2 ;;
         -l) [ $# -ge 2 ] || fail "-l needs a value"; LIST=$2; shift 2 ;;
         -p) [ $# -ge 2 ] || fail "-p needs a value"; PKGSET=$2; shift 2 ;;
+        -b) [ $# -ge 2 ] || fail "-b needs a value"; BINDIR=$2; shift 2 ;;
         -E) REPRO=1; shift ;;
-        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET] [-E])" ;;
+        *) fail "unknown arg '$1' (usage: mkinitramfs.sh -s STORE -r ROOTDIR -k KERNEL -o OUT.cpio.gz [-l LISTFILE] [-p PKGSET] [-b BINDIR] [-E])" ;;
     esac
 done
 [ -n "$STORE" ]   || fail "-s STORE required"
@@ -151,6 +161,21 @@ done
 cp -a "$STORE"/. "$STAGE/fx/store/" || fail "cannot copy store"
 rm -rf "$STAGE/fx/store/.build" "$STAGE/fx/store/.tmp" 2>/dev/null
 
+# ─── the fx-core console payload (-b; M6) ─────────────────────────────────
+# Copies the whole BINDIR (fxsh + the fx-* set) to /usr/fx-core/bin —
+# sorted copy so the -E touch loop and cpio see a stable set.  The ldd
+# closure walk below picks these binaries up too (they need the same
+# /lib64 set the image already ships: libc, libm, ld, libdatalog).
+if [ -n "$BINDIR" ]; then
+    [ -d "$BINDIR" ] || fail "-b bindir not a directory: $BINDIR"
+    mkdir -p "$STAGE/usr/fx-core/bin" || fail "cannot create /usr/fx-core/bin"
+    for f in $(LC_ALL=C ls "$BINDIR"); do
+        [ -f "$BINDIR/$f" ] || continue # only regular files (no dirs)
+        cp "$BINDIR/$f" "$STAGE/usr/fx-core/bin/$f" || fail "cannot copy $BINDIR/$f"
+        chmod 755 "$STAGE/usr/fx-core/bin/$f"
+    done
+fi
+
 # the store's fx-init dir (guest-absolute target for /bin/init)
 FXINIT_DIR=$( (cd "$STAGE/fx/store" && ls -d ./*-fx-init 2>/dev/null) | head -1 )
 [ -n "$FXINIT_DIR" ] || fail "no *-fx-init dir in the store (activate a generation first)"
@@ -161,11 +186,21 @@ ln -s "/fx/store/${FXINIT_DIR#./}/fx-init" "$STAGE/bin/init"
 # EXECUTE it — the APE sh-preamble binaries); APE/static payloads print "not
 # a dynamic executable" and contribute nothing.
 is_elf() { [ "$(head -c 4 "$1" 2>/dev/null)" = "$(printf '\177ELF')" ]; }
-LIBS=$( { is_elf "$STAGE/usr/bin/busybox" && ldd "$STAGE/usr/bin/busybox"
-          find "$STAGE/fx/store" -type f -perm /111 | while IFS= read -r b; do
-              is_elf "$b" && ldd "$b" 2>/dev/null
-          done
-        } | grep -o '/[^ 	]*\.so[^ 	]*' | sort -u )
+# the -b payload dir joins the walk (the fxsh/fx-* binaries need the same
+# host closure set as the store binaries — verified by the -l list diff)
+if [ -n "$BINDIR" ]; then
+    LIBS=$( { is_elf "$STAGE/usr/bin/busybox" && ldd "$STAGE/usr/bin/busybox"
+              find "$STAGE/fx/store" "$STAGE/usr/fx-core/bin" -type f -perm /111 | while IFS= read -r b; do
+                  is_elf "$b" && ldd "$b" 2>/dev/null
+              done
+            } | grep -o '/[^ 	]*\.so[^ 	]*' | sort -u )
+else
+    LIBS=$( { is_elf "$STAGE/usr/bin/busybox" && ldd "$STAGE/usr/bin/busybox"
+              find "$STAGE/fx/store" -type f -perm /111 | while IFS= read -r b; do
+                  is_elf "$b" && ldd "$b" 2>/dev/null
+              done
+            } | grep -o '/[^ 	]*\.so[^ 	]*' | sort -u )
+fi
 [ -n "$LIBS" ] || fail "ldd closure came back empty (busybox should need at least libc)"
 for l in $LIBS; do
     [ -e "$l" ] || continue

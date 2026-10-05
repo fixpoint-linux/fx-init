@@ -1,9 +1,9 @@
 // activate_facts.zig — unit-5 differential-harness helper (Zig replacement for
 // the C oracle twin zig/activate_facts.c, which is removed with the C engine).
-// Opens a store and dumps the 12 relations fx-activate maintains (the 10 M4
+// Opens a store and dumps the 13 relations fx-activate maintains (the 11 M4
 // relations generation, svc, svc_argv, svc_env, svc_probe, svc_bin, svc_backoff,
-// user, tool_fxstore, boot_grace + the Lens-2 provenance relations install,
-// provides) plus the published snapshot versions + CURRENT, as
+// svc_console, user, tool_fxstore, boot_grace + the Lens-2 provenance relations
+// install, provides) plus the published snapshot versions + CURRENT, as
 // SORTED lines with sym columns resolved via dl_intern_str_of.  Raw-u32 columns
 // (epoch, uid, idx, backoff_ms, grace_ms, mode) print numerically;
 // activate_diff.sh sed-normalizes the generation epoch.
@@ -33,6 +33,7 @@ const rels = [_]RelSpec{
     .{ .rel = "svc_probe", .arity = 3, .sym_mask = 0x7 }, // (name, kind, arg)
     .{ .rel = "svc_bin", .arity = 2, .sym_mask = 0x3 }, // (name, path)
     .{ .rel = "svc_backoff", .arity = 2, .sym_mask = 0x1 }, // (name, backoff_ms-raw)
+    .{ .rel = "svc_console", .arity = 2, .sym_mask = 0x1 }, // (name, console_flag-raw)
     .{ .rel = "user", .arity = 3, .sym_mask = 0x5 }, // (name, uid-raw, groups_csv)
     .{ .rel = "tool_fxstore", .arity = 1, .sym_mask = 0x1 }, // (path)
     .{ .rel = "boot_grace", .arity = 1, .sym_mask = 0x0 }, // (grace_ms-raw)

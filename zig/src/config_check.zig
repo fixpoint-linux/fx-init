@@ -52,6 +52,10 @@ pub fn main(init: std.process.Init) !void {
             try out.print("service[{d}].env[{d}].key={s}\n", .{ i, j, kv.key });
             try out.print("service[{d}].env[{d}].value={s}\n", .{ i, j, kv.value });
         }
+        // M6: the console field rides the dump so config_diff is not blind
+        // to a map_service regression that silently drops it (None prints
+        // '-', like every other Optional above).
+        try out.print("service[{d}].console={s}\n", .{ i, s.console orelse "-" });
     }
     for (cfg.extra_etc, 0..) |f, i| {
         try out.print("etc[{d}].path={s}\n", .{ i, f.path });

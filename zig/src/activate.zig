@@ -704,6 +704,10 @@ pub fn emitBuildfile(
 //        lpstr name | u32be nargv | per-arg lpstr
 //        lpstr pkg (or "" if none) | lpstr on | lpstr restart
 //        lpstr probe_kind | lpstr probe_arg (or "")
+//        lpstr console (or "" if none) — M6 console increment, APPENDED after
+//        probe_arg so the pre-M6 prefix bytes are unchanged in ORDER (the
+//        genhash itself shifts once for every config, which is expected and
+//        rides the activate_diff golden re-pin)
 //   | u32be npaths, then closure store paths sorted (each lpstr)
 
 pub fn serializeGeneration(
@@ -761,6 +765,7 @@ pub fn serializeGeneration(
         };
         try b.lpstr(pk);
         try b.lpstr(s.probe_arg orelse "");
+        try b.lpstr(s.console orelse "");
     }
 
     // closure store paths sorted.  RECORDED STORE-RELATIVE (`<hash>-<name>`,
@@ -1207,6 +1212,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .rel = "svc_probe", .arity = 3 },
         .{ .rel = "svc_bin", .arity = 2 },
         .{ .rel = "svc_backoff", .arity = 2 },
+        .{ .rel = "svc_console", .arity = 2 },
         .{ .rel = "user", .arity = 3 },
         .{ .rel = "tool_fxstore", .arity = 1 },
         .{ .rel = "boot_grace", .arity = 1 },
@@ -1287,6 +1293,13 @@ pub fn main(init: std.process.Init) !void {
         // svc_backoff(name, backoff_ms)
         const cbk = [2]u32{ sn, sv.backoff_ms };
         addFact(db, "svc_backoff", &cbk);
+        // svc_console(name, console_flag) — RAW u32 column (the svc_backoff
+        // convention): 1 = the service attaches to /dev/console instead of
+        // the supervisor pipe.  A fact is written for EVERY service (0 or
+        // 1) so fx-init's per-service query sees an explicit value even
+        // after clearRel wiped the previous activation's set.
+        const cc = [2]u32{ sn, @intFromBool(sv.console != null) };
+        addFact(db, "svc_console", &cc);
         // svc_argv(name, idx, arg)
         for (sv.argv, 0..) |arg, a| {
             const c = [3]u32{ sn, @intCast(a), fx.dl_intern_str(db, dupeZ(arg)) };
@@ -1534,6 +1547,7 @@ test "serialize_generation golden bytes" {
                 .probe_kind = .file,
                 .probe_arg = "/p",
                 .env = &.{},
+                .console = "console",
             },
         },
         .extra_etc = &.{},
@@ -1566,6 +1580,7 @@ test "serialize_generation golden bytes" {
     try exp.u32be(7); // backoff_ms
     try exp.lpstr("file");
     try exp.lpstr("/p");
+    try exp.lpstr("console");
     try exp.u32be(2); // npaths — sorted: "11-aa" < "44-bb"
     try exp.lpstr("11-aa");
     try exp.lpstr("44-bb");

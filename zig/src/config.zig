@@ -96,6 +96,12 @@ pub const FxService = struct {
     probe_kind: FxProbeKind,
     probe_arg: ?[]const u8,
     env: []const FxEnv,
+    // M6 console increment: None (null) = the default pipe stdio; Some
+    // "console" = attach the service to /dev/console (init.zig's
+    // start_service opens it onto the child's 0/1/2 instead of the pipe).
+    // The TEXT is kept (not a bool) so the schema stays open for later
+    // device names; today only "console" is accepted.
+    console: ?[]const u8,
 };
 
 pub const FxUser = struct {
@@ -436,6 +442,7 @@ fn map_service(svc: *FxService, rec: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!
         .probe_kind = .none,
         .probe_arg = null,
         .env = &.{},
+        .console = null,
     };
 
     svc.name = try need_text(rec, "name", "service", e);
@@ -489,6 +496,16 @@ fn map_service(svc: *FxService, rec: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!
 
     const env_t = rec_get(rec, "env");
     if (env_t) |et| try map_env(svc, et, where, e);
+
+    // console: Optional Text — None (default) = pipe stdio; only "console"
+    // (i.e. /dev/console) is accepted today.  Anything else is an ERROR,
+    // not a silent pass-through: a typo'd device name would otherwise boot
+    // a service with closed-ish pipe stdio and no hint why.
+    if (try opt_text(rec, "console", e, where)) |con| {
+        if (!std.mem.eql(u8, con, "console"))
+            return e.set("{s}: console '{s}' not in {{console}}", .{ where, con });
+        svc.console = con;
+    }
 }
 
 // ─── User record walker ─────────────────────────────────────────────────────
@@ -812,6 +829,69 @@ test "clean_etc_path rules (config.c:339-343)" {
     // semantics — the C rejects it too).
     e = .{};
     try testing.expectError(error.FxConfig, clean_etc_path("a..b", &e));
+}
+
+test "console field: Some \"console\" parses, other values rejected, None default" {
+    // a load-based test needs a FILE (fx_config_load reads from disk) —
+    // write the fixture into a testing-owned temp dir.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const body =
+        \\let Probe = < Tcp : Natural | Unix : Text | File : Text >
+        \\let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
+        \\                restart : Optional Text, backoffMs : Optional Natural,
+        \\                probe : Optional Probe,
+        \\                env : Optional (List { key : Text, value : Text }),
+        \\                console : Optional Text }
+        \\let User = { name : Text, uid : Natural, groups : List Text }
+        \\in  { hostname = "fixbox"
+        \\    , packages = [ "dhake" ] : List Text
+        \\    , users = [ { name = "root", uid = 0, groups = [] : List Text } ]
+        \\    , services =
+        \\        [ { name = "sh", argv = [ "/usr/fx-core/bin/fxsh" ], pkg = None Text,
+        \\            on = "all", restart = Some "never", backoffMs = None Natural,
+        \\            probe = None Probe,
+        \\            env = None (List { key : Text, value : Text }),
+        \\            console = Some "console" }
+        \\        , { name = "plain", argv = [ "/bin/true" ], pkg = None Text,
+        \\            on = "all", restart = None Text, backoffMs = None Natural,
+        \\            probe = None Probe,
+        \\            env = None (List { key : Text, value : Text }),
+        \\            console = None Text }
+        \\        ]
+        \\    , extraEtc = None (List { path : Text, content : Text })
+        \\    , bootGraceMs = Some 3000
+        \\    }
+        \\
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.dhall", .data = body });
+    const ok_path = try std.fmt.allocPrint(gpa_alloc, ".zig-cache/tmp/{s}/ok.dhall", .{tmp.sub_path});
+    defer gpa_alloc.free(ok_path);
+    var e = ErrBuf{};
+    var cfg: FxConfig = undefined;
+    try fx_config_load(&cfg, ok_path, &e);
+    try testing.expectEqual(@as(usize, 2), cfg.services.len);
+    try testing.expectEqualStrings("sh", cfg.services[0].name);
+    try testing.expectEqualStrings("console", cfg.services[0].console.?);
+    try testing.expectEqualStrings("plain", cfg.services[1].name);
+    try testing.expect(cfg.services[1].console == null); // None = default pipe
+
+    // a non-"console" value is an ERROR, not a silent pass-through
+    var bad = std.ArrayList(u8).empty;
+    defer bad.deinit(gpa_alloc);
+    bad.appendSlice(gpa_alloc, body) catch return error.SkipZigTest;
+    // replace `Some "console"` with `Some "tty7777"` — SAME LENGTH, so the
+    // splice cannot shift the rest of the document
+    const idx = std.mem.indexOf(u8, bad.items, "Some \"console\"") orelse return error.SkipZigTest;
+    @memcpy(bad.items[idx .. idx + "Some \"tty7777\"".len], "Some \"tty7777\"");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad.dhall", .data = bad.items });
+    const bad_path = try std.fmt.allocPrint(gpa_alloc, ".zig-cache/tmp/{s}/bad.dhall", .{tmp.sub_path});
+    defer gpa_alloc.free(bad_path);
+    e = .{};
+    var cfg2: FxConfig = undefined;
+    try testing.expectError(error.FxConfig, fx_config_load(&cfg2, bad_path, &e));
+    try testing.expect(std.mem.indexOf(u8, e.slice(), "console 'tty7777'") != null);
 }
 
 /// The exact extraEtc path predicate from map_extra_etc (config.c:339-343),

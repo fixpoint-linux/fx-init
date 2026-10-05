@@ -88,6 +88,10 @@ const Svc = struct {
     backoff_ms: u32 = 0,
     probe_kind: FxProbeKind = .none,
     probe_arg: [256]u8 = [_]u8{0} ** 256,
+    // M6 console increment: svc_console fact flag — 1 = start_service skips
+    // the supervisor pipe and opens /dev/console onto the child's 0/1/2
+    // (the fxsh serial-console service).  0 = the pipe, as before.
+    console: c_int = 0,
     pid: c_int = 0,
     state: c_int = ST_PENDING,
     restarts: c_int = 0,
@@ -935,6 +939,15 @@ fn backoff_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+const ConsoleCtx = struct { v: c_int = 0, got: c_int = 0 };
+fn console_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = ar;
+    const k: *ConsoleCtx = @ptrCast(@alignCast(user.?));
+    k.v = @intCast(c[1]);
+    k.got = 1;
+    return 0;
+}
+
 const GraceCtx = struct { v: u32 = 0, got: c_int = 0 };
 fn grace_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = ar;
@@ -1016,6 +1029,10 @@ fn read_store_facts(version: u32) c_int {
         var bkc = BkCtx{};
         _ = dl_query_bound_version(db, version, "svc_backoff", @ptrCast(&sn), 1, backoff_cb, &bkc);
         sv.backoff_ms = if (bkc.got != 0) bkc.v else 1000;
+
+        var ccl = ConsoleCtx{};
+        _ = dl_query_bound_version(db, version, "svc_console", @ptrCast(&sn), 1, console_cb, &ccl);
+        sv.console = if (ccl.got != 0) ccl.v else 0;
 
         var ec = EnvCtx{ .db = db };
         _ = dl_query_bound_version(db, version, "svc_env", @ptrCast(&sn), 1, svc_env_cb, &ec);
@@ -1228,27 +1245,70 @@ fn probe_ready(sv: *Svc) c_int {
 }
 
 fn start_service(sv: *Svc) void {
+    // M6 console increment: a console service takes /dev/console as its
+    // 0/1/2 INSTEAD of the supervisor pipe (the fxsh serial shell).  No
+    // pipe() at all — out_fd stays -1, so the poll/drain paths skip it
+    // naturally (their `out_fd >= 0` guards) and reap_children's close is
+    // a no-op.  PID1 keeps its own /dev/console fds 0-2 (mount_early): the
+    // shell shares the tty by design — after boot-ok PID1 writes nothing
+    // except on shutdown, and the boot verdict (fd 2) may interleave with
+    // the shell's output on the same console.
+    const want_console = sv.console != 0;
     var outpipe: [2]c_int = .{ -1, -1 };
-    if (std.c.pipe(&outpipe) != 0) {
-        log_line(@ptrCast(&sv.name), "error", "pipe failed");
-        return;
+    if (!want_console) {
+        if (std.c.pipe(&outpipe) != 0) {
+            log_line(@ptrCast(&sv.name), "error", "pipe failed");
+            return;
+        }
     }
     const pid = std.c.fork();
     if (pid < 0) {
-        _ = std.c.close(outpipe[0]);
-        _ = std.c.close(outpipe[1]);
+        if (!want_console) {
+            _ = std.c.close(outpipe[0]);
+            _ = std.c.close(outpipe[1]);
+        }
         log_line(@ptrCast(&sv.name), "error", "fork failed");
         return;
     }
     if (pid == 0) {
-        _ = std.c.close(outpipe[0]);
-        _ = std.c.dup2(outpipe[1], 1);
-        _ = std.c.dup2(outpipe[1], 2);
-        _ = std.c.close(outpipe[1]);
+        if (want_console) {
+            // the console child: open the device FRESH (O_RDWR) and dup it
+            // onto 0/1/2.  setsid() below detaches from PID1's session so
+            // the shell runs in its own session on the shared tty (the
+            // same shape as the M4 control-channel shell precedent; no
+            // TIOCSCTTY claim — two sessions on one tty is legal and the
+            // kernel line discipline stays canonical, which is exactly
+            // what fxsh's read(2)-per-line REPL wants).
+            const cfd = open("/dev/console", O_RDWR, 0);
+            if (cfd < 0) {
+                _ = std.c.write(2, "fx-init: console service: cannot open /dev/console\n", "fx-init: console service: cannot open /dev/console\n".len);
+                std.c._exit(127);
+            }
+            _ = std.c.dup2(cfd, 0);
+            _ = std.c.dup2(cfd, 1);
+            _ = std.c.dup2(cfd, 2);
+            if (cfd > 2) _ = std.c.close(cfd);
+        } else {
+            _ = std.c.close(outpipe[0]);
+            _ = std.c.dup2(outpipe[1], 1);
+            _ = std.c.dup2(outpipe[1], 2);
+            _ = std.c.close(outpipe[1]);
+        }
         _ = std.c.setsid();
         _ = setenv("FX_SVC_NAME", @ptrCast(&sv.name), 1);
         _ = setenv("FX_RUN_DIR", @ptrCast(&g_run), 1);
         _ = setenv("PATH", "/bin", 1);
+        if (want_console) {
+            // the serial shell's environment: a sane PATH that includes
+            // the fx-core staging dir, the caslog state dir (resolveStateDir
+            // reads $FX_STATE_DIR first; /run is writable tmpfs post-pivot),
+            // and a inert-TERM (fxsh emits no ANSI; keeps any /bin/sh
+            // fallback sane).  Config env (svc_env facts) overrides these
+            // below — setenv(..., 1) order gives the config the last word.
+            _ = setenv("PATH", "/usr/fx-core/bin:/bin:/usr/bin", 1);
+            _ = setenv("FX_STATE_DIR", "/run/fx/shell", 1);
+            _ = setenv("TERM", "dumb", 1);
+        }
         var i: c_int = 0;
         while (i < sv.nenv) : (i += 1) {
             _ = setenv(sv.env_k.?[@intCast(i)].?, sv.env_v.?[@intCast(i)].?, 1);
@@ -1258,12 +1318,14 @@ fn start_service(sv: *Svc) void {
         _ = std.c.write(2, "fx-init: exec failed\n", "fx-init: exec failed\n".len);
         std.c._exit(127);
     }
-    _ = std.c.close(outpipe[1]);
+    if (!want_console) _ = std.c.close(outpipe[1]);
     sv.pid = pid;
     sv.state = ST_STARTED;
     sv.started_at = time(null);
-    sv.out_fd = outpipe[0];
-    _ = std.c.fcntl(sv.out_fd, F_SETFL, std.c.fcntl(sv.out_fd, F_GETFL) | O_NONBLOCK);
+    sv.out_fd = if (want_console) -1 else outpipe[0];
+    if (!want_console) {
+        _ = std.c.fcntl(sv.out_fd, F_SETFL, std.c.fcntl(sv.out_fd, F_GETFL) | O_NONBLOCK);
+    }
     rt_txn_begin();
     rt_set_service(sv);
     _ = rt_txn_commit();
@@ -2076,7 +2138,17 @@ fn reap_children() void {
         }
         _ = rt_txn_commit();
 
-        if (g_boot_decided == 0 and !was_explicit_stop) {
+        // A CONSOLE service's exit during grace does NOT fail the boot: an
+        // interactive shell exiting is the service doing its job, not a
+        // boot failure — and pinning ('failed') into the disk store's
+        // .bootlog here would make decide_boot_version treat the CURRENT
+        // generation as stale on the NEXT boot and roll it back to an
+        // older ok generation (the user would lose the current generation
+        // by typing 'exit' too fast).  A console service that fails to
+        // SPAWN/EXEC still fails the boot honestly: that exit carries
+        // exit status 127 and lands in ST_FAILED below, which the
+        // any_failed arm of boot_decision reports on its own.
+        if (g_boot_decided == 0 and !was_explicit_stop and s.console == 0) {
             rt_txn_begin();
             rt_set_boot(g_current_version, "failed");
             _ = rt_txn_commit();
@@ -3693,6 +3765,22 @@ test "boot_decision state machine (START-ONLY grace rule)" {
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(boot_decision(false, &.{s_failed}, false)));
     // already decided -> none
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(boot_decision(true, &.{s_failed}, true)));
+}
+
+test "console service: ST_STARTED like any other (boot_decision ignores the console flag)" {
+    // the M6 console shell is 'started' the moment it spawns (probe=none ->
+    // ready instantly), so a live console service must not hold the boot
+    // verdict back.  Its exit during grace does NOT fail the boot either
+    // (reap_children skips the exit latch for console services — an
+    // interactive shell exiting is the service doing its job, and pinning
+    // 'failed' would roll the generation back on the next boot); a clean
+    // exit leaves it ST_STOPPED, which boot_decision counts as ok.
+    const s_console = Svc{ .state = ST_STARTED, .console = 1 };
+    const s_console_stopped = Svc{ .state = ST_STOPPED, .console = 1 };
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(boot_decision(false, &.{s_console}, true)));
+    // started + exited-cleanly (a user typed `exit`) -> still a clean ok
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(boot_decision(false, &.{ s_console_stopped }, true)));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(boot_decision(false, &.{ s_console, s_console_stopped }, true)));
 }
 
 test "next_timeout arithmetic" {

@@ -304,7 +304,8 @@ const usage_text: []const u8 =
     \\                      ${TMPDIR:-/tmp}/fx-image-work).  The store root
     \\                      is a derivation-hash input, so the SAME work dir
     \\                      is part of the reproducibility contract; DIR/
-    \\                      buildroot (the zig build cache) is kept across
+    \\                      buildroot and DIR/buildroot-fxcore (the zig
+    \\                      build caches) are kept across
     \\                      runs so repeat builds are warm — the two-run
     \\                      byte-identity contract holds on a PERSISTENT
     \\                      work dir, not across rm -rf'd ones.  A concurrent
@@ -683,14 +684,42 @@ const FREEZE_FIND =
     "-not -name \"*.o\" -not -name \"*.a\" -not -name \"*.so\" -not -name \"*.com\" " ++
     "-not -name \"dl-test-*\" -not -name \".ape-*\" -print0";
 
+/// fx-core's freeze: FREEZE_FIND plus the fx-core-shaped cache/output
+/// exclusions.  MEASURED on the live tree: without these the freeze copies
+/// 46270 files / 9.4GB (the root-level .zig-cache alone is 9.0GB, and
+/// vendor/mfe-framework/node_modules is another 27MB of vendored JS the
+/// zig build never reads); with them it is ~530 files / ~11MB (src,
+/// build.zig, build.zig.zon, schemas, shell, vendor/dhake).
+const FREEZE_FIND_FXCORE =
+    "find . -not -path \"./.git/*\" -not -name \".git\" " ++
+    "-not -path \"./build-tmp/*\" -not -name \"build-tmp\" " ++
+    "-not -path \"./zig-out/*\" -not -name \"zig-out\" " ++
+    "-not -path \"./.zig-cache/*\" -not -name \".zig-cache\" " ++
+    "-not -path \"./node_modules/*\" -not -name \"node_modules\" " ++
+    "-not -path \"./vendor/mfe-framework/*\" -not -name \"mfe-framework\" " ++
+    "-not -path \"./elm-stuff/*\" -not -name \"elm-stuff\" " ++
+    "-not -path \"./dist/*\" -not -name \"dist\" " ++
+    "-not -path \"./site/*\" -not -name \"site\" " ++
+    "-not -name \"*.o\" -not -name \"*.a\" -not -name \"*.so\" -not -name \"*.com\" " ++
+    "-not -name \"dl-test-*\" -not -name \".ape-*\" -print0";
+
 fn freezeSrc(alloc: std.mem.Allocator, io: std.Io, ctx: *const BuildCtx, src: []const u8, dst: []const u8) void {
+    freezeSrcFind(alloc, io, ctx, src, dst, FREEZE_FIND);
+}
+
+/// freezeSrc with an explicit find(1) expression — fx-core needs EXTRA
+/// exclusions (FREEZE_FIND's cache/out exclusions are the fx-init-shaped
+/// ./zig/.zig-cache paths; fx-core keeps its zig cache + a 27MB vendored
+/// node_modules at OTHER paths, and freezing those would copy ~9GB into
+/// the work dir).
+fn freezeSrcFind(alloc: std.mem.Allocator, io: std.Io, ctx: *const BuildCtx, src: []const u8, dst: []const u8, find_expr: []const u8) void {
     if (!isDir(io, src))
         fail(ctx, "freeze_src: source tree not found: {s}", .{src});
     const script = std.fmt.allocPrint(alloc,
         \\set -e
         \\mkdir -p {s}
         \\cd {s} && {s} | cpio -pdm0 {s} >/dev/null 2>&1
-    , .{ dst, src, FREEZE_FIND, dst }) catch fail(ctx, "oom", .{});
+    , .{ dst, src, find_expr, dst }) catch fail(ctx, "oom", .{});
     _ = runShell(alloc, io, ctx, null, ".", "freeze_src", script);
 }
 
@@ -862,6 +891,85 @@ fn provision(
         const p = std.fmt.allocPrint(alloc, "{s}/{s}", .{ zb, b }) catch fail(ctx, "oom", .{});
         if (!isFile(io, p))
             fail(ctx, "zig build did not produce zig-out/bin/{s}", .{b});
+    }
+
+    // ─── the fx-core console payload (M6) ─────────────────────────────────
+    // fxsh + the fx-* set stage at /usr/fx-core/bin in the guest (one of
+    // the pivot binds, so it survives the disk-arm pivot; fxsh resolves its
+    // command binaries via its OWN executable dir, no env needed).  NOT an
+    // m3 package: the image lane builds it from the frozen tree, work-
+    // rooted, exactly like buildroot above — every absolute path the
+    // linker bakes is a function of (content, work dir) only.
+    //
+    //   {work}/{dhall-c,fxstore,datalog-dafsa}  the FROZEN sibling trees,
+    //       laid out as buildroot-fxcore's DIRECT ../ siblings so
+    //       fx-core/build.zig's hardcoded b.path("../dhall-c/..."),
+    //       b.path("../datalog-dafsa") and the ../fxstore/zig module roots
+    //       resolve (MEASURED in a /tmp probe: the ReleaseSmall build needs
+    //       exactly src + build.zig + build.zig.zon + those three siblings;
+    //       datalog needs the PRE-BUILT libdatalog.so at the sibling root,
+    //       the same file {work}/lib stages)
+    //   {work}/buildroot-fxcore  a PERSISTENT rsync-refreshed copy of the
+    //       frozen fx-core (the buildroot mechanism verbatim: its zig cache
+    //       surviving makeWork's wipe is what makes run-2 a warm no-op, and
+    //       warm builds ARE the two-run byte-identical contract)
+    const buildroot_fxcore = fmt2(alloc, "{s}/buildroot-fxcore", .{std.fs.path.dirname(frozen) orelse frozen});
+    note(ctx, "=== fx-image: fx-core build (work-rooted buildroot-fxcore) ===\n", .{});
+    {
+        // sibling layout: cp -a the frozen trees to {work}/<name> (they are
+        // pristine — makeWork wiped everything but the buildroots, then
+        // freezeSrc re-copied them fresh).  The frozen datalog-dafsa has NO
+        // libdatalog.so (every freeze excludes *.so), but fx-core's
+        // addLibraryPath("../datalog-dafsa") needs it at the sibling root
+        // at link time — stage the SAME file {work}/lib already holds (the
+        // live checkout's engine .so, copied once above).
+        // The rsync is the buildroot refresh verbatim: --checksum decides
+        // by CONTENT so unchanged files keep their mtimes (run-2 is a warm
+        // no-op), --delete removes every stale source file, and ONLY the
+        // zig caches are protected — zig-out is deliberately NOT (it is
+        // the stale-target guard; `zig build` reinstalls the binaries
+        // byte-exact from the warm cache).
+        const work_root = std.fs.path.dirname(frozen) orelse frozen;
+        const script = fmt2(
+            alloc,
+            "cp -a {s}/siblings/dhall-c {s}/siblings/fxstore {s}/siblings/datalog-dafsa {s}/ && " ++
+                "cp {s}/libdatalog.so {s}/datalog-dafsa/libdatalog.so && " ++
+                "rsync -a --delete --checksum --filter='protect .zig-cache/***' --filter='protect .zig-global/***' {s}/siblings/fx-core/ {s}",
+            .{ frozen, frozen, frozen, work_root, lib_dir, work_root, frozen, buildroot_fxcore },
+        );
+        _ = runShell(alloc, io, ctx, null, ".", "fx-core layout + refresh", script);
+    }
+    {
+        // ZIG_GLOBAL_CACHE_DIR is buildroot-local (the m3 recipes' exact
+        // convention, package-set.dhall:159) so no other zig on this host
+        // interleaves state into the image's cache.  The default `zig
+        // build` step is INSTALL-only in fx-core (tests hang off the
+        // separate `test` step, build.zig:144), so no --summary games.
+        const cmdline = fmt2(
+            alloc,
+            "ZIG_GLOBAL_CACHE_DIR={s}/.zig-global zig build -Doptimize=ReleaseSmall",
+            .{buildroot_fxcore},
+        );
+        const res = std.process.run(alloc, io, .{
+            .argv = &.{ "/bin/sh", "-c", cmdline },
+            .cwd = .{ .path = buildroot_fxcore },
+            .environ_map = env,
+        }) catch fail(ctx, "cannot spawn fx-core zig build", .{});
+        alloc.free(res.stdout);
+        alloc.free(res.stderr);
+    }
+    // gate on the console payload we need (the image.zig:861 shape: gate
+    // on the ARTIFACTS, not the aggregate exit — a usage-test failure in
+    // an unrelated target must not burn the image)
+    const fxbin = fmt2(alloc, "{s}/zig-out/bin", .{buildroot_fxcore});
+    for ([_][]const u8{
+        "fxsh",   "fx-echo", "fx-cat",  "fx-head", "fx-tail", "fx-ls",
+        "fx-grep", "fx-find", "fx-sort", "fx-uniq", "fx-wc",  "fx-du",
+        "fx-what", "fx-why",
+    }) |b| {
+        const p = std.fmt.allocPrint(alloc, "{s}/{s}", .{ fxbin, b }) catch fail(ctx, "oom", .{});
+        if (!isFile(io, p))
+            fail(ctx, "fx-core build did not produce zig-out/bin/{s}", .{b});
     }
 
     // the prebuilt sibling inputs (same checks as the harness)
@@ -1144,6 +1252,11 @@ fn buildImage(gpa: std.mem.Allocator, io: std.Io, ctx: *const BuildCtx, cur_envi
     freezeSrc(alloc, io, ctx, fmt2(alloc, "{s}/dhall-c", .{sibs}), fmt2(alloc, "{s}/siblings/dhall-c", .{frozen}));
     freezeSrc(alloc, io, ctx, fmt2(alloc, "{s}/fxstore", .{sibs}), fmt2(alloc, "{s}/siblings/fxstore", .{frozen}));
     freezeSrc(alloc, io, ctx, repo, fmt2(alloc, "{s}/fx-init", .{frozen}));
+    // the 5th freeze: fx-core (the M6 console payload's source).  Its own
+    // find: the fx-core tree keeps a 9GB zig cache at ROOT .zig-cache and a
+    // vendored node_modules under vendor/mfe-framework — FREEZE_FIND's
+    // fx-init-shaped exclusions would copy all of it.
+    freezeSrcFind(alloc, io, ctx, fmt2(alloc, "{s}/fx-core", .{sibs}), fmt2(alloc, "{s}/siblings/fx-core", .{frozen}), FREEZE_FIND_FXCORE);
 
     // ─── provision + activate ───────────────────────────────────────────
     const pkgset_frozen = provision(alloc, io, ctx, &env, repo, sibs, frozen, store);
@@ -1151,13 +1264,16 @@ fn buildImage(gpa: std.mem.Allocator, io: std.Io, ctx: *const BuildCtx, cur_envi
     note(ctx, "=== fx-image: activated version {d} (rdinit /fx/store/{s}/fx-init) ===\n", .{ act.version, act.fxinit_dirname });
 
     // ─── the initramfs (mkinitramfs -E = deterministic; U1's contract) ──
-    note(ctx, "=== fx-image: building initramfs (mkinitramfs -E) ===\n", .{});
+    // -b stages the fx-core console payload at /usr/fx-core/bin (the M6
+    // console service's argv[0] lives there; flag-off callers — every
+    // existing harness — get the byte-identical archive of before).
+    note(ctx, "=== fx-image: building initramfs (mkinitramfs -E -b fx-core) ===\n", .{});
     const initrd = fmt2(alloc, "{s}/initrd.cpio.gz", .{work});
     {
         const script = fmt2(
             alloc,
-            "sh {s}/tests/mkinitramfs.sh -E -s {s} -r {s} -k {s} -o {s}",
-            .{ repo, store, root, kern.path, initrd },
+            "sh {s}/tests/mkinitramfs.sh -E -b {s}/buildroot-fxcore/zig-out/bin -s {s} -r {s} -k {s} -o {s}",
+            .{ repo, work, store, root, kern.path, initrd },
         );
         _ = runShell(alloc, io, ctx, &env, repo, "mkinitramfs", script);
     }
@@ -1338,7 +1454,7 @@ fn makeWork(alloc: std.mem.Allocator, io: std.Io, ctx: *const BuildCtx, env: *st
         // scoped to the work dir's immediate children (never a wider walk);
         // mkdir -p because a CLEAN work dir does not exist yet (the old
         // rm -rf tolerated that too)
-        const script = fmt2(alloc, "mkdir -p {s} && find {s} -mindepth 1 -maxdepth 1 ! -name buildroot -exec rm -rf -- {{}} +", .{ work, work });
+        const script = fmt2(alloc, "mkdir -p {s} && find {s} -mindepth 1 -maxdepth 1 ! -name buildroot ! -name buildroot-fxcore -exec rm -rf -- {{}} +", .{ work, work });
         _ = runShell(alloc, io, ctx, null, ".", "clear work dir", script);
     }
     for ([_][]const u8{ "store", "root/run/fx", "root/etc", "root/bin", "root/tmp", "frozen/siblings" }) |sub| {
@@ -1436,12 +1552,12 @@ fn cleanupScratch(alloc: std.mem.Allocator, io: std.Io, env: *std.process.Enviro
     releaseWorkLock(io);
     const keep = envGet(env, "FX_KEEP");
     if (keep != null and !std.mem.eql(u8, keep.?, "0")) return;
-    // Same selective wipe as makeWork: buildroot SURVIVES the run too (its
-    // zig cache is what makes the NEXT run warm — cold zig builds are not
-    // bit-reproducible on this host, MEASURED; see provision's note).
-    // FX_KEEP=1 keeps the whole tree as before.
-    // a child rm (deleteTree over the whole tree can hit open fds)
-    const script = fmt2(alloc, "find {s} -mindepth 1 -maxdepth 1 ! -name buildroot -exec rm -rf -- {{}} +", .{work});
+    // Same selective wipe as makeWork: buildroot AND buildroot-fxcore
+    // SURVIVE the run too (their zig caches are what makes the NEXT run
+    // warm — cold zig builds are not bit-reproducible on this host,
+    // MEASURED; see provision's note).  FX_KEEP=1 keeps the whole tree as
+    // before.  a child rm (deleteTree over the whole tree can hit open fds)
+    const script = fmt2(alloc, "find {s} -mindepth 1 -maxdepth 1 ! -name buildroot ! -name buildroot-fxcore -exec rm -rf -- {{}} +", .{work});
     const res = std.process.run(alloc, io, .{
         .argv = &.{ "/bin/sh", "-c", script },
     }) catch return;

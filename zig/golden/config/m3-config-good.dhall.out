@@ -16,4 +16,5 @@ service[0].restart=FX_RESTART_ALWAYS
 service[0].backoff_ms=500
 service[0].probe_kind=FX_PROBE_NONE
 service[0].probe_arg=-
+service[0].console=-
 grace_ms=5000
