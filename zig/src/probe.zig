@@ -31,28 +31,19 @@ extern fn dl_txn_rollback(db: *dl_db) c_int;
 
 // ─── libc externs (std.posix gaps; glibc/Linux) ───────────────────────────
 
+const fxstat = @import("fxstat"); // target-correct stat ABI (see fxstat.zig)
+
 const DIR = std.c.DIR;
 const dirent = std.c.dirent; // { ino, off, reclen, type, name[256] }
 extern fn opendir(path: [*:0]const u8) ?*DIR;
 extern fn readdir(dir: *DIR) ?*dirent;
 extern fn closedir(dir: *DIR) c_int;
 
-/// glibc `struct statvfs` (fsblkcnt_t/fsfilcnt_t are u64 on LP64).
-const StatVfs = extern struct {
-    f_bsize: c_ulong,
-    f_frsize: c_ulong,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: c_ulong,
-    f_flag: c_ulong,
-    f_namemax: c_ulong,
-    __f_spare: [6]c_uint,
-};
-extern fn statvfs(path: [*:0]const u8, buf: *StatVfs) c_int;
+// struct statvfs / struct stat and the statvfs/stat symbols are owned by
+// fxstat.zig: it is target-correct (MEASURED per-target layouts, not the LP64
+// shape this file used to hardcode) and binds the i386 time64 entry point.
+const StatVfs = fxstat.StatVfs;
+const statvfs = fxstat.statvfs;
 
 /// glibc `struct utsname` (_UTSNAME_LENGTH = 65).
 const Utsname = extern struct {
@@ -65,27 +56,10 @@ const Utsname = extern struct {
 };
 extern fn uname(buf: *Utsname) c_int;
 
-const Timespec = extern struct { sec: i64, nsec: i64 };
-
-/// glibc `struct stat` (x86-64/aarch64 LP64).  st_mtime == st_mtim.sec.
-const Stat = extern struct {
-    st_dev: u64,
-    st_ino: u64,
-    st_nlink: u64,
-    st_mode: u32,
-    st_uid: u32,
-    st_gid: u32,
-    __pad0: c_int,
-    st_rdev: u64,
-    st_size: i64,
-    st_blksize: i64,
-    st_blocks: i64,
-    st_atim: Timespec,
-    st_mtim: Timespec,
-    st_ctim: Timespec,
-    __unused: [3]i64,
-};
-extern fn stat(path: [*:0]const u8, buf: *Stat) c_int;
+// struct stat + the stat symbol live in fxstat.zig (target-correct layout and
+// the i386 time64 entry point) — see the note on StatVfs above.
+const Stat = fxstat.Stat;
+const stat = fxstat.stat;
 
 /// Linux _SC_PAGESIZE (= 30 on every Linux ABI zig targets).
 const _SC_PAGESIZE: c_int = 30;
@@ -222,7 +196,10 @@ fn probe_process(db: *dl_db, root: ?[*:0]const u8) void {
     defer _ = closedir(d);
     var pgkb = @divTrunc(sysconf(_SC_PAGESIZE), 1024);
     if (pgkb <= 0) pgkb = 4;
-    const pgkb32: u32 = @truncate(@as(u64, @bitCast(pgkb)));
+    // pgkb is c_long — 32-bit on i386 — so a @bitCast to u64 is a size
+    // mismatch there.  It is positive after the guard above; widen it, don't
+    // reinterpret its width.
+    const pgkb32: u32 = @intCast(pgkb);
     while (readdir(d)) |e| {
         const name: [*:0]const u8 = @ptrCast(&e.name);
         if (!is_pid_dir(name)) continue;

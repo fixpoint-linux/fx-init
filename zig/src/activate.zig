@@ -30,6 +30,7 @@
 const std = @import("std");
 const cfg_mod = @import("config");
 const fx = @import("fxstore");
+const fxstat = @import("fxstat"); // target-correct time ABI (see fxstat.zig)
 
 const FxConfig = cfg_mod.FxConfig;
 const FxService = cfg_mod.FxService;
@@ -53,7 +54,7 @@ const gpa_alloc = std.heap.c_allocator;
 // libc scratch (log.zig pattern).
 extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 extern "c" fn getpid() c_int;
-extern "c" fn time(t: ?*i64) i64;
+const time = fxstat.time; // time64-bound on i386 (see fxstat.zig)
 
 const EEXIST: c_int = 17; // Linux
 const PATH_MAX: usize = 4096;

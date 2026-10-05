@@ -22,6 +22,7 @@ const probe_mod = @import("probe");
 const reloc_mod = @import("reloc");
 const sup = @import("supervise");
 const fx = @import("fxstore");
+const fxstat = @import("fxstat"); // target-correct stat/statfs/time ABI (see fxstat.zig)
 
 const gpa_alloc = std.heap.c_allocator;
 
@@ -42,6 +43,7 @@ const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ENOEXEC: c_int = 8;
 const ENOENT: c_int = 2;
+const ENOSYS: c_int = 38;
 const EISDIR: c_int = 21;
 const EPERM: c_int = 1;
 const F_GETFL: c_int = 3;
@@ -134,6 +136,17 @@ var g_boot_start_ms: u64 = 0;
 var g_boot_deadline_ms: u64 = 0;
 var g_next_probe: i64 = 0;
 var g_ctrl_fd: c_int = -1;
+// WHY setup_ctrl() failed, for the one startup line that reports the control
+// plane's state.  A bare "control socket failed" on every boot hid both the
+// reason and the consequence: the pinned kernel is a make-tinyconfig build
+// (.kernel-cache/kernel/config: "# CONFIG_NET is not set"), and with CONFIG_NET
+// off the kernel stubs the whole socket layer, so socket(2) returns ENOSYS
+// (MEASURED in the v86 guest: "socket failed: Function not implemented") on
+// EVERY guest boot — the QEMU image lane boots the same pinned vmlinuz, so the
+// same call fails there; only a HOST-kernel harness (fxinit_boot.sh,
+// fxinit_pid1.sh) gets a socket.  Empty step = the last attempt succeeded.
+var g_ctrl_fail: struct { step: [*:0]const u8 = "", errno: c_int = 0 } = .{};
+
 // M4 virtio-serial control channel (tests/qemu_ctrl.sh): the guest end of a
 // qemu virtserialport.  Inert everywhere else — the gate in
 // setup_virtio_ctrl needs BOTH pid1 AND a /dev/vport*p* node, which only a
@@ -372,7 +385,9 @@ fn exec_sh_retry(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int 
     sh[n] = null;
     return execv("/bin/sh", @ptrCast(&sh));
 }
-extern "c" fn time(t: ?*i64) i64;
+// time / clock_gettime / nanosleep are bound by fxstat.zig (the i386
+// time64 entry points); see that file.
+const time = fxstat.time;
 extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
 extern "c" fn bind(fd: c_int, addr: *const anyopaque, len: c_uint) c_int;
 extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
@@ -440,7 +455,11 @@ fn ospan(p: ?[*:0]const u8) []const u8 {
 }
 
 fn errnoStr() []const u8 {
-    return std.mem.span(strerror(std.c._errno().*));
+    return errnoStrOf(std.c._errno().*);
+}
+/// strerror for an errno captured EARLIER (a later libc call may move errno).
+fn errnoStrOf(e: c_int) []const u8 {
+    return std.mem.span(strerror(e));
 }
 fn errf(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
@@ -480,8 +499,8 @@ fn now_s() u32 {
 }
 
 fn now_ms() u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) {
+    var ts: fxstat.Timespec = undefined;
+    if (fxstat.clock_gettime(fxstat.CLOCK_MONOTONIC, &ts) != 0) {
         return @as(u64, @bitCast(time(null))) *% 1000;
     }
     return @as(u64, @intCast(ts.sec)) *% 1000 +% @as(u64, @intCast(ts.nsec)) / 1_000_000;
@@ -1688,22 +1707,12 @@ const pivot_binds = [_][2][:0]const u8{
     .{ "/usr",   "/newroot/usr" },
 };
 
-/// glibc's struct statfs (x86_64) — only f_type is read.
-const Statfs = extern struct {
-    f_type: i64,
-    f_bsize: i64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_fsid: [2]i32,
-    f_namelen: i64,
-    f_frsize: i64,
-    f_flags: i64,
-    f_spare: [4]i64,
-};
-extern "c" fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
+/// struct statfs + the statfs symbol are owned by fxstat.zig: the x86_64 shape
+/// above was read as an i64 f_type, but on i386 musl f_type is a 32-bit long
+/// at @0 and the struct is 84 bytes — reading an i64 there yields
+/// f_type | (f_bsize << 32), so the TMPFS_MAGIC comparison silently failed.
+const Statfs = fxstat.Statfs;
+const statfs = fxstat.statfs;
 extern "c" fn pivot_root(new_root: [*:0]const u8, put_old: [*:0]const u8) c_int;
 extern "c" fn chroot(path: [*:0]const u8) c_int;
 extern "c" fn umount2(target: [*:0]const u8, flags: c_int) c_int;
@@ -1901,6 +1910,20 @@ fn pivot_root_to_tmpfs() void {
             return;
         }
     }
+    // /tmp is NOT in `dirs`: it takes mode 1777, not 755 (the image builder's
+    // `chmod 1777`, tests/mkinitramfs.sh), and it is created HERE, on the
+    // tmpfs — the tmpfs root REPLACES the initramfs layer whose /tmp the
+    // builder made, so without this line the booted root has no /tmp at all.
+    // Every fx-core stage mkdtemps a HARDCODED /tmp/<name> template
+    // (fx-ls/fx-grep/fx-sort/fx-wc/fx-du/fx-tree/fx-find/fx-top/fx-ps), so
+    // the whole command set fails with a bare Mkdtemp — MEASURED in the
+    // guest: `ls /bin` -> `error: Mkdtemp`.  chmod rather than trusting
+    // mkdir's mode: the umask masks it.
+    if (std.c.mkdir("/newroot/tmp", 0o1777) != 0 and std.c._errno().* != EEXIST) {
+        errf("fx-init: warning: pivot: mkdir {s} failed: {s} — staying on initramfs root\n", .{ "/newroot/tmp", errnoStr() });
+        return;
+    }
+    _ = std.c.chmod("/newroot/tmp", 0o1777);
 
     // ── phase 2: reversible mounts ONTO the new root ──────────────────────
     // From here a failure leaves a bind ON the tmpfs — detached by the undo;
@@ -2892,23 +2915,36 @@ fn setup_ctrl() c_int {
     _ = snfmt(&sp, "{s}/control.sock", .{span(@ptrCast(&g_run))});
     _ = std.c.unlink(@ptrCast(&sp));
     const fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) return ctrlFail("socket", std.c._errno().*);
     var a = std.mem.zeroes(SockaddrUn);
     a.family = AF_UNIX;
     var pl: usize = strlen(@ptrCast(&sp));
     if (pl >= a.path.len) pl = a.path.len - 1;
     @memcpy(a.path[0..pl], sp[0..pl]);
     a.path[pl] = 0;
+    // The errno is captured at the FAILING CALL, before close(2): a successful
+    // close is free to clobber errno, and this string is the only diagnostic a
+    // user gets for a control plane that never came up.
     if (bind(fd, @ptrCast(&a), @sizeOf(SockaddrUn)) < 0) {
+        const e = std.c._errno().*;
         _ = std.c.close(fd);
-        return -1;
+        return ctrlFail("bind", e);
     }
     if (listen(fd, 8) < 0) {
+        const e = std.c._errno().*;
         _ = std.c.close(fd);
-        return -1;
+        return ctrlFail("listen", e);
     }
     _ = std.c.fcntl(fd, F_SETFL, std.c.fcntl(fd, F_GETFL) | O_NONBLOCK);
     return fd;
+}
+
+/// Record the failing step + the errno ITS FAILING CALL returned (the caller
+/// captures it there — never re-read after a close) and report failure to
+/// setup_ctrl's caller.
+fn ctrlFail(step: [*:0]const u8, errno_val: c_int) c_int {
+    g_ctrl_fail = .{ .step = step, .errno = errno_val };
+    return -1;
 }
 
 fn handle_conn(cfd: c_int) void {
@@ -3169,8 +3205,8 @@ fn do_shutdown() void {
             }
         }
         if (alive != 0) {
-            const ts = std.c.timespec{ .sec = 0, .nsec = 100 * 1000 * 1000 };
-            _ = std.c.nanosleep(&ts, null);
+            const ts = fxstat.Timespec{ .sec = 0, .nsec = 100 * 1000 * 1000 };
+            _ = fxstat.nanosleep(&ts, null);
         }
     }
     i = 0;
@@ -3613,9 +3649,41 @@ pub fn main(init: std.process.Init) !void {
     }
 
     g_ctrl_fd = setup_ctrl();
-    if (g_ctrl_fd < 0) errf("fx-init: warning: control socket failed\n", .{});
     setup_virtio_ctrl();
     setup_virtio_log();
+    // An unavailable UNIX control socket is worth ONE truthful line, not a
+    // bare "failed" every boot: setup_ctrl records the failing step + errno
+    // (g_ctrl_fail), and the virtio channel is brought up BELOW but ABOVE
+    // this report so the line can say what the control plane actually has.
+    // The two cases are genuinely different: with a virtio port up
+    // (tests/qemu_ctrl.sh) the protocol is carried and the socket is a
+    // local/namespace convenience; with neither, in-guest fxctl has NO channel
+    // and that is the fact a console reader needs.  setup_ctrl still runs
+    // first and the virtio setup is still unconditional and unchanged, so the
+    // virtio-path assertion ("fx-init: virtio control up (...)") is untouched.
+    if (g_ctrl_fd < 0) {
+        var sp: [1100]u8 = undefined;
+        _ = snfmt(&sp, "{s}/control.sock", .{span(@ptrCast(&g_run))});
+        const why: []const u8 = if (g_ctrl_fail.errno != 0)
+            errnoStrOf(g_ctrl_fail.errno)
+        else
+            "?";
+        // ENOSYS from socket(2) is STRUCTURAL, not transient: a kernel built
+        // without CONFIG_NET stubs the whole socket layer, so no family —
+        // AF_UNIX included — can be created here however the run dir looks.
+        // MEASURED in the v86 guest: "socket failed: Function not implemented"
+        // on the pinned vmlinuz, whose own config says "# CONFIG_NET is not
+        // set" (.kernel-cache/kernel/config:790).
+        const hint: []const u8 = if (g_ctrl_fail.errno == ENOSYS)
+            " — this kernel has no socket layer: CONFIG_NET is not set"
+        else
+            "";
+        if (g_vio_fd >= 0) {
+            errf("fx-init: no UNIX control socket ({s}: {s} failed: {s}{s}) — the virtio control port carries the protocol\n", .{ span(@ptrCast(&sp)), g_ctrl_fail.step, why, hint });
+        } else {
+            errf("fx-init: warning: no control channel: {s} ({s} failed: {s}{s}) and no virtio control port — fxctl cannot connect in this guest\n", .{ span(@ptrCast(&sp)), g_ctrl_fail.step, why, hint });
+        }
+    }
 
     log_line("fx-init", "info", "entered main loop");
     main_loop();

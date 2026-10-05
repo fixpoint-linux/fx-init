@@ -24,12 +24,61 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -----------------------------------------------------------------------
+    // libdatalog linkage (the still-Zig datalog core, C-FFI).
+    //
+    // NATIVE/gnu builds: EXACTLY as before — linkSystemLibrary("datalog")
+    // against the sibling ../../datalog-dafsa/zig-out/lib/libdatalog.so (the
+    // prebuilt glibc shared object) + the baked rpath.
+    //
+    // MUSL builds: a glibc-built .so cannot serve an i386-musl link (ld.lld:
+    // "libdatalog.so is incompatible with elf_i386") and a dynamic link would
+    // defeat the static goal, so we instead link a STATIC libdatalog.a BUILT
+    // IN THIS BUILD GRAPH from the sibling's Zig sources
+    // (datalog-dafsa/zig/src/hybrid.zig + the vendored dafsa engine) for the
+    // SAME target.  In-graph rather than a prebuilt path because the artifact
+    // must be target-coupled to whatever -Dtarget the user passes.  Same
+    // pattern as fx-core/build.zig and fxstore/build.zig.
+    // -----------------------------------------------------------------------
+    const datalog_mod = b.createModule(.{
+        .root_source_file = b.path("../../datalog-dafsa/zig/src/hybrid.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dafsa_abi", .module = b.createModule(.{
+                .root_source_file = b.path("../../datalog-dafsa/vendor/dafsa/zig/src/abi.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) },
+        },
+    });
+    const is_musl = target.result.abi.isMusl();
+    // Created unconditionally (as in fx-core/fxstore): an unreferenced step is
+    // never compiled, so the native build is untouched.
+    const datalog_lib = b.addLibrary(.{
+        .name = "datalog",
+        .linkage = .static,
+        .root_module = datalog_mod,
+    });
+    datalog_lib.root_module.addIncludePath(b.path("../../datalog-dafsa/src"));
+    datalog_lib.root_module.addIncludePath(b.path("../../datalog-dafsa/vendor/dafsa"));
+
     const dhall_mod = b.createModule(.{
         .root_source_file = sib(b, "FX_SIB_DHALL_C", "../../dhall-c")
             .join(b.allocator, "zig/src/dhall_mod.zig") catch @panic("OOM"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+    });
+
+    // fxstat: the ONE target-correct C-ABI stat/timespec surface (its layout
+    // is MEASURED per target and pinned by a comptime guard — see fxstat.zig).
+    const fxstat_mod = b.createModule(.{
+        .root_source_file = b.path("src/fxstat.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     // config: the FxConfig types + walker + load pipeline (port of src/config.c).
@@ -140,12 +189,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    linkDatalog(b, log_test_mod);
+    linkDatalog(b, log_test_mod, is_musl, datalog_lib);
     const probe_mod = b.createModule(.{
         .root_source_file = b.path("src/probe.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "fxstat", .module = fxstat_mod },
+        },
     });
     const probe_obj = b.addObject(.{ .name = "probe_port", .root_module = probe_mod });
     const probe_test_mod = b.createModule(.{
@@ -153,8 +205,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "fxstat", .module = fxstat_mod },
+        },
     });
-    linkDatalog(b, probe_test_mod);
+    linkDatalog(b, probe_test_mod, is_musl, datalog_lib);
 
     // log_probe_live: the one-process regression driver (C), linking the
     // Zig port objects and libdatalog.so.  (It used to link the C originals
@@ -175,7 +230,7 @@ pub fn build(b: *std.Build) void {
     });
     live_mod.addObject(log_obj);
     live_mod.addObject(probe_obj);
-    linkDatalog(b, live_mod);
+    linkDatalog(b, live_mod, is_musl, datalog_lib);
     const live = b.addExecutable(.{ .name = "log_probe_live", .root_module = live_mod });
     b.installArtifact(live);
 
@@ -253,7 +308,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     // closure unit tests open LIVE dbs (the dedicated-test-module pattern).
-    linkDatalog(b, closure_mod);
+    linkDatalog(b, closure_mod, is_musl, datalog_lib);
     const build_mod = b.createModule(.{
         .root_source_file = sib(b, "FX_SIB_FXSTORE", "../../fxstore")
             .join(b.allocator, "zig/src/build.zig") catch @panic("OOM"),
@@ -277,7 +332,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build", .module = build_mod },
         },
     });
-    linkDatalog(b, store_mod);
+    linkDatalog(b, store_mod, is_musl, datalog_lib);
 
     // fxstore: the facade re-exporting the surface activate.zig + init.zig
     // use, with one consistent DlDb opaque type across the port.
@@ -306,9 +361,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "config", .module = config_mod },
             .{ .name = "fxstore", .module = fxstore_mod },
+            .{ .name = "fxstat", .module = fxstat_mod },
         },
     });
-    linkDatalog(b, activate_mod);
+    linkDatalog(b, activate_mod, is_musl, datalog_lib);
     const activate_exe = b.addExecutable(.{ .name = "fx-activate", .root_module = activate_mod });
     b.installArtifact(activate_exe);
 
@@ -329,7 +385,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    linkDatalog(b, paths_exe.root_module);
+    linkDatalog(b, paths_exe.root_module, is_musl, datalog_lib);
     b.installArtifact(paths_exe);
     const facts_exe = b.addExecutable(.{
         .name = "activate_facts",
@@ -343,7 +399,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    linkDatalog(b, facts_exe.root_module);
+    linkDatalog(b, facts_exe.root_module, is_musl, datalog_lib);
     b.installArtifact(facts_exe);
 
     // ─── UNIT 6: fx-init (PID1/supervisor) ───────────────────────────────
@@ -363,9 +419,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "reloc", .module = reloc_mod },
             .{ .name = "supervise", .module = supervise_mod },
             .{ .name = "fxstore", .module = fxstore_mod },
+            .{ .name = "fxstat", .module = fxstat_mod },
         },
     });
-    linkDatalog(b, init_mod);
+    linkDatalog(b, init_mod, is_musl, datalog_lib);
     const init_exe = b.addExecutable(.{ .name = "fx-init", .root_module = init_mod });
     b.installArtifact(init_exe);
 
@@ -434,15 +491,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_image_tests.step);
 }
 
-// Link the Zig-built datalog-dafsa engine .so (sibling ../../datalog-dafsa
-// checkout, since the build root is zig/) into `m`.  The library path and the
-// baked rpath are both the .so's absolute directory, so linked binaries/tests
-// resolve it at runtime from any cwd.
-fn linkDatalog(b: *std.Build, m: *std.Build.Module) void {
-    m.linkSystemLibrary("datalog", .{});
-    // FX_SIB_DATALOG_LIB points at the dir HOLDING libdatalog.so (the m3
-    // fixture's dep store output), not the checkout root.
-    const dl_lib = sib(b, "FX_SIB_DATALOG_LIB", "../../datalog-dafsa/zig-out/lib");
-    m.addLibraryPath(dl_lib);
-    m.addRPath(dl_lib);
+// Link the datalog-dafsa engine into `m`.  Native/gnu: the Zig-built
+// libdatalog.so from the sibling ../../datalog-dafsa checkout (build root is
+// zig/), with the library path and the baked rpath both the .so's absolute
+// directory, so linked binaries/tests resolve it at runtime from any cwd
+// (unchanged).  Musl: the in-graph STATIC libdatalog (i386 has no glibc .so,
+// and a dynamic link would defeat the static goal).
+fn linkDatalog(b: *std.Build, m: *std.Build.Module, is_musl: bool, datalog_lib: *std.Build.Step.Compile) void {
+    if (is_musl) {
+        m.linkLibrary(datalog_lib);
+    } else {
+        m.linkSystemLibrary("datalog", .{});
+        // FX_SIB_DATALOG_LIB points at the dir HOLDING libdatalog.so (the m3
+        // fixture's dep store output), not the checkout root.
+        const dl_lib = sib(b, "FX_SIB_DATALOG_LIB", "../../datalog-dafsa/zig-out/lib");
+        m.addLibraryPath(dl_lib);
+        m.addRPath(dl_lib);
+    }
 }
