@@ -41,6 +41,25 @@
 // usage() is deliberately NOT extended: its bytes are pinned by the
 // fxctl_diff.sh goldens (zig/golden/fxctl-live) and the fixture oracle
 // zig/fxctl_dump.c, neither of which this change may touch.
+//
+// Fifo mode (the in-guest transport; this port's addition): a bare `--fifo`
+// flag anywhere in argv, or a non-empty FX_FIFO env, opens the fifo PAIR
+// PID1 maintains in the run dir — <FX_RUN|/run/fx>/control.in (client ->
+// PID1, O_WRONLY|O_NONBLOCK) and control.out (PID1 -> client,
+// O_RDONLY|O_NONBLOCK) — INSTEAD of the control socket.  A dedicated
+// transport is REQUIRED, not a redundant alias: the chardev path opens ONE
+// fd O_RDWR and uses it for BOTH directions — pointed at a fifo it delivers
+// the request but the response dead-ends (nobody writes the request fifo
+// back) and the client times out; and ONE bidirectional fifo is a read race
+// (the client and PID1 both eligible readers of the same pipe buffer — the
+// client can consume its own request).  The pair is SINGLE-CLIENT BY
+// CONVENTION, NOT ENFORCEMENT (a second concurrent client can steal reply
+// lines off the shared control.out — garbled reads, never supervisor
+// corruption).  A request is capped at LINE_MAX_REQ-1=4095 chars + '\n' =
+// 4096 = PIPE_BUF exactly, so EACH write(2) is atomic; but the body and the
+// newline are TWO syscalls, so two CONCURRENT clients can tear a request
+// between them — PID1 answers "ERR unknown command", never a wedge.
+// Paths derive from FX_RUN (sockPath's rule); there is NO path operand.
 const std = @import("std");
 
 pub const LINE_MAX_REQ: usize = 4096;
@@ -76,7 +95,19 @@ extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 // because PollSource only calls it after poll(2) reports data (and the one
 // consumer of a non-socket fd needs no socket timeouts).
 const O_RDWR: c_int = 2;
+// the fifo pair's open flags (Linux/x86_64 values, init.zig's pins):
+// control.in O_WRONLY|O_NONBLOCK (a fifo write-open with no reader fails
+// ENXIO IMMEDIATELY — never a hanging open), control.out O_RDONLY|
+// O_NONBLOCK (a blocking O_RDONLY would hang in the window where PID1 died
+// between the two opens; the poll-gated reads below want no blocking).
+const O_WRONLY: c_int = 1;
+const O_RDONLY: c_int = 0;
+const O_NONBLOCK: c_int = 0x800;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+// test-only fixture creator: the CLIENT never creates fifos (PID1 owns the
+// pair) — the unit tests below mkfifo their fixtures with the same libc
+// call init.zig uses.
+extern "c" fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
 
 fn errno() c_int {
     return __errno_location().*;
@@ -218,6 +249,86 @@ pub fn openChardev(path: []const u8) c_int {
     if (fd >= 0) return fd;
     if (errno() != ENXIO) return -1;
     return connectSock(path);
+}
+
+/// Fifo transport selection (the in-guest pair; see the header comment): a
+/// bare `--fifo` flag (a leading-`--` token, so it is stripped from the
+/// request line) or a non-empty FX_FIFO env picks the pair; false keeps the
+/// chardev/socket paths.  NO operand exists to miss — the pair's paths
+/// derive from FX_RUN, unlike --chardev's device path.
+pub fn fifoSelected(argv: []const []const u8, fx_fifo: ?[]const u8) bool {
+    for (argv) |a| {
+        if (std.mem.eql(u8, a, "--fifo")) return true;
+    }
+    if (fx_fifo) |v| {
+        if (v.len > 0) return true;
+    }
+    return false;
+}
+
+/// <FX_RUN|/run/fx><suffix> — sockPath's FX_RUN join (non-empty env wins,
+/// snprintf-truncated), shared by the pair's two paths.
+fn runJoin(buf: []u8, fx_run: ?[]const u8, suffix: []const u8) []const u8 {
+    var run: []const u8 = "/run/fx";
+    if (fx_run) |r| {
+        if (r.len > 0) run = r;
+    }
+    var off: usize = 0;
+    for (run) |ch| {
+        if (off < buf.len - 1) {
+            buf[off] = ch;
+            off += 1;
+        }
+    }
+    for (suffix) |ch| {
+        if (off < buf.len - 1) {
+            buf[off] = ch;
+            off += 1;
+        }
+    }
+    return buf[0..off];
+}
+
+/// The request side of the in-guest pair: <FX_RUN|/run/fx>/control.in.
+pub fn fifoInPath(buf: []u8, fx_run: ?[]const u8) []const u8 {
+    return runJoin(buf, fx_run, "/control.in");
+}
+
+/// The reply side: <FX_RUN|/run/fx>/control.out.
+pub fn fifoOutPath(buf: []u8, fx_run: ?[]const u8) []const u8 {
+    return runJoin(buf, fx_run, "/control.out");
+}
+
+/// An opened fifo pair: wfd = control.in (requests), rfd = control.out
+/// (responses).  -1 fields on failure, errno left set for main's message
+/// (the connectSock contract).
+pub const FifoPair = struct { wfd: c_int = -1, rfd: c_int = -1 };
+
+/// Open the in-guest pair for one client session: control.in
+/// O_WRONLY|O_NONBLOCK — PID1's permanently-parked O_RDWR read side is the
+/// reader, so "PID1 not running" is a clean ENXIO/ENOENT, never a hanging
+/// open — then control.out O_RDONLY|O_NONBLOCK.  On the second open's
+/// failure the errno is PRESERVED across the cleanup close (the caller
+/// reads it immediately).
+pub fn openFifoPair(in_path: []const u8, out_path: []const u8) FifoPair {
+    var ibuf: [512]u8 = undefined;
+    var obuf: [512]u8 = undefined;
+    const in_n = @min(in_path.len, ibuf.len - 1);
+    @memcpy(ibuf[0..in_n], in_path[0..in_n]);
+    ibuf[in_n] = 0;
+    const out_n = @min(out_path.len, obuf.len - 1);
+    @memcpy(obuf[0..out_n], out_path[0..out_n]);
+    obuf[out_n] = 0;
+    const wfd = open(ibuf[0..in_n :0].ptr, O_WRONLY | O_NONBLOCK);
+    if (wfd < 0) return .{};
+    const rfd = open(obuf[0..out_n :0].ptr, O_RDONLY | O_NONBLOCK);
+    if (rfd < 0) {
+        const e = errno();
+        _ = close(wfd);
+        __errno_location().* = e;
+        return .{ .wfd = wfd, .rfd = -1 };
+    }
+    return .{ .wfd = wfd, .rfd = rfd };
 }
 
 /// The read(2) source for readResponse over a plain (non-socket) chardev
@@ -383,19 +494,22 @@ pub fn main(init: std.process.Init) !void {
 
     // chardev mode: --chardev PATH / --chardev=PATH / FX_CHARDEV selects the
     // bidirectional virtio chardev transport instead of the control socket.
-    // The flag pair is STRIPPED from argv before requestLine so the request
-    // line is byte-identical to the socket path's (the guest grammar is the
-    // socket's); usage()/rc 2 still fire first when there is no subcommand.
+    // fifo mode: bare --fifo / FX_FIFO selects the in-guest fifo PAIR (see
+    // the header comment).  Both flag forms are STRIPPED from argv before
+    // requestLine so the request line is byte-identical to the socket path's
+    // (the guest grammar is the socket's); usage()/rc 2 still fire first
+    // when there is no subcommand.
     const chardev = chardevPath(args[1..], env("FX_CHARDEV"));
+    const fifo = fifoSelected(args[1..], env("FX_FIFO"));
     var argv_req: []const []const u8 = args[1..];
-    if (chardev != null) {
+    if (chardev != null or fifo) {
         const al = init.arena.allocator();
         const compact = try al.alloc([]const u8, args.len - 1);
         var keep: usize = 0;
         var skip_next = false;
         for (args[1..]) |a| {
             if (skip_next) {
-                skip_next = false; // the bare flag's PATH operand
+                skip_next = false; // the bare --chardev flag's PATH operand
                 continue;
             }
             if (std.mem.eql(u8, a, "--chardev")) {
@@ -403,6 +517,7 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             }
             if (a.len > 10 and std.mem.eql(u8, a[0..10], "--chardev=")) continue;
+            if (std.mem.eql(u8, a, "--fifo")) continue; // bare flag, no operand
             compact[keep] = a;
             keep += 1;
         }
@@ -411,6 +526,10 @@ pub fn main(init: std.process.Init) !void {
     const line = requestLine(&req, argv_req);
 
     var fd: c_int = -1;
+    // the fifo reply fd, -1 unless the fifo transport engaged (the request
+    // fd is `fd` itself — the shared sendLine/close tail below needs no
+    // branching for it).
+    var fifo_rfd: c_int = -1;
     if (chardev) |cp| {
         fd = openChardev(cp);
         if (fd < 0) {
@@ -422,6 +541,29 @@ pub fn main(init: std.process.Init) !void {
             }
             std.process.exit(1);
         }
+    } else if (fifo) {
+        var ibuf: [512]u8 = undefined;
+        var obuf: [512]u8 = undefined;
+        const ipath = fifoInPath(&ibuf, env("FX_RUN"));
+        const opath = fifoOutPath(&obuf, env("FX_RUN"));
+        const pair = openFifoPair(ipath, opath);
+        if (pair.wfd < 0 or pair.rfd < 0) {
+            const e = errno(); // preserved by openFifoPair across its close
+            // the request-side open failed: ENOENT (no fifo — PID1 never
+            // created it) and ENXIO (a fifo exists but no reader — PID1 is
+            // gone) are both "not running", like the socket arm's
+            // ENOENT/ECONNREFUSED pair.
+            if (pair.wfd < 0 and (e == ENOENT or e == ENXIO)) {
+                std.debug.print("fxctl: fx-init not running ({s})\n", .{ipath});
+            } else if (pair.wfd < 0) {
+                std.debug.print("fxctl: open {s}: {s}\n", .{ ipath, std.mem.span(strerror(e)) });
+            } else {
+                std.debug.print("fxctl: open {s}: {s}\n", .{ opath, std.mem.span(strerror(e)) });
+            }
+            std.process.exit(1);
+        }
+        fd = pair.wfd;
+        fifo_rfd = pair.rfd;
     } else {
         var pbuf: [512]u8 = undefined;
         const path = sockPath(&pbuf, env("FX_SOCKET"), env("FX_RUN"));
@@ -447,23 +589,30 @@ pub fn main(init: std.process.Init) !void {
     if (!sendLine(fd, line)) {
         const e = errno();
         std.debug.print("fxctl: send failed: {s}\n", .{std.mem.span(strerror(e))});
+        if (fifo_rfd >= 0) _ = close(fifo_rfd);
         _ = close(fd);
         std.process.exit(1);
     }
     // The read source mirrors the transport: the socket's SO_RCVTIMEO does
-    // the timing; a plain chardev fd has no such option, so PollSource
-    // gates each read with poll(2) under the same 5s budget.
+    // the timing; a plain chardev or fifo fd has no such option, so
+    // PollSource gates each read with poll(2) under the same 5s budget.
+    // The fifo's source is the REPLY fd (control.out), never the request fd.
     const rc = if (chardev != null) blk: {
         var src = PollSource{ .fd = fd };
+        break :blk readResponse(&src, out);
+    } else if (fifo) blk: {
+        var src = PollSource{ .fd = fifo_rfd };
         break :blk readResponse(&src, out);
     } else blk: {
         var src = FdSource{ .fd = fd };
         break :blk readResponse(&src, out);
     };
-    // NO half-close on the chardev path: the fd closes only HERE, after the
-    // responses (MEASURED: an earlier write-side shutdown makes qemu tear
-    // the chardev down before the guest's response write).  The socket path
-    // is the C's fclose(fdopen(fd)) on every exit — same point.
+    // NO half-close on the chardev/fifo paths: the fd closes only HERE,
+    // after the responses (MEASURED on the chardev: an earlier write-side
+    // shutdown makes qemu tear the chardev down before the guest's response
+    // write).  The socket path is the C's fclose(fdopen(fd)) on every exit
+    // — same point.
+    if (fifo_rfd >= 0) _ = close(fifo_rfd);
     _ = close(fd);
     out.flush() catch {};
     if (rc < 0) {
@@ -548,6 +697,95 @@ test "chardevPath: --chardev flag / = form / FX_CHARDEV precedence" {
     // empty = form selects nothing itself; the env still applies
     try std.testing.expectEqualStrings("/dev/env", chardevPath(&.{"--chardev="}, "/dev/env").?);
     try std.testing.expect(chardevPath(&.{"--chardev="}, null) == null);
+}
+
+test "fifoSelected: --fifo flag / FX_FIFO env" {
+    // no flag, no env (or empty env) -> not fifo mode
+    try std.testing.expect(!fifoSelected(&.{"status"}, null));
+    try std.testing.expect(!fifoSelected(&.{"status"}, ""));
+    // non-empty env engages (the value is ignored — paths derive from FX_RUN)
+    try std.testing.expect(fifoSelected(&.{"status"}, "1"));
+    try std.testing.expect(fifoSelected(&.{"status"}, "/irrelevant"));
+    // the bare flag engages anywhere in argv
+    try std.testing.expect(fifoSelected(&.{ "--fifo", "q", "generation_current" }, null));
+    try std.testing.expect(fifoSelected(&.{ "q", "--fifo", "generation_current" }, null));
+    // a trailing bare flag STILL selects (unlike --chardev: no operand exists)
+    try std.testing.expect(fifoSelected(&.{"--fifo"}, null));
+    // lookalikes are NOT the flag
+    try std.testing.expect(!fifoSelected(&.{"--fifox"}, null));
+    try std.testing.expect(!fifoSelected(&.{"--fifo=/run/fx"}, null)); // no operand form
+    try std.testing.expect(!fifoSelected(&.{"-fifo"}, null));
+    try std.testing.expect(!fifoSelected(&.{"fifo"}, null));
+}
+
+test "fifoInPath/fifoOutPath: FX_RUN derivation + truncation (sockPath's rule)" {
+    var ib: [512]u8 = undefined;
+    var ob: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("/run/fx/control.in", fifoInPath(&ib, null));
+    try std.testing.expectEqualStrings("/run/fx/control.out", fifoOutPath(&ob, null));
+    // empty FX_RUN falls back to the default
+    try std.testing.expectEqualStrings("/run/fx/control.in", fifoInPath(&ib, ""));
+    try std.testing.expectEqualStrings("/run/fx/control.out", fifoOutPath(&ob, ""));
+    // non-empty FX_RUN wins
+    try std.testing.expectEqualStrings("/custom/control.in", fifoInPath(&ib, "/custom"));
+    try std.testing.expectEqualStrings("/custom/control.out", fifoOutPath(&ob, "/custom"));
+    // snprintf truncation: 600-char FX_RUN -> 511 chars kept
+    const long = "r" ++ "u" ** 600;
+    const p = fifoInPath(&ib, long);
+    try std.testing.expectEqual(@as(usize, 511), p.len);
+    try std.testing.expectStringStartsWith(p, "ru");
+}
+
+test "openFifoPair: readerless fifo is ENXIO, never a hang; a parked peer completes the pair" {
+    // fixture: a real fifo pair under /tmp, pid-unique (stale nodes from a
+    // crashed run are unlinked first).
+    var pbuf: [128]u8 = undefined;
+    var qbuf: [128]u8 = undefined;
+    const pin = std.fmt.bufPrintZ(&pbuf, "/tmp/fxctl-fifo-in-{d}", .{std.os.linux.getpid()}) catch unreachable;
+    const pout = std.fmt.bufPrintZ(&qbuf, "/tmp/fxctl-fifo-out-{d}", .{std.os.linux.getpid()}) catch unreachable;
+    _ = std.c.unlink(pin);
+    _ = std.c.unlink(pout);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(pin, 0o600));
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(pout, 0o600));
+    defer {
+        _ = std.c.unlink(pin);
+        _ = std.c.unlink(pout);
+    }
+
+    // READERLESS request fifo: the write-open must fail ENXIO immediately —
+    // the "PID1 gone" outcome (never a hanging open).
+    try std.testing.expect(openFifoPair(pin, pout).wfd < 0);
+    try std.testing.expectEqual(@as(c_int, ENXIO), errno());
+
+    // PID1's parked ends (setup_fifo_ctrl's O_RDWR pair), held for the test.
+    const svc_in = open(pin, O_RDWR | O_NONBLOCK);
+    const svc_out = open(pout, O_RDWR | O_NONBLOCK);
+    try std.testing.expect(svc_in >= 0);
+    try std.testing.expect(svc_out >= 0);
+    defer {
+        _ = close(svc_in);
+        _ = close(svc_out);
+    }
+
+    const pair = openFifoPair(pin, pout);
+    try std.testing.expect(pair.wfd >= 0);
+    try std.testing.expect(pair.rfd >= 0);
+
+    // the full round trip: the request lands whole on the "server's" read
+    // side (body + newline, each write <= PIPE_BUF — atomic), the reply is
+    // read back through PollSource on the REPLY fd.
+    try std.testing.expect(sendLine(pair.wfd, "q generation_current"));
+    var sbuf: [64]u8 = undefined;
+    const n = std.c.read(svc_in, &sbuf, sbuf.len);
+    try std.testing.expectEqualStrings("q generation_current\n", sbuf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(usize, 3), @as(usize, @intCast(std.c.write(svc_out, "OK\n", 3))));
+    var src = PollSource{ .fd = pair.rfd, .timeout_ms = 2000 };
+    var dst: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 3), src.read(&dst));
+    try std.testing.expectEqualStrings("OK\n", dst[0..3]);
+
+    _ = close(pair.wfd);
+    _ = close(pair.rfd);
 }
 
 test "openChardev: errno shaped like connectSock; a real node opens O_RDWR" {

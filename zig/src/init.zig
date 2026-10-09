@@ -163,6 +163,29 @@ var g_vio_wf: ?*FILE = null;
 var g_vio_peer_gone: bool = true;
 var g_vio_carry: [REQ_MAX]u8 = undefined;
 var g_vio_carry_len: usize = 0;
+// M7 fifo control channel (tests/qemu_fifo.sh): the IN-GUEST client channel
+// — a request fifo <g_run>/control.in (client -> PID1) plus a reply fifo
+// <g_run>/control.out (PID1 -> client), created next to control.sock.  WHY a
+// fifo pair: the socket layer is ENOSYS on the pinned CONFIG_NET-off kernel,
+// PID1 holds state.db/log.db for LIFE (no direct read path for a client),
+// and the virtio port is single-consumer (an in-guest second reader would
+// race PID1) — this pair is the one channel whose consumer is the guest
+// itself, leaving the port to the external operator.
+//
+// SINGLE-CLIENT BY CONVENTION, NOT ENFORCEMENT: any number of writers may
+// queue requests (each write <= PIPE_BUF is atomic), but control.out is ONE
+// shared reply stream — a second concurrent client/reader can STEAL the
+// first's response lines, and both then misparse or time out.  The worst
+// case is garbled reads, NEVER PID1 state corruption.  Not a security
+// boundary either: 0600 root-owned fifos in a root-equivalent channel (the
+// same standing the socket's put/rm arms claim — see put_allowlisted).
+// Per-client reply fifos (request line carrying a reply path) are a
+// deferred, purely additive option.
+var g_fifo_in_fd: c_int = -1;
+var g_fifo_out_fd: c_int = -1;
+var g_fifo_out_wf: ?*FILE = null;
+var g_fifo_carry: [REQ_MAX]u8 = undefined;
+var g_fifo_carry_len: usize = 0;
 // M4 log stream (tests/qemu_logs.sh): a SECOND virtserialport, write-only,
 // carrying one "ts svc lvl msg" line per log_line call — logs flow OUT
 // continuously instead of being polled with `grep` over the request
@@ -221,7 +244,7 @@ extern fn dl_query(db: *dl_db, goal_rel: [*:0]const u8, cb: dl_tuple_cb, user: ?
 extern fn dl_query_bound(db: *dl_db, goal_rel: [*:0]const u8, leading: [*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 extern fn dl_query_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 extern fn dl_query_bound_version(db: *dl_db, version: u32, goal_rel: [*:0]const u8, leading: [*]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
-extern fn dl_snapshot_versions(db: *const dl_db, out: [*]u32, cap: usize) c_long;
+extern fn dl_snapshot_versions(db: *const dl_db, out: ?[*]u32, cap: usize) c_long;
 // The fxstore Zig port's store core (store.zig): fx_store_open/close/db/
 // current_version/rollback.  Its db handle is closure.zig's DlDb opaque type;
 // cast at the boundary (both are plain opaque pointers over libdatalog.so).
@@ -396,6 +419,9 @@ extern "c" fn accept(fd: c_int, addr: ?*anyopaque, addrlen: ?*c_uint) c_int;
 // not in std.c, declared locally per the repo's fork/execv precedent.
 extern "c" fn mount(source: [*:0]const u8, target: [*:0]const u8, fstype: [*:0]const u8, flags: c_ulong, data: ?*const anyopaque) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+// mkfifo(3) (POSIX, in libc): the fifo control pair's creator — same extern
+// shape as the vendored fxstore derivation.zig:580.
+extern "c" fn mkfifo(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn sync() void;
 extern "c" fn syncfs(fd: c_int) c_int;
 
@@ -733,18 +759,281 @@ fn bootlog_newest_ok_below(v: u32, out: *u32) c_int {
     return found;
 }
 
+/// Enumerate ALL published snapshot versions into a malloc'd ASCENDING
+/// array (caller frees; null on any anomaly — callers fail open, exactly
+/// as they did on an unenumerable store).  dl_snapshot_versions fills the
+/// caller buffer from the LOW end of the ascending enumeration, so a
+/// FIXED-SIZE buffer sees only the OLDEST versions when the store holds
+/// more — and on exactly the long-lived machine the guardrail exists for
+/// (snapshot retention is OFF by default; the pre-guardrail ratchet added
+/// 2 versions/cycle) the NEWEST versions, where the re-failures live,
+/// would be invisible: the rule would silently stop protecting and the
+/// ratchet would resume.  Walking the WHOLE history also keeps the ver_n
+/// freshness chain (the previous version's view) defined across the full
+/// order.  The recovery path calls this a handful of times per RECOVERY
+/// boot only, so the malloc/free is fine HERE — unlike the bootlog table
+/// above, which stays fixed-size because it runs on every boot.  Two
+/// calls with no lock between them: PID1's boot path is single-threaded
+/// and is the only caller domain, so the count cannot move between them.
+fn store_versions_all(db: *const dl_db) ?[]u32 {
+    const total = dl_snapshot_versions(db, null, 0);
+    if (total <= 0) return null;
+    const cap: usize = @intCast(total);
+    const buf = malloc(cap * @sizeOf(u32)) orelse return null;
+    const p: [*]u32 = @ptrCast(@alignCast(buf));
+    const n = dl_snapshot_versions(db, p, cap);
+    if (n <= 0) {
+        free(buf);
+        return null;
+    }
+    const got: usize = @intCast(@min(n, total));
+    return p[0..got];
+}
+
 fn version_exists(v: u32) c_int {
     var err: [1024]u8 = undefined;
     const s = fx_store_open_wrap(g_store, &err, err.len) orelse return 0;
-    var vers: [256]u32 = undefined;
-    const n = dl_snapshot_versions(store_db(s), &vers, vers.len);
+    const vers = store_versions_all(store_db(s));
     store_close_durable(s);
-    if (n <= 0) return 0;
-    var i: c_long = 0;
-    while (i < n and i < 256) : (i += 1) {
-        if (vers[@intCast(i)] == v) return 1;
+    if (vers) |vs| {
+        defer free(@ptrCast(vs.ptr));
+        for (vs) |x| {
+            if (x == v) return 1;
+        }
     }
     return 0;
+}
+
+// ─── recovery guardrail: content-aware termination (the backstop) ────────
+//
+// THE PROBLEM (measured, B2 evidence): recovery republishes newest-ok
+// content as a NEW HIGHER version; if the restored bracket re-breaks every
+// time, the loop never settles — versions ratchet +N/cycle and .bootlog
+// gains a failed line per cycle, FOREVER, with every individual boot
+// locally correct (a failure, then a successful-looking recovery).  THE
+// RULE: a recovery candidate is refused iff >= RECOVERY_CONTENT_FAIL_MAX
+// distinct versions whose LAST non-shutdown .bootlog status is failed or
+// unresolved-in-progress carry the candidate's genhash.  ONE failure of a
+// content = transient -> recover EXACTLY as today; TWO = persistent ->
+// never auto-recover to that content again (see the give-up below).
+//
+// Recurrence is DETECTABLE because fxstore's rollback restores the
+// generation tuple verbatim (store.zig rollback_swap_rels copies every
+// non-IDB relation as-of the target): genhash(v_roll) == genhash(v_target).
+
+/// A recovery candidate is refused after its CONTENT (genhash) has failed
+/// this many distinct versions.  2, not 1: a single failure must still
+/// recover exactly as today (tests/qemu_ctrl.sh's contract); only the
+/// REPEAT is evidence of a persistent fault rather than a transient one.
+const RECOVERY_CONTENT_FAIL_MAX: u32 = 2;
+
+/// The candidate walk's hard bound (strictly descending versions).  These
+/// caps ARE the loop bounds of the guardrail: exceeding them degrades to
+/// give-up-sooner / older-failures-aging-out, never to a hang (PID1).
+const RECOVERY_WALK_MAX: u32 = 8;
+
+/// The guardrail's view of a .bootlog status word.  Unknown words (format
+/// drift) are .other: they count as neither ok nor failed, so a future
+/// status vocabulary can never fabricate blacklist entries.
+const BootVerStatus = enum { ok, failed, in_prog, shutdown, other };
+
+fn bootlog_status_of(w: [*:0]const u8) BootVerStatus {
+    if (strcmp(w, "ok") == 0) return .ok;
+    if (strcmp(w, "failed") == 0) return .failed;
+    if (strcmp(w, "in-progress") == 0) return .in_prog;
+    if (strcmp(w, "shutdown") == 0) return .shutdown;
+    return .other;
+}
+
+/// ONE .bootlog line -> (version, status).  Pure.  sscanf "%u %63s" leaves
+/// any trailing garbage after the status token unread — a future epoch
+/// column or annotation cannot break the parse (bootlog_last's grammar).
+const BootVerLine = struct { v: u32 = 0, st: BootVerStatus = .other, got: c_int = 0 };
+
+fn bootlog_parse_line(line: [*:0]const u8) BootVerLine {
+    var tv: u32 = 0;
+    var tsw: [64]u8 = [_]u8{0} ** 64;
+    var out = BootVerLine{};
+    if (sscanf(line, "%u %63s", &tv, &tsw) == 2) {
+        out.v = tv;
+        out.st = bootlog_status_of(@ptrCast(&tsw));
+        out.got = 1;
+    }
+    return out;
+}
+
+/// Per-version LAST non-shutdown status, fixed table (PID1 path: no
+/// allocation).  PER-VERSION LAST-ENTRY AGGREGATION IS LOAD-BEARING: an
+/// a2-shaped bootlog reads "7 in-progress / 7 ok" — the in-progress
+/// RESOLVED to ok, so raw entry counting would false-positive; per version,
+/// the LAST non-shutdown entry in file order is the verdict (mirrors
+/// bootlog_last's semantics).  Shutdown entries are skipped: a clean
+/// shutdown is not a boot verdict.  Unresolved in-progress (crash mid-boot,
+/// no later verdict) is kept — a boot that never completed is the same
+/// evidence class the recovery trigger itself reads as stale.  When more
+/// than tbl.len distinct versions appear, the OLDEST-updated entry ages
+/// out: older failures leaving the table only degrades toward recovering
+/// (fail-open), never toward refusing.
+const BootVerLast = struct { v: u32 = 0, st: BootVerStatus = .other, seq: u32 = 0 };
+
+fn bootver_apply(tbl: []BootVerLast, n: *usize, seq: u32, v: u32, st: BootVerStatus) void {
+    if (st == .shutdown) return;
+    for (tbl[0..n.*]) |*e| {
+        if (e.v == v) { // later file-order entry wins
+            e.st = st;
+            e.seq = seq;
+            return;
+        }
+    }
+    if (n.* < tbl.len) {
+        tbl[n.*] = .{ .v = v, .st = st, .seq = seq };
+        n.* += 1;
+        return;
+    }
+    var oldest: usize = 0;
+    var i: usize = 1;
+    while (i < n.*) : (i += 1) {
+        if (tbl[i].seq < tbl[oldest].seq) oldest = i;
+    }
+    tbl[oldest] = .{ .v = v, .st = st, .seq = seq };
+}
+
+/// One fopen/fgets pass over <store>/.bootlog building the per-version
+/// last-status table (thin wrapper; the pure core above is unit-tested).
+/// A missing/unreadable file returns an EMPTY table — the guardrail reads
+/// that as "no failed versions" and recovers as today (FAIL-OPEN: a read
+/// anomaly must never brick legitimate recovery).
+fn bootlog_last_status_tbl(tbl: []BootVerLast) usize {
+    var p: [1100]u8 = undefined;
+    bootlog_path(&p, p.len);
+    const f = fopen(@ptrCast(&p), "r") orelse return 0;
+    var line: [256]u8 = undefined;
+    var n: usize = 0;
+    var seq: u32 = 0;
+    while (fgets(&line, @intCast(line.len), f)) |_| {
+        const pl = bootlog_parse_line(@ptrCast(&line));
+        if (pl.got != 0) {
+            bootver_apply(tbl, &n, seq, pl.v, pl.st);
+            seq +%= 1;
+        }
+    }
+    _ = fclose(f);
+    return n;
+}
+
+/// Resolve a version's GENERATION HASH (the hex64 string, first column of
+/// the arity-4 `generation` relation) as-of that version — the
+/// read_store_facts query pattern + gen_pick_cb's highest-epoch pick.
+/// Opens its OWN store handle per call exactly like version_exists above:
+/// the only caller (the recovery guardrail) runs a handful of these per
+/// RECOVERY boot, and a self-contained open/close has no leak path past
+/// any return.  Any anomaly (store open failure, no generation as-of v,
+/// unresolvable intern) returns 0 — that version simply does not count
+/// toward the guardrail (fail-open).
+fn store_genhash_of(v: u32, out: [*]u8, cap: usize) c_int {
+    if (cap == 0) return 0;
+    var err: [1024]u8 = undefined;
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse return 0;
+    var gp = GenPick{};
+    _ = dl_query_version(store_db(s), v, "generation", gen_pick_cb, &gp);
+    if (gp.found == 0) {
+        store_close_durable(s);
+        return 0;
+    }
+    const gh = dl_intern_str_of(store_db(s), gp.gh) orelse {
+        store_close_durable(s);
+        return 0;
+    };
+    _ = strncpy(out, gh, cap - 1);
+    out[cap - 1] = 0;
+    store_close_durable(s);
+    return 1;
+}
+
+/// The guardrail's derived measurements for ONE candidate genhash, in a
+/// single store pass (one open; the recovery path runs this at most
+/// RECOVERY_WALK_MAX times per RECOVERY boot — normal boots execute none
+/// of this):
+///   fail_n = distinct store versions whose LAST non-shutdown bootlog
+///            status is failed-or-unresolved-in-progress AND whose
+///            as-of-resolved genhash equals `gh` — the RULE's count.  The
+///            as-of resolution (gen_pick_cb, highest epoch) is exactly
+///            what the boot path itself uses to pick the generation a
+///            version boots, so "failed version carrying gh" means
+///            "this version failed booting this content";
+///   ver_n  = distinct store versions where `gh` was PUBLISHED — how many
+///            times this content has been made current (the republish
+///            index is ver_n-1).  A version counts only when its resolved
+///            row is FRESH: different content than the previous version's
+///            view, or a LATER epoch (the same genhash republished).  The
+///            as-of query alone would fall back to the latest VISIBLE row,
+///            so reserved/intermediate revs (every publish path in this
+///            store burns one) would spuriously "carry" the genhash —
+///            measured: without the freshness test the first recovery
+///            already reported "republish #1".  dl_snapshot_versions
+///            returns versions in ASCENDING order (snapshotEnumerate
+///            sorts), which is what makes "previous version's view"
+///            well-defined — and the scan walks the WHOLE history (see
+///            store_versions_all: a fixed-size window would see only the
+///            OLDEST versions on a long-lived store, and the NEWEST —
+///            where the re-failures live — must always be in view).
+///            KNOWN RESIDUAL of the freshness test: genEpoch (activate.zig)
+///            returns FX_EPOCH/SOURCE_DATE_EPOCH when set, and fx-image
+///            EXPORTS FX_EPOCH to every provisioning child —
+///            reproducibly provisioned stores give EVERY version the SAME
+///            epoch BY DESIGN, so the `cur_epoch > prev_epoch` arm never
+///            fires there and a same-genhash republish is visible only
+///            through the content-differs arm.  Repeated same-target
+///            rollbacks (publish-first intermediate view == G, then the
+///            rebuilt snapshot == G, all at the pinned epoch) fall through
+///            BOTH arms and ver_n UNDERCOUNTS.  Impact is ver_n-only (the
+///            "republish #N" log line); fail_n reads no epochs and the
+///            RULE is unaffected.
+/// Fail-open: every anomaly (no bootlog, store open failure, a version's
+/// genhash unresolvable) contributes ZERO to both counts.
+const GuardStats = struct { fail_n: u32 = 0, ver_n: u32 = 0 };
+
+fn guard_stats_for(gh: [*:0]const u8) GuardStats {
+    var out = GuardStats{};
+    var tbl: [64]BootVerLast = undefined;
+    const nt = bootlog_last_status_tbl(&tbl);
+    var err: [1024]u8 = undefined;
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse return out;
+    const vers = store_versions_all(store_db(s)) orelse {
+        store_close_durable(s);
+        return out;
+    };
+    defer free(@ptrCast(vers.ptr));
+    var prev_h: ?[*:0]const u8 = null; // previous version's resolved genhash
+    var prev_epoch: u32 = 0;
+    for (vers) |v| {
+        var gp = GenPick{};
+        _ = dl_query_version(store_db(s), v, "generation", gen_pick_cb, &gp);
+        var cur_h: ?[*:0]const u8 = null;
+        var cur_epoch: u32 = 0;
+        if (gp.found != 0) {
+            if (dl_intern_str_of(store_db(s), gp.gh)) |h| {
+                cur_h = h;
+                cur_epoch = gp.best_epoch;
+                if (strcmp(h, gh) == 0) {
+                    var j: usize = 0;
+                    while (j < nt) : (j += 1) {
+                        if (tbl[j].v == v and (tbl[j].st == .failed or tbl[j].st == .in_prog)) {
+                            out.fail_n += 1;
+                            break;
+                        }
+                    }
+                    if (prev_h == null or strcmp(prev_h.?, h) != 0 or cur_epoch > prev_epoch) {
+                        out.ver_n += 1;
+                    }
+                }
+            }
+        }
+        prev_h = cur_h;
+        prev_epoch = cur_epoch;
+    }
+    store_close_durable(s);
+    return out;
 }
 
 // ─── transient store reads: generation + svc facts AS-OF a version ───────
@@ -1099,31 +1388,94 @@ fn decide_boot_version() u32 {
     if (bootlog_last(&lv, &lstatus, lstatus.len) != 0 and lv == g_current_version and
         (strcmp(@ptrCast(&lstatus), "in-progress") == 0 or strcmp(@ptrCast(&lstatus), "failed") == 0))
     {
-        var vok: u32 = 0;
-        if (bootlog_newest_ok_below(g_current_version, &vok) != 0 and version_exists(vok) != 0) {
-            errf("fx-init: stale {s} for v{d}; rolling forward to v{d}\n", .{ span(@ptrCast(&lstatus)), g_current_version, vok });
-            var e2: [1024]u8 = undefined;
-            if (fx_store_open_wrap(g_store, &e2, e2.len)) |rs| {
-                // fx_store_rollback is snapshot-complete: it restores every
-                // relation as-of vok (facts + provenance pair) itself.
-                const rb: c_int = fx_store_rollback_wrap(rs, vok, false, &e2, e2.len);
-                _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
-                if (rb == 0) {
-                    log_line("fx-init", "info", "rolled forward to known-good generation");
-                    // second durability point: the roll-forward's CURRENT
-                    // rewrite is a separate commit from bootlog_append's
-                    // fsync — and on the DISK store the nojournal-ext4
-                    // BITMAPS of the rollback's snapshot churn can still be
-                    // mid-writeback (see store_close_durable).  Flush the
-                    // store's OWN filesystem before this boot can be killed.
-                    syncfs_store();
-                } else {
-                    errf("fx-init: roll-forward failed: {s}\n", .{span(@ptrCast(&e2))});
-                }
-                store_close_durable(rs);
+        // ── the GUARDRAIL candidate walk ────────────────────────────────
+        // Descend from the newest ok version: a candidate whose CONTENT
+        // (genhash) has already failed >= RECOVERY_CONTENT_FAIL_MAX
+        // distinct versions is a PERSISTENT fault, not a transient one —
+        // skip it and try the next-older ok content.  ONE failure of a
+        // content recovers EXACTLY as today.  Every read anomaly fails
+        // OPEN toward today's behavior (this is PID1's boot recovery
+        // path; a misread must never brick a legitimate recovery).  The
+        // walk is bounded by construction: strict descent, hard iteration
+        // cap, no unbounded loop.
+        var bound: u32 = g_current_version;
+        var rejected: u32 = 0;
+        var walk: u32 = 0;
+        while (walk < RECOVERY_WALK_MAX) : (walk += 1) {
+            var vok: u32 = 0;
+            if (bootlog_newest_ok_below(bound, &vok) == 0) break;
+            if (version_exists(vok) == 0) break; // today's silent fall-through
+            var gh: [72]u8 = [_]u8{0} ** 72;
+            var have_gh: c_int = 0;
+            var n: u32 = 0;
+            var vern: u32 = 0;
+            if (store_genhash_of(vok, &gh, gh.len) != 0) {
+                have_gh = 1;
+                const gs = guard_stats_for(@ptrCast(&gh));
+                n = gs.fail_n;
+                vern = gs.ver_n;
             }
-            return g_current_version;
+            if (n < RECOVERY_CONTENT_FAIL_MAX) {
+                errf("fx-init: stale {s} for v{d}; rolling forward to v{d}\n", .{ span(@ptrCast(&lstatus)), g_current_version, vok });
+                var e2: [1024]u8 = undefined;
+                if (fx_store_open_wrap(g_store, &e2, e2.len)) |rs| {
+                    // fx_store_rollback is snapshot-complete: it restores every
+                    // relation as-of vok (facts + provenance pair) itself.
+                    const rb: c_int = fx_store_rollback_wrap(rs, vok, false, &e2, e2.len);
+                    _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
+                    if (rb == 0) {
+                        log_line("fx-init", "info", "rolled forward to known-good generation");
+                        // second durability point: the roll-forward's CURRENT
+                        // rewrite is a separate commit from bootlog_append's
+                        // fsync — and on the DISK store the nojournal-ext4
+                        // BITMAPS of the rollback's snapshot churn can still be
+                        // mid-writeback (see store_close_durable).  Flush the
+                        // store's OWN filesystem before this boot can be killed.
+                        syncfs_store();
+                    } else {
+                        errf("fx-init: roll-forward failed: {s}\n", .{span(@ptrCast(&e2))});
+                    }
+                    store_close_durable(rs);
+                }
+                // derived MEASUREMENT (observability: a flapping machine must
+                // be VISIBLE — its invisibility is half its danger).  Both
+                // counts derive from .bootlog x store history, which are
+                // already durable; NO new state, NO new write on this path.
+                if (have_gh != 0) {
+                    errf("fx-init: recovery to v{d} content genhash={s} (content failed {d}x before, republish #{d})\n", .{ vok, span(@ptrCast(&gh)), n, if (vern > 0) vern - 1 else 0 });
+                } else {
+                    errf("fx-init: recovery to v{d} (content genhash unresolvable; guardrail skipped)\n", .{vok});
+                }
+                return g_current_version;
+            }
+            errf("fx-init: v{d} content {s} failed {d}x; not recovering to it\n", .{ vok, span(@ptrCast(&gh)), n });
+            rejected += 1;
+            bound = vok; // next-older ok candidate
         }
+        if (rejected != 0) {
+            // GIVE-UP = HOLD AT CURRENT: no republish (the version number
+            // FREEZES — the ratchet stops) and a LOUD line every boot.  NOT
+            // halt/panic: the harness boots with panic=-1, so a panic is an
+            // instant silent reboot loop AND loses the console; holding
+            // boots current as-is with the control channels up every boot
+            // regardless of the verdict, so MANUAL recovery (ctrl
+            // activate/rollback — both bypass decide_boot_version entirely)
+            // always remains available.  This refuses only the AUTOMATIC
+            // republish; it never locks the operator out.  Fires ONLY when
+            // a candidate EXISTED and was refused by the content rule —
+            // the no-candidate-at-all case above stays silent (today's
+            // behavior for a fresh machine's first failure).  The message
+            // names what was EXAMINED, never "every known-good generation":
+            // the walk is bounded (RECOVERY_WALK_MAX) and can also break on
+            // a missing version, so an acceptable older candidate may exist
+            // untried — an operator-facing line must not overclaim away the
+            // manual recovery this hold exists to preserve.
+            var gm: [200]u8 = undefined;
+            _ = snfmtRaw(&gm, gm.len, "recovery gave up: all {d} known-good generations examined failed >= {d} boots; holding v{d}", .{ rejected, RECOVERY_CONTENT_FAIL_MAX, g_current_version });
+            errf("fx-init: {s}\n", .{span(@ptrCast(&gm))});
+            log_line("fx-init", "error", @ptrCast(&gm));
+        }
+        return g_current_version;
     }
     return g_current_version;
 }
@@ -2478,7 +2830,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
     // loop immediately (never blocks); while the shell lives, the port is
     // the child's — handle_virtio/main_loop skip it via the g_shell_pid
     // latch, and a second `shell` is an ERR.  The shell inherits NO other
-    // fds (the sigpipe/ctrl/vlog/service fds are closed in the child).
+    // fds (the sigpipe/ctrl/vlog/fifo/service fds are closed in the child).
     if (strcmp(cmd, "shell") == 0) {
         if (g_vio_fd < 0) {
             resp_err(o, "shell: no virtio control channel");
@@ -2515,6 +2867,11 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             if (g_sigpipe[1] >= 0) _ = std.c.close(g_sigpipe[1]);
             if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
             if (g_vlog_fd >= 0) _ = std.c.close(g_vlog_fd);
+            // the fifo pair rides this list too: a leaked control.in writer
+            // would keep the fifo "alive" after PID1 dies, and a leaked
+            // control.out reader would steal responses from the next client.
+            if (g_fifo_in_fd >= 0) _ = std.c.close(g_fifo_in_fd);
+            if (g_fifo_out_fd >= 0) _ = std.c.close(g_fifo_out_fd);
             var si: c_int = 0;
             while (si < g_nsvc) : (si += 1) {
                 if (g_svc.?[@intCast(si)].out_fd >= 0) _ = std.c.close(g_svc.?[@intCast(si)].out_fd);
@@ -3096,6 +3453,73 @@ fn setup_virtio_log() void {
     errf("fx-init: virtio log up ({s})\n", .{span(@ptrCast(&vp))});
 }
 
+/// Create + open the in-guest fifo control pair (see the statics block above
+/// for the design): <g_run>/control.in (client -> PID1) and <g_run>/control.out
+/// (PID1 -> client).  PID1-gated exactly like setup_virtio_ctrl — a harness
+/// running as a normal process stays inert.  Per fifo: unlink a stale path
+/// (the control.sock precedent), mkfifo 0600, open O_RDWR|O_NONBLOCK.
+///
+/// WHY O_RDWR on both, not the reader/writer ends a fifo "wants":
+///   (i)   O_RDWR on a fifo returns immediately — BOOT CANNOT BLOCK;
+///   (ii)  PID1 permanently parks a WRITER on control.in, so poll never
+///         reports POLLHUP/EOF-readable while no client is attached — that
+///         is exactly the disconnected-virtserialport 100%-spin the
+///         g_vio_peer_gone latch exists for, and O_RDWR means NO latch, NO
+///         reprobe machinery, read()==0 UNREACHABLE;
+///   (iii) PID1 permanently parks a READER on control.out, so a response
+///         write can never block-forever or EPIPE when no client listens
+///         (SIGPIPE is ignored in PID1 anyway).
+/// WHY O_NONBLOCK on top: a FULL control.out must EAGAIN-drop a response,
+/// not HANG the supervisor — the difference between a lost line and a wedged
+/// guest; that property is this channel's whole safety story.
+///
+/// Setup failure = ONE warning + return, boot proceeds (the virtio open-fail
+/// precedent): an in-guest channel is a convenience next to the port, never
+/// a boot dependency.
+fn setup_fifo_ctrl() void {
+    if (std.c.getpid() != 1) return;
+    var pin: [1100]u8 = undefined;
+    var pout: [1100]u8 = undefined;
+    _ = snfmt(&pin, "{s}/control.in", .{span(@ptrCast(&g_run))});
+    _ = snfmt(&pout, "{s}/control.out", .{span(@ptrCast(&g_run))});
+    _ = std.c.unlink(@ptrCast(&pin));
+    if (mkfifo(@ptrCast(&pin), 0o600) != 0) {
+        errf("fx-init: warning: fifo control: mkfifo {s}: {s}\n", .{ span(@ptrCast(&pin)), errnoStr() });
+        return;
+    }
+    _ = std.c.unlink(@ptrCast(&pout));
+    if (mkfifo(@ptrCast(&pout), 0o600) != 0) {
+        errf("fx-init: warning: fifo control: mkfifo {s}: {s}\n", .{ span(@ptrCast(&pout)), errnoStr() });
+        _ = std.c.unlink(@ptrCast(&pin));
+        return;
+    }
+    const in_fd = open(@ptrCast(&pin), O_RDWR | O_NONBLOCK, 0);
+    if (in_fd < 0) {
+        errf("fx-init: warning: fifo control: open {s}: {s}\n", .{ span(@ptrCast(&pin)), errnoStr() });
+        return;
+    }
+    const out_fd = open(@ptrCast(&pout), O_RDWR | O_NONBLOCK, 0);
+    if (out_fd < 0) {
+        errf("fx-init: warning: fifo control: open {s}: {s}\n", .{ span(@ptrCast(&pout)), errnoStr() });
+        _ = std.c.close(in_fd);
+        return;
+    }
+    g_fifo_out_wf = fdopen(out_fd, "w");
+    const wf = g_fifo_out_wf orelse {
+        errf("fx-init: warning: fifo control: fdopen {s} failed\n", .{span(@ptrCast(&pout))});
+        _ = std.c.close(in_fd);
+        _ = std.c.close(out_fd);
+        return;
+    };
+    // unbuffered + clearerr-on-failure: the g_vio_wf contract — one dropped
+    // response (EAGAIN on a full fifo) must not silence the channel for the
+    // next client.
+    _ = setvbuf(wf, null, _IONBF, 0);
+    g_fifo_in_fd = in_fd;
+    g_fifo_out_fd = out_fd;
+    errf("fx-init: fifo control up ({s} + {s})\n", .{ span(@ptrCast(&pin)), span(@ptrCast(&pout)) });
+}
+
 /// One POLLIN dispatch on the virtio port: a single read, appended to the
 /// carry buffer, split on newlines; each COMPLETE line runs the EXISTING
 /// handle_request (the command grammar is the socket's, not a copy).
@@ -3168,6 +3592,65 @@ fn handle_virtio() void {
     }
 }
 
+/// One POLLIN dispatch on the request fifo — handle_virtio's pump, minus the
+/// peer-gone latch and the shell handoff (both virtio-specific).  NO latch
+/// needed: setup_fifo_ctrl's O_RDWR parks PID1's own writer on control.in,
+/// so read()==0 is unreachable and poll can never spin on a POLLHUP-only fd.
+/// PID1 serializes STRUCTURALLY — single-threaded, one request line -> one
+/// FULL flushed response (handle_request's resp_* fflush) before the next
+/// line is read — so request->response order is FIFO within the one client
+/// this channel is sized for.
+fn handle_fifo() void {
+    const wf = g_fifo_out_wf orelse return;
+    var buf: [4096]u8 = undefined;
+    const n = std.c.read(g_fifo_in_fd, &buf, buf.len);
+    if (n <= 0) return; // EAGAIN (spurious wakeup) or a transient error: nothing to do
+    var consumed: usize = 0;
+    while (consumed < @as(usize, @intCast(n))) {
+        const nl = std.mem.indexOfScalar(u8, buf[consumed..@intCast(n)], '\n') orelse {
+            // partial line: carry it, capped — a line longer than the buffer
+            // is truncated at REQ_MAX-1 and handled (garbage-in) rather than
+            // wedgeing the channel (the g_vio_carry policy).
+            const room = @min(g_fifo_carry.len - 1 - g_fifo_carry_len, @as(usize, @intCast(n)) - consumed);
+            @memcpy(g_fifo_carry[g_fifo_carry_len .. g_fifo_carry_len + room], buf[consumed .. consumed + room]);
+            g_fifo_carry_len += room;
+            consumed += room;
+            break;
+        };
+        const seg = buf[consumed .. consumed + nl];
+        var line: [REQ_MAX + 1]u8 = undefined;
+        const clen = @min(g_fifo_carry_len, REQ_MAX);
+        @memcpy(line[0..clen], g_fifo_carry[0..clen]);
+        const total = clen + seg.len;
+        if (total <= REQ_MAX) {
+            @memcpy(line[clen..total], seg);
+            line[total] = 0;
+            handle_request(wf, @ptrCast(&line));
+        }
+        // overlong line: copy the truncated seg and NUL-terminate, then feed
+        // it (garbage-in).  line[clen..REQ_MAX] is zeroed first so a truncated
+        // segment cannot carry uninitialized garbage into the handled line;
+        // line[REQ_MAX] terminates it so strtok_r stops at the boundary.
+        else {
+            @memset(line[clen..REQ_MAX], 0);
+            const copy_len = @min(seg.len, REQ_MAX - clen);
+            @memcpy(line[clen..clen + copy_len], seg[0..copy_len]);
+            line[REQ_MAX] = 0;
+            handle_request(wf, @ptrCast(&line));
+        }
+        g_fifo_carry_len = 0;
+        consumed += nl + 1;
+    }
+    // the g_vio_wf tail: control.out is O_NONBLOCK, so a full fifo EAGAIN-
+    // drops this response — clear the error flag so the NEXT one can still
+    // be written (a dropped line, never a silenced channel).
+    _ = fflush(wf);
+    if (ferror(wf) != 0) {
+        errf("fx-init: fifo: response write failed (fifo full? dropped) — clearing\n", .{});
+        clearerr(wf);
+    }
+}
+
 // ─── shutdown (fx-init.c:1194-1220) ───────────────────────────────────────
 
 fn do_shutdown() void {
@@ -3219,6 +3702,15 @@ fn do_shutdown() void {
     var sp: [1100]u8 = undefined;
     _ = snfmt(&sp, "{s}/control.sock", .{span(@ptrCast(&g_run))});
     _ = std.c.unlink(@ptrCast(&sp));
+    // the fifo pair mirrors the socket's teardown: unlink BOTH paths, then
+    // close — a stale fifo in the run dir would make the next boot's unlink
+    // the only cleaner (and a client's open succeed against a dead PID1).
+    var fpin: [1100]u8 = undefined;
+    var fpout: [1100]u8 = undefined;
+    _ = snfmt(&fpin, "{s}/control.in", .{span(@ptrCast(&g_run))});
+    _ = snfmt(&fpout, "{s}/control.out", .{span(@ptrCast(&g_run))});
+    _ = std.c.unlink(@ptrCast(&fpin));
+    _ = std.c.unlink(@ptrCast(&fpout));
     if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
     if (g_vio_fd >= 0) {
         // g_vio_wf is an fdopen over g_vio_fd and owns it — one fclose
@@ -3226,6 +3718,17 @@ fn do_shutdown() void {
         if (g_vio_wf) |wf| _ = fclose(wf) else _ = std.c.close(g_vio_fd);
         g_vio_fd = -1;
         g_vio_wf = null;
+    }
+    if (g_fifo_in_fd >= 0) {
+        _ = std.c.close(g_fifo_in_fd);
+        g_fifo_in_fd = -1;
+    }
+    if (g_fifo_out_fd >= 0) {
+        // g_fifo_out_wf is an fdopen over g_fifo_out_fd and owns it — one
+        // fclose closes both (the g_vio_wf pattern; no double close).
+        if (g_fifo_out_wf) |wf| _ = fclose(wf) else _ = std.c.close(g_fifo_out_fd);
+        g_fifo_out_fd = -1;
+        g_fifo_out_wf = null;
     }
     if (g_vlog_fd >= 0) {
         _ = std.c.close(g_vlog_fd);
@@ -3265,7 +3768,15 @@ fn next_timeout() i32 {
 
 fn main_loop() void {
     while (g_shutdown.load(.monotonic) == 0) {
-        var pf: [2 + 64]std.posix.pollfd = undefined;
+        // [2 + 1 + 1 + 64]: sigpipe+ctrl, the VIRTIO port, the fifo control
+        // fd, then 64 service pipes.  EVERY fixed fd the loop can add must
+        // be in the arithmetic: the virtio fd was missing, so with virtio +
+        // fifo + 64 services all up the array was ONE SHORT and the last
+        // service pipe silently dropped out of the poll set — the
+        // nfd<pf.len guard prevents the overrun but starves that pipe
+        // (drain_pipe runs only on poll revents, so its service's stdout
+        // would never drain and could block on a full pipe).
+        var pf: [2 + 1 + 1 + 64]std.posix.pollfd = undefined;
         var nfd: usize = 0;
         pf[nfd] = .{ .fd = g_sigpipe[0], .events = std.posix.POLL.IN, .revents = 0 };
         nfd += 1;
@@ -3279,6 +3790,15 @@ fn main_loop() void {
         // iteration below instead (MEASURED on the first qemu_ctrl run).
         if (g_vio_fd >= 0 and !g_vio_peer_gone and g_shell_pid.load(.monotonic) == 0) {
             pf[nfd] = .{ .fd = g_vio_fd, .events = std.posix.POLL.IN, .revents = 0 };
+            nfd += 1;
+        }
+        // The fifo request fd, POLLIN only.  PID1's own O_RDWR write end
+        // keeps a writer on control.in forever, so this fd can never report
+        // the POLLHUP-spin a disconnected virtserialport does — no latch, no
+        // reprobe (see setup_fifo_ctrl).  control.out is NEVER polled: PID1
+        // only ever writes it.
+        if (g_fifo_in_fd >= 0) {
+            pf[nfd] = .{ .fd = g_fifo_in_fd, .events = std.posix.POLL.IN, .revents = 0 };
             nfd += 1;
         }
         var i: c_int = 0;
@@ -3324,6 +3844,14 @@ fn main_loop() void {
             // CHANGES (peer EOF latched / peer is back) — one console line
             // that matters must not drown in per-iteration reprobes.
             handle_virtio();
+        }
+        if (g_fifo_in_fd >= 0) {
+            pi = 0;
+            while (pi < nfd) : (pi += 1) {
+                if (pf[pi].fd == g_fifo_in_fd and (pf[pi].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                    handle_fifo();
+                }
+            }
         }
         pi = 0;
         while (pi < nfd) : (pi += 1) {
@@ -3651,6 +4179,9 @@ pub fn main(init: std.process.Init) !void {
     g_ctrl_fd = setup_ctrl();
     setup_virtio_ctrl();
     setup_virtio_log();
+    // the in-guest fifo pair comes up BEFORE the report below so the report
+    // can say truthfully what fxctl actually has in this guest.
+    setup_fifo_ctrl();
     // An unavailable UNIX control socket is worth ONE truthful line, not a
     // bare "failed" every boot: setup_ctrl records the failing step + errno
     // (g_ctrl_fail), and the virtio channel is brought up BELOW but ABOVE
@@ -3680,6 +4211,11 @@ pub fn main(init: std.process.Init) !void {
             "";
         if (g_vio_fd >= 0) {
             errf("fx-init: no UNIX control socket ({s}: {s} failed: {s}{s}) — the virtio control port carries the protocol\n", .{ span(@ptrCast(&sp)), g_ctrl_fail.step, why, hint });
+        } else if (g_fifo_in_fd >= 0) {
+            // no port (a guest without virtio-serial) but the fifo pair is
+            // up: in-guest fxctl HAS a channel — say so instead of the old
+            // "fxctl cannot connect" line, which this arm would now lie by.
+            errf("fx-init: no UNIX control socket ({s}: {s} failed: {s}{s}) — the fifo pair ({s}/control.in + control.out) carries the protocol for in-guest fxctl\n", .{ span(@ptrCast(&sp)), g_ctrl_fail.step, why, hint, span(@ptrCast(&g_run)) });
         } else {
             errf("fx-init: warning: no control channel: {s} ({s} failed: {s}{s}) and no virtio control port — fxctl cannot connect in this guest\n", .{ span(@ptrCast(&sp)), g_ctrl_fail.step, why, hint });
         }
@@ -3815,6 +4351,197 @@ test "parse_on mirrors the lenient on= grammar" {
     parse_on("bogus:thing", &kind, &arg, arg.len);
     try std.testing.expectEqual(FxOnKind.all, kind);
     try std.testing.expectEqualStrings("", argstr(&arg));
+}
+
+test "bootlog_parse_line: the shapes .bootlog actually has" {
+    // the real grammar is "<v> <status> <epoch>" written by bootlog_append;
+    // sscanf "%u %63s" stops at the first space, so a trailing epoch (or
+    // any FUTURE annotation) cannot break the parse
+    const l1 = bootlog_parse_line("7 in-progress 1697000001");
+    try std.testing.expectEqual(@as(c_int, 1), l1.got);
+    try std.testing.expectEqual(@as(u32, 7), l1.v);
+    try std.testing.expectEqual(BootVerStatus.in_prog, l1.st);
+    const l2 = bootlog_parse_line("7 ok 1697000009");
+    try std.testing.expectEqual(@as(c_int, 1), l2.got);
+    try std.testing.expectEqual(BootVerStatus.ok, l2.st);
+    const l3 = bootlog_parse_line("9 failed");
+    try std.testing.expectEqual(@as(c_int, 1), l3.got);
+    try std.testing.expectEqual(BootVerStatus.failed, l3.st);
+    const l4 = bootlog_parse_line("5 shutdown 1697000042");
+    try std.testing.expectEqual(@as(c_int, 1), l4.got);
+    try std.testing.expectEqual(BootVerStatus.shutdown, l4.st);
+    // an unknown status word is neither ok nor failed (format drift can
+    // never fabricate blacklist entries)
+    const l5 = bootlog_parse_line("3 futurestatus 1");
+    try std.testing.expectEqual(@as(c_int, 1), l5.got);
+    try std.testing.expectEqual(BootVerStatus.other, l5.st);
+    // garbage / no-status lines parse to nothing
+    try std.testing.expectEqual(@as(c_int, 0), bootlog_parse_line("garbage").got);
+    try std.testing.expectEqual(@as(c_int, 0), bootlog_parse_line("").got);
+    try std.testing.expectEqual(@as(c_int, 0), bootlog_parse_line("7").got);
+}
+
+test "bootver_apply: per-version LAST-entry aggregation (the a2 shape)" {
+    // THE LOAD-BEARING CASE (B2 evidence): a bootlog can read
+    // "7 in-progress / 7 ok / 9 in-progress / 9 ok" — each in-progress
+    // RESOLVED to ok in the same boot.  RAW entry counting would count 2
+    // failures here; per-version last-entry aggregation resolves both to
+    // ok, so the guardrail counts ZERO failed versions.
+    var tbl: [8]BootVerLast = undefined;
+    var n: usize = 0;
+    inline for (.{ "7 in-progress 1", "7 ok 2", "9 in-progress 3", "9 ok 4" }) |ln| {
+        const pl = bootlog_parse_line(ln);
+        try std.testing.expectEqual(@as(c_int, 1), pl.got);
+        bootver_apply(&tbl, &n, @intCast(n + 1), pl.v, pl.st);
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    var failed: u32 = 0;
+    for (tbl[0..n]) |e| {
+        if (e.st == .failed or e.st == .in_prog) failed += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), failed);
+
+    // a FAILED verdict is OVERWRITTEN by a later ok of the same version
+    // (last entry wins), and vice versa
+    n = 0;
+    inline for (.{ "3 failed 1", "3 ok 2" }) |ln| {
+        const pl = bootlog_parse_line(ln);
+        bootver_apply(&tbl, &n, @intCast(n + 1), pl.v, pl.st);
+    }
+    for (tbl[0..n]) |e| try std.testing.expectEqual(BootVerStatus.ok, e.st);
+    n = 0;
+    inline for (.{ "3 ok 1", "3 failed 2" }) |ln| {
+        const pl = bootlog_parse_line(ln);
+        bootver_apply(&tbl, &n, @intCast(n + 1), pl.v, pl.st);
+    }
+    for (tbl[0..n]) |e| try std.testing.expectEqual(BootVerStatus.failed, e.st);
+
+    // SHUTDOWN entries are skipped entirely: a version that failed then
+    // shut down cleanly keeps its failed verdict (shutdown is not a boot
+    // verdict — mirrors bootlog_last), and a shutdown-ONLY version is
+    // absent from the table
+    n = 0;
+    inline for (.{ "5 failed 1", "5 shutdown 2", "6 shutdown 3" }) |ln| {
+        const pl = bootlog_parse_line(ln);
+        bootver_apply(&tbl, &n, @intCast(n + 1), pl.v, pl.st);
+    }
+    try std.testing.expectEqual(@as(usize, 1), n); // v6 never entered
+    try std.testing.expectEqual(@as(u32, 5), tbl[0].v);
+    try std.testing.expectEqual(BootVerStatus.failed, tbl[0].st);
+
+    // UNRESOLVED in-progress (crash mid-boot, no later verdict) COUNTS as
+    // failed — a boot that never completed is the same evidence class the
+    // recovery trigger itself reads as stale
+    n = 0;
+    const pl = bootlog_parse_line("11 in-progress 1");
+    bootver_apply(&tbl, &n, 1, pl.v, pl.st);
+    try std.testing.expectEqual(BootVerStatus.in_prog, tbl[0].st);
+    failed = 0;
+    for (tbl[0..n]) |e| {
+        if (e.st == .failed or e.st == .in_prog) failed += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), failed);
+
+    // FULL TABLE: the OLDEST-updated entry ages out (older failures leaving
+    // the table degrades toward recovering, never toward refusing)
+    var small: [2]BootVerLast = undefined;
+    var m: usize = 0;
+    inline for (.{ "1 failed 1", "2 failed 2", "3 failed 3" }) |ln| {
+        const q = bootlog_parse_line(ln);
+        bootver_apply(&small, &m, @intCast(m + 1), q.v, q.st);
+    }
+    try std.testing.expectEqual(@as(usize, 2), m);
+    // v1 (oldest update) was evicted; v2 and v3 remain
+    var seen2: c_int = 0;
+    var seen1: c_int = 0;
+    for (small[0..m]) |e| {
+        if (e.v == 2) seen2 = 1;
+        if (e.v == 1) seen1 = 1;
+    }
+    try std.testing.expectEqual(@as(c_int, 1), seen2);
+    try std.testing.expectEqual(@as(c_int, 0), seen1);
+}
+
+test "guard_stats_for: the WHOLE version history stays in view past 256 versions" {
+    // REGRESSION PROBE for the fixed-size scan: dl_snapshot_versions fills
+    // the caller buffer from the LOW end of the ascending enumeration, so
+    // the old [256]u32 window saw only the OLDEST 256 versions — on a
+    // store with more (nothing bounds the count: snapshot retention is OFF
+    // by default, and the pre-guardrail ratchet added 2 versions/cycle)
+    // the NEWEST versions, where a long-flapper's re-failures live, were
+    // NEVER examined: fail_n read 0 and the ratchet resumed, silently, on
+    // the exact machine the guardrail exists for.  This test builds that
+    // store — 258 versions with the failing ones at ascending indices
+    // 256/257, beyond the old cap — and must count them.  PRE-FIX it
+    // reads fail_n == 0.
+    const io = std.testing.io;
+    const saved_io = g_io;
+    const saved_store = g_store;
+    g_io = io;
+    defer {
+        g_io = saved_io;
+        g_store = saved_store;
+    }
+    var seed: [8]u8 = undefined;
+    io.random(&seed);
+    var rb: [96:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&rb, "/tmp/fx-grd-{x:0>16}", .{std.mem.readInt(u64, &seed, .little)});
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        var bb: [112:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&bb, "{s}.build", .{root})) |b| {
+            std.Io.Dir.cwd().deleteTree(io, b) catch {};
+        } else |_| {}
+    }
+    // the candidate genhash, a real-shape hex64
+    const G = "0123456789abcdef" ** 4;
+    // build the store: v1..v256 empty, then ONE generation fact published
+    // at v257 AND v258 — the rollback shape (fxstore restores the
+    // generation tuple verbatim, so a republished version carries the
+    // SAME genhash; here: the second publish of the unchanged fact).
+    {
+        var err: [1024]u8 = undefined;
+        const s = fx_store_open_wrap(root.ptr, &err, err.len) orelse return error.StoreOpen;
+        const db = store_db(s);
+        try std.testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "generation", 4));
+        var i: u32 = 0;
+        while (i < 256) : (i += 1) {
+            var e2 = fx.store.ErrBuf{};
+            fx.fx_store_publish(s, &e2) catch return error.Publish;
+        }
+        try std.testing.expectEqual(@as(c_int, 0), dl_txn_begin(db));
+        var gz: [65]u8 = undefined;
+        @memcpy(gz[0..64], G);
+        gz[64] = 0;
+        const cols = [4]u32{ dl_intern_str(db, @ptrCast(&gz)), dl_intern_str(db, "b.dhall"), dl_intern_str(db, "d.com"), 1000 };
+        _ = dl_txn_add_fact(db, "generation", &cols, 4);
+        try std.testing.expectEqual(@as(c_int, 0), dl_txn_commit(db));
+        var e3 = fx.store.ErrBuf{};
+        fx.fx_store_publish(s, &e3) catch return error.Publish; // v257
+        var e4 = fx.store.ErrBuf{};
+        fx.fx_store_publish(s, &e4) catch return error.Publish; // v258
+        store_close_durable(s);
+    }
+    // the re-failure evidence: v257 and v258 FAILED their boots
+    g_store = root.ptr;
+    {
+        var bp: [1100]u8 = undefined;
+        bootlog_path(&bp, bp.len);
+        const f = fopen(@ptrCast(&bp), "w") orelse return error.Bootlog;
+        _ = fputs("257 failed 1697000001\n258 failed 1697000002\n", f);
+        _ = fclose(f);
+    }
+    var gz2: [65]u8 = undefined;
+    @memcpy(gz2[0..64], G);
+    gz2[64] = 0;
+    const gs = guard_stats_for(@ptrCast(&gz2));
+    // THE assertion: both failing versions are IN VIEW — with the old
+    // oldest-256 window this reads 0 and the guardrail silently stops
+    // protecting this store.
+    try std.testing.expectEqual(@as(u32, 2), gs.fail_n);
+    // v257's row is fresh against v256's empty view; v258 is the same
+    // content at the same epoch (the republish shape) — counted once.
+    try std.testing.expectEqual(@as(u32, 1), gs.ver_n);
 }
 
 test "boot_decision state machine (START-ONLY grace rule)" {

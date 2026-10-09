@@ -16,6 +16,12 @@ vendored submodules:
 - **`fxctl`** — the datalog control/query plane. Queries any live relation (joining
   the immutable store DB), hybrid log search, and control (`start|stop|restart|
   activate|rollback|shutdown|probe`) — all datalog-framed over `/run/fx/control.sock`.
+  Inside the guest (`fxctl --fifo` / `FX_FIFO`), the same grammar rides the fifo pair
+  PID1 keeps in `/run/fx` (`control.in` requests, `control.out` replies) — the pinned
+  guest kernel has no socket layer. That pair is **single-client by convention, not
+  enforcement**: a second concurrent client's replies interleave on the shared
+  `control.out` (garbled reads, never supervisor corruption); the channel is
+  root-equivalent by design.
 - **`fx_probe` / `fx_log`** (Zig modules) — the init-hosted probe loop (process/fs/file/device/
   kernel/net/env from `/proc`,`/sys`) and the compact DAFSA-interned service log DB.
 

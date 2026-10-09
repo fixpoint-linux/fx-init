@@ -43,6 +43,32 @@ static int mode_exit(char *code) {
     return c;
 }
 
+static int mode_flapper(char *marker) {
+    /* good ONCE, bad forever (tests/qemu_guardrail.sh): the marker lives on
+     * the DISK outside the store (/fx/disk/.flap-marker), so it survives
+     * both rollback (store relations only) and adopt (rm -rf of the store
+     * dir only) — the exact shape "the restored bracket re-breaks": boot 1
+     * is healthy, every recovery that republishes this content fails AGAIN
+     * because the marker is still there.  fsync the marker: the harness
+     * kills QEMU abruptly and the whole lane rests on the marker's
+     * survival. */
+    if (marker && access(marker, F_OK) == 0) {
+        printf("fakesvc flapper: marker present, failing\n");
+        fflush(stdout);
+        return 1;
+    }
+    if (marker) {
+        FILE *f = fopen(marker, "w");
+        if (f) {
+            fputs("flap\n", f);
+            fflush(f);
+            fsync(fileno(f));
+            fclose(f);
+        }
+    }
+    return mode_ok();
+}
+
 static int mode_hang(void) {
     printf("fakesvc hang\n");
     fflush(stdout);
@@ -79,11 +105,12 @@ int main(int argc, char **argv) {
      * if a child refuses to die within the shutdown grace — but actually we
      * WANT default SIGTERM handling (so shutdown sweep works); do NOT block. */
     (void)argc;
-    if (argc < 2) { fprintf(stderr, "usage: fakesvc <ok|exit <code>|hang|net <port>>\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: fakesvc <ok|exit <code>|hang|net <port>|flapper <marker>>\n"); return 2; }
     if (!strcmp(argv[1], "ok"))    return mode_ok();
     if (!strcmp(argv[1], "exit")) return mode_exit(argc > 2 ? argv[2] : "0");
     if (!strcmp(argv[1], "hang")) return mode_hang();
     if (!strcmp(argv[1], "net"))  return mode_net(argc > 2 ? argv[2] : NULL);
+    if (!strcmp(argv[1], "flapper")) return mode_flapper(argc > 2 ? argv[2] : NULL);
     fprintf(stderr, "fakesvc: unknown mode %s\n", argv[1]);
     return 2;
 }
