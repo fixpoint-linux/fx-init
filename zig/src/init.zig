@@ -122,6 +122,29 @@ var g_log: ?*dl_db = null;
 var g_svc: ?[*]Svc = null;
 var g_nsvc: c_int = 0;
 var g_svc_cap: c_int = 0;
+
+/// The service-table BOUND.  main_loop's poll set holds exactly
+/// [2 + 1 + 1 + SVC_MAX] fds (sigpipe+ctrl, virtio, fifo, then one pipe
+/// per non-console service): a configuration with MORE distinct services
+/// used to load fine (svc_name_cb grew 16->32->64->128 unbounded) while
+/// the poll loop's `nfd < pf.len` guard silently dropped service pipes
+/// beyond the window — their stdout never drained, so the service could
+/// block forever on a full pipe.  Right in the small, silently inert
+/// beyond the limit.  Now the bound is ENFORCED: svc_name_cb records the
+/// first distinct service past it and read_store_facts REFUSES the
+/// configuration loudly, by name, with the count and the limit.
+const SVC_MAX: usize = 64;
+const SVC_MAX_I: c_int = @intCast(SVC_MAX);
+
+/// Set by svc_name_cb when a DISTINCT service arrives past SVC_MAX;
+/// read_store_facts refuses the whole configuration when it is set.
+var g_svc_overflow: c_int = 0;
+/// The first offender's name (the refusal names it) and how many svc ROWS
+/// were skipped past the window (rows, not distinct names: a name can
+/// repeat across epochs — the message says "rows" and means rows).
+var g_svc_over_name: [128]u8 = [_]u8{0} ** 128;
+var g_svc_over_rows: c_int = 0;
+
 var g_boot_version: u32 = 0;
 var g_current_version: u32 = 0;
 var g_buildfile: [1024]u8 = [_]u8{0} ** 1024;
@@ -759,6 +782,117 @@ fn bootlog_newest_ok_below(v: u32, out: *u32) c_int {
     return found;
 }
 
+// ─── recovery journal: <store>/.recovery (the oscillator made visible) ────
+//
+// THE MEASUREMENT GAP (why a plain count file): every individual boot is
+// locally correct — a failure, then a successful-looking recovery — so a
+// reader looking at ONE boot cannot see the cycle; nothing in the running
+// system COUNTS recoveries.  The runtime DB is unreadable from outside
+// PID1 (state.db is held under a process-lifetime exclusive lock — the
+// reason fxctl is unusable in-guest), so the record must be a plain file
+// beside <store>/.bootlog, readable the same way fx-harness's fx_outcome
+// already reads .bootlog and .db/snapshots/CURRENT: cat the file.
+//
+// SHAPE — an append-only JOURNAL, not a bare number:
+//   * a bare count says "recovered 7x" but cannot say whether that is one
+//     fault coming back or seven unrelated ones.  Each line carries the
+//     recovered CONTENT's genhash, so identical genhashes on multiple
+//     lines = the same fault recurring (the oscillation signature), and
+//     the count is still just the number of data lines;
+//   * append-only (fopen "a" + fsync + syncfs, bootlog_append's exact
+//     durability class) keeps one file, one writer, no rewrite-in-place
+//     whose partial state could read as a wrong count.
+//
+// TIMING — the append lands inside decide_boot_version's roll-forward
+// branch, which main calls BEFORE read_store_facts, the in-progress
+// bootlog line, run_dhake, and the first service fork: every failure
+// mode of the recovered boot (dhake failure, a service exiting inside
+// the grace window, grace expiry) runs AFTER the increment is durable.
+// A counter written at boot-ok would read 0 on a machine whose every
+// recovery re-fails — blind exactly when it matters.
+//
+// REACHABILITY — the value is a function of boot outcomes, not of agent
+// input: nothing on any control channel can append to or reset it (the
+// only writer is this code path, reached iff fx_store_rollback returned
+// 0 inside the AUTOMATIC recovery branch).  An in-guest agent running as
+// root CAN forge or truncate the file with a plain write — the same
+// exposure class .bootlog already has and the recovery decision already
+// trusts; unlike a DB counter, though, the measurement is RECONSTRUCTIBLE
+// from independent state (.bootlog x the store's per-version genhash
+// history — exactly what guard_stats_for walks), so a forged journal
+// line is checkable against, not authoritative over, the store's history.
+
+/// The header IS the definition, in the file itself — the reader (harness,
+/// operator) must not have to read init.zig to know what was counted.
+const RECOVERY_HEADER =
+    \\# fx-init recovery journal. One DATA line per AUTOMATIC roll-forward:
+    \\# fx-init republished an older ok generation because the current
+    \\# version's last .bootlog verdict was failed/in-progress. The count
+    \\# of recoveries is the number of lines starting with a digit.
+    \\# NOT counted: operator rollbacks (fxctl/fxstore `rollback`),
+    \\# activations, ordinary boots, and boots where recovery was REFUSED
+    \\# by the guardrail (the hold appends nothing).
+    \\# Same fault coming back: multiple lines whose trailing genhash is
+    \\# IDENTICAL are the same CONTENT re-failing — the recurrence a bare
+    \\# count cannot show. This file still cannot say the machine is
+    \\# oscillating RIGHT NOW: read the epochs below and .bootlog for the
+    \\# interleaving.
+    \\# Written only by fx-init at the roll-forward decision. Root in-guest
+    \\# can forge or truncate it exactly as it can .bootlog; the counts are
+    \\# reconstructible from .bootlog x the store's version/genhash history.
+    \\# line: <epoch-s> <published-version> <from-failed-version> <content-genhash|->
+    \\
+;
+
+fn recovery_path(out: [*]u8, cap: usize) void {
+    snfmtRaw(out, cap, "{s}/.recovery", .{span(g_store)});
+}
+
+/// One journal line. Pure (unit-tested): epoch first so the file sorts by
+/// time with sort(1), then the version pair, then the content id ("-" when
+/// the genhash was unresolvable — an honest absence, not a guess).
+fn recovery_line(out: []u8, epoch: u32, published: u32, from_failed: u32, gh: []const u8) []const u8 {
+    return snfmt(out, "{d} {d} {d} {s}\n", .{ epoch, published, from_failed, gh });
+}
+
+/// Ensure the journal (with its definition header) exists on every store —
+/// a machine that has NEVER recovered reads "file present, zero data
+/// lines", which is a measurement, not an absence.  Runs once per boot at
+/// the top of decide_boot_version: an access() no-op after the first boot.
+fn recovery_ensure() void {
+    var p: [1100]u8 = undefined;
+    recovery_path(&p, p.len);
+    if (std.c.access(@ptrCast(&p), F_OK) == 0) return;
+    _ = mkdirp(g_store);
+    const f = fopen(@ptrCast(&p), "w") orelse return;
+    _ = fprintf(f, "%s", @as([*:0]const u8, RECOVERY_HEADER));
+    _ = fflush(f);
+    _ = fsync(fileno(f));
+    _ = fclose(f);
+    syncfs_store();
+}
+
+/// Append one recovery. Called ONLY from decide_boot_version's roll-forward
+/// branch, after the rollback committed (rb == 0) — see TIMING above.  A
+/// machine dying between the rollback commit and this append undercounts by
+/// one: the next boot sees the rolled-forward CURRENT with no matching
+/// journal line and does not re-trigger (bootlog_last reads the OLD
+/// version's failed verdict, which no longer equals CURRENT), so the
+/// missing line is never re-added — bounded, stated, accepted.
+fn recovery_append(published: u32, from_failed: u32, gh: []const u8) void {
+    var p: [1100]u8 = undefined;
+    recovery_path(&p, p.len);
+    _ = mkdirp(g_store);
+    const f = fopen(@ptrCast(&p), "a") orelse return;
+    var line: [128]u8 = undefined;
+    const l = recovery_line(&line, now_s(), published, from_failed, gh);
+    _ = fwrite(l.ptr, 1, l.len, f);
+    _ = fflush(f);
+    _ = fsync(fileno(f));
+    _ = fclose(f);
+    syncfs_store();
+}
+
 /// Enumerate ALL published snapshot versions into a malloc'd ASCENDING
 /// array (caller frees; null on any anomaly — callers fail open, exactly
 /// as they did on an unenumerable store).  dl_snapshot_versions fills the
@@ -1082,6 +1216,21 @@ fn svc_name_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
     const x: *SvcCtx = @ptrCast(@alignCast(user.?));
     const name = dl_intern_str_of(x.db, c[0]) orelse return 0;
     if (svc_find(name) != null) return 0;
+    // THE BOUND (see SVC_MAX): the growth ladder below now ends at 64 —
+    // this arm takes over for every distinct service past the poll
+    // window.  LOUD, not silent: record the first offender's name and
+    // keep counting rows (return 0 so the enumeration finishes — the
+    // refusal can then state exactly how many rows were skipped);
+    // read_store_facts refuses the configuration.
+    if (g_nsvc >= SVC_MAX_I) {
+        if (g_svc_overflow == 0) {
+            _ = strncpy(&g_svc_over_name, name, g_svc_over_name.len - 1);
+            g_svc_over_name[g_svc_over_name.len - 1] = 0;
+            g_svc_overflow = 1;
+        }
+        g_svc_over_rows += 1;
+        return 0;
+    }
     if (g_nsvc >= g_svc_cap) {
         const nc: c_int = if (g_svc_cap != 0) g_svc_cap * 2 else 16;
         const ns = reallocT(Svc, g_svc, @intCast(nc)) orelse return 1;
@@ -1265,14 +1414,12 @@ fn grace_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
-fn read_store_facts(version: u32) c_int {
-    var err: [1024]u8 = undefined;
-    const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
-        errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
-        return -1;
-    };
-    const db = store_db(s);
-
+/// Free the service table (shared by read_store_facts' rebuild and its
+/// svc-refusal path).  Leaves g_nsvc = 0: a refused configuration runs
+/// NOTHING — the first 64 rows would otherwise sit in the table with
+/// argv/env UNFILLED (the metadata loop never ran for them) and
+/// start_service's exec_sh_retry would unwrap null argv.
+fn svc_table_free() void {
     var i: c_int = 0;
     while (i < g_nsvc) : (i += 1) {
         cfree(g_svc.?[@intCast(i)].argv);
@@ -1283,6 +1430,19 @@ fn read_store_facts(version: u32) c_int {
     g_svc = null;
     g_nsvc = 0;
     g_svc_cap = 0;
+}
+
+fn read_store_facts(version: u32) c_int {
+    var err: [1024]u8 = undefined;
+    const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
+        errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
+        return -1;
+    };
+    const db = store_db(s);
+
+    svc_table_free();
+    g_svc_overflow = 0;
+    g_svc_over_rows = 0;
 
     var gp = GenPick{};
     _ = dl_query_version(db, version, "generation", gen_pick_cb, &gp);
@@ -1308,8 +1468,22 @@ fn read_store_facts(version: u32) c_int {
 
     var sc = SvcCtx{ .db = db };
     _ = dl_query_version(db, version, "svc", svc_name_cb, &sc);
+    if (g_svc_overflow != 0) {
+        // REFUSE the configuration, by name, with the count and the limit
+        // (the loud arm of the SVC_MAX bound — see svc_name_cb).  The
+        // partial table is FREED, not kept: nothing from a refused
+        // configuration runs.  Distinct rc (-2) so callers can tell a
+        // refused CONFIG from a missing generation.
+        svc_table_free();
+        var m: [256]u8 = undefined;
+        _ = snfmtRaw(&m, m.len, "service '{s}' is #{d} of the declared set; the supervision poll window holds {d} ({d} svc rows past it skipped) — configuration refused", .{ span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+        errf("fx-init: refusing service table: {s}\n", .{span(@ptrCast(&m))});
+        log_line("fx-init", "error", @ptrCast(&m));
+        store_close_durable(s);
+        return -2;
+    }
 
-    i = 0;
+    var i: c_int = 0;
     while (i < g_nsvc) : (i += 1) {
         const sv = &g_svc.?[@intCast(i)];
         const sn = dl_intern_str(db, @ptrCast(&sv.name));
@@ -1369,6 +1543,10 @@ fn read_store_facts(version: u32) c_int {
 // ─── boot decision + dhake materialization (fx-init.c:628-745) ────────────
 
 fn decide_boot_version() u32 {
+    // the journal must exist from the machine's FIRST boot (header only,
+    // zero data lines = "never auto-recovered" is a measurement) — before
+    // any branch below can return early.
+    recovery_ensure();
     var err: [1024]u8 = undefined;
     const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
         errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
@@ -1421,6 +1599,10 @@ fn decide_boot_version() u32 {
                 if (fx_store_open_wrap(g_store, &e2, e2.len)) |rs| {
                     // fx_store_rollback is snapshot-complete: it restores every
                     // relation as-of vok (facts + provenance pair) itself.
+                    // v_failed must be captured BEFORE the rollback: the
+                    // current_version rewrite below overwrites g_current_version
+                    // with the NEWLY PUBLISHED version (the journal's `from`).
+                    const v_failed: u32 = g_current_version;
                     const rb: c_int = fx_store_rollback_wrap(rs, vok, false, &e2, e2.len);
                     _ = fx_store_current_version_wrap(rs, &g_current_version, &e2, e2.len);
                     if (rb == 0) {
@@ -1432,6 +1614,14 @@ fn decide_boot_version() u32 {
                         // mid-writeback (see store_close_durable).  Flush the
                         // store's OWN filesystem before this boot can be killed.
                         syncfs_store();
+                        // THE COUNTER (see the recovery journal section): the
+                        // increment lands HERE — after the rollback committed,
+                        // before read_store_facts/the first service fork — so
+                        // it is already durable when every failure mode of the
+                        // recovered boot runs (the oscillator's recoveries all
+                        // re-fail and must still count).  "-" keeps the line
+                        // when the candidate's genhash was unresolvable.
+                        recovery_append(g_current_version, v_failed, if (have_gh != 0) span(@ptrCast(&gh)) else "-");
                     } else {
                         errf("fx-init: roll-forward failed: {s}\n", .{span(@ptrCast(&e2))});
                     }
@@ -1841,6 +2031,7 @@ const DISK_DEV_BASE = "/dev/vda";
 const DISK_DEV_PART = "/dev/vda1";
 const DISK_STORE_DB = DISK_STORE ++ "/.db";
 const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
+const DISK_STORE_RECOVERY = DISK_STORE ++ "/.recovery";
 const Dirent = extern struct {
     d_ino: u64,
     d_off: i64,
@@ -1997,13 +2188,18 @@ fn ensure_disk_store() void {
         const ramfs_v = store_current_of(DEFAULT_STORE);
         if (ramfs_v != 0 and ramfs_v > disk_v) {
             // adopt: the ramfs (image) generation is NEWER.  Replace the
-            // disk store wholesale but keep its .bootlog aside — restoring
-            // the boot history is what makes the next boot's roll-forward
-            // decision read a disk a PRIOR boot wrote.
+            // disk store wholesale but keep its .bootlog and .recovery
+            // aside — restoring the boot history is what makes the next
+            // boot's roll-forward decision read a disk a PRIOR boot
+            // wrote, and the recovery journal is the same machine-lifetime
+            // record: an adopt must not silently zero the oscillator
+            // count while keeping the failures it counts.
             _ = run_bb("mv", DISK_STORE_BOOTLOG, "/fx/disk/bootlog.keep", null);
+            _ = run_bb("mv", DISK_STORE_RECOVERY, "/fx/disk/recovery.keep", null);
             _ = run_bb("rm", "-rf", DISK_STORE, null);
             const cp = run_bb("cp", "-a", DEFAULT_STORE, DISK_MOUNT);
             _ = run_bb("mv", "/fx/disk/bootlog.keep", DISK_STORE_BOOTLOG, null);
+            _ = run_bb("mv", "/fx/disk/recovery.keep", DISK_STORE_RECOVERY, null);
             if (cp != 0) {
                 errf("fx-init: disk: adopt cp FAILED (exit {d}) — disk store disabled\n", .{cp});
                 return;
@@ -3135,6 +3331,22 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
             store_close_durable(s);
             _ = read_store_facts(g_current_version);
+            if (g_svc_overflow != 0) {
+                // The activated CONFIGURATION exceeds the service bound:
+                // read_store_facts refused it (loud line above — name,
+                // count, limit) and freed the table.  The store CURRENT
+                // already moved (the activate child committed), so say
+                // BOTH facts in the response; do NOT re-arm the boot
+                // decision and do NOT materialize — an EMPTY service
+                // table would judge the new generation with a vacuous
+                // boot-ok.  The operator rolls back or activates a
+                // smaller config.
+                var m: [256]u8 = undefined;
+                _ = snfmtRaw(&m, m.len, "activated version {d} but REFUSED: service '{s}' is #{d}, window {d}, {d} rows past it", .{ g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                log_line("fx-init", "error", @ptrCast(&m));
+                resp_err(o, @ptrCast(&m));
+                return;
+            }
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
@@ -3219,6 +3431,18 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             // response — flush everything before answering.
             syncfs_store();
             _ = read_store_facts(g_current_version);
+            if (g_svc_overflow != 0) {
+                // The rolled-back-to CONFIGURATION exceeds the service
+                // bound: read_store_facts refused it (loud line above) and
+                // freed the table.  The rollback itself DID land in the
+                // store — say both facts; the running system manages NO
+                // services from the refused set.
+                var m: [256]u8 = undefined;
+                _ = snfmtRaw(&m, m.len, "rolled back to version {d} (current {d}) but service table REFUSED: '{s}' is #{d}, window {d}, {d} rows past it", .{ v, g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                log_line("fx-init", "error", @ptrCast(&m));
+                resp_err(o, @ptrCast(&m));
+                return;
+            }
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
@@ -3768,15 +3992,20 @@ fn next_timeout() i32 {
 
 fn main_loop() void {
     while (g_shutdown.load(.monotonic) == 0) {
-        // [2 + 1 + 1 + 64]: sigpipe+ctrl, the VIRTIO port, the fifo control
-        // fd, then 64 service pipes.  EVERY fixed fd the loop can add must
-        // be in the arithmetic: the virtio fd was missing, so with virtio +
-        // fifo + 64 services all up the array was ONE SHORT and the last
-        // service pipe silently dropped out of the poll set — the
-        // nfd<pf.len guard prevents the overrun but starves that pipe
-        // (drain_pipe runs only on poll revents, so its service's stdout
-        // would never drain and could block on a full pipe).
-        var pf: [2 + 1 + 1 + 64]std.posix.pollfd = undefined;
+        // [2 + 1 + 1 + SVC_MAX]: sigpipe+ctrl, the VIRTIO port, the fifo
+        // control fd, then one pipe per non-console service.  EVERY fixed
+        // fd the loop can add must be in the arithmetic: the virtio fd was
+        // missing, so with virtio + fifo + 64 services all up the array
+        // was ONE SHORT and the last service pipe silently dropped out of
+        // the poll set — the nfd<pf.len guard prevents the overrun but
+        // starves that pipe (drain_pipe runs only on poll revents, so its
+        // service's stdout would never drain and could block on a full
+        // pipe).  The window is now an ENFORCED BOUND, not a silent cliff:
+        // svc_name_cb refuses any configuration with more than SVC_MAX
+        // distinct services (loud, by name — read_store_facts), so the
+        // `nfd < pf.len` clamp below is unreachable belt, never a load-
+        // bearing starvation path.
+        var pf: [2 + 1 + 1 + SVC_MAX]std.posix.pollfd = undefined;
         var nfd: usize = 0;
         pf[nfd] = .{ .fd = g_sigpipe[0], .events = std.posix.POLL.IN, .revents = 0 };
         nfd += 1;
@@ -4135,8 +4364,14 @@ pub fn main(init: std.process.Init) !void {
 
     g_boot_start_ms = now_ms();
     const boot_v = decide_boot_version();
-    if (boot_v == 0 or read_store_facts(boot_v) != 0) {
-        errf("fx-init: no generation to boot\n", .{});
+    const facts_rc: c_int = if (boot_v == 0) -1 else read_store_facts(boot_v);
+    if (boot_v == 0 or facts_rc != 0) {
+        // -2 = the CONFIGURATION was refused (the service-table bound);
+        // its LOUD line (name + count + limit) already printed above, and
+        // "no generation to boot" would be FALSE — the generation exists,
+        // the config is just too wide to supervise.  Every other failure
+        // is genuinely "nothing bootable at this version".
+        if (facts_rc != -2) errf("fx-init: no generation to boot\n", .{});
         errf("fx-init: boot-FAILED v{d}\n", .{g_current_version});
         g_boot_version = 0;
         // Pin the verdict: no services were loaded, so boot_decision would
@@ -4622,4 +4857,28 @@ test "on_ready: up-graph + time gate (supervise fakes not needed)" {
     g_boot_start_ms = 0;
     @memcpy(svcs[1].on_arg[0.."1".len], "1");
     try std.testing.expectEqual(@as(c_int, 1), on_ready(&svcs[1]));
+}
+
+test "recovery journal: the header carries the definition (reader-facing contract)" {
+    // The file IS the reader's only documentation of what was counted —
+    // these phrases cannot silently disappear from it.
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "AUTOMATIC roll-forward") != null);
+    // what does NOT count must be IN the file, not only in this source
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "rollback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "REFUSED") != null);
+    // the recurrence rule + the honesty line about what the file cannot say
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "IDENTICAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "RIGHT NOW") != null);
+    // the grammar line documents the data format
+    try std.testing.expect(std.mem.indexOf(u8, RECOVERY_HEADER, "<epoch-s>") != null);
+}
+
+test "recovery_line: one data line, epoch-first, '-' for an unresolvable genhash" {
+    var buf: [128]u8 = undefined;
+    const l = recovery_line(&buf, 1697000001, 9, 7, "deadbeef");
+    try std.testing.expectEqualStrings("1697000001 9 7 deadbeef\n", l);
+    // an unresolvable genhash still records the RECOVERY (it happened);
+    // "-" is an honest absence, not a fabricated content id
+    const l2 = recovery_line(&buf, 5, 12, 11, "-");
+    try std.testing.expectEqualStrings("5 12 11 -\n", l2);
 }
