@@ -888,6 +888,22 @@ fn clearRel(db: *DlDb, rel: [*:0]const u8, arity: u8) error{ ClearFailed, OutOfM
 /// inside main's open txn, just before dl_txn_commit):
 ///   store(hash, name)        for every closure entry
 ///   srcstore(src_hash, name) for every .path closure entry
+///   src_of(hash, src_hash, name) ONLY for entries with a src_hash — the
+///                            PAIR store/srcstore names only side by side:
+///                            srcstore is append-only (reaped only when its
+///                            NAME becomes unreachable), so after a rebuild
+///                            one name carries SEVERAL live srcstore rows and
+///                            nothing says which source THIS derivation was
+///                            folded from.  src_of's deriv hash is byte-wise
+///                            the `<hash>` of provides' `<hash>-<pkg>` (both
+///                            are it.hash here), so a reader holding the
+///                            store dir resolves the exact src_hash with no
+///                            guessing.  NO row when src_hash is null (a
+///                            fetch-src package, or source absent): absence
+///                            means "cannot attribute", never "any".  Like
+///                            store/srcstore it is never cleared per
+///                            activation — rows key on deriv_hash, which a
+///                            rebuild changes, so no two rows collide.
 ///   activate_root(root)      ONLY-IF-ABSENT — the root the committed
 ///                            derivation hashes embed (dep store paths are
 ///                            root-qualified); the fallback recomputes dep
@@ -896,17 +912,20 @@ fn clearRel(db: *DlDb, rel: [*:0]const u8, arity: u8) error{ ClearFailed, OutOfM
 ///                            rewrite history the fallback depends on.
 /// Duplicates are DAFSA no-ops, so re-activation is idempotent.
 fn commitClosureMeta(db: *DlDb, entries: []PathEntry, store_root: []const u8) void {
-    // store/srcstore are declared by fx_store_open; activate_root is ours
-    // (dl_txn_add_fact REJECTS unknown relations, and addFact does not
-    // surface that — declare idempotently so the fact always lands).
+    // store/srcstore are declared by fx_store_open; activate_root and src_of
+    // are ours (dl_txn_add_fact REJECTS unknown relations, and addFact does
+    // not surface that — declare idempotently so the fact always lands).
     var e_meta: ErrBuf = .{};
     _ = declare(db, "activate_root", 1, &e_meta) catch {};
+    _ = declare(db, "src_of", 3, &e_meta) catch {};
     for (entries) |*it| {
         const store_cols = [2]u32{ fx.dl_intern_str(db, dupeZ(it.hash)), fx.dl_intern_str(db, dupeZ(it.p.name)) };
         addFact(db, "store", &store_cols);
         if (it.src_hash) |sh| {
             const src_cols = [2]u32{ fx.dl_intern_str(db, dupeZ(sh)), fx.dl_intern_str(db, dupeZ(it.p.name)) };
             addFact(db, "srcstore", &src_cols);
+            const of_cols = [3]u32{ fx.dl_intern_str(db, dupeZ(it.hash)), fx.dl_intern_str(db, dupeZ(sh)), fx.dl_intern_str(db, dupeZ(it.p.name)) };
+            addFact(db, "src_of", &of_cols);
         }
     }
     const root_sym = fx.dl_intern_str(db, dupeZ(store_root));
@@ -1796,6 +1815,55 @@ test "src-free: publication round trip (store/srcstore/activate_root facts)" {
     _ = fx.dl_query(db, "store", &bagCb, &tbag);
     try testing.expectEqual(@as(usize, 2), sbag.b.items.len); // col1 = NAME
     try testing.expectEqual(@as(usize, 2), tbag.b.items.len);
+
+    // src_of(deriv_hash, src_hash, name) a3: one row per srcstore row, and
+    // its deriv hash is EXACTLY the `store` row hash of the same name — the
+    // pair a consumer resolves the generation's source through (a row whose
+    // col0 did not equal the store hash would re-create the ambiguity the
+    // relation exists to close).
+    const Bag3 = struct {
+        db: *DlDb,
+        alloc: std.mem.Allocator,
+        a: std.ArrayList([]const u8) = .empty,
+        b: std.ArrayList([]const u8) = .empty,
+        c: std.ArrayList([]const u8) = .empty,
+    };
+    const bag3Cb = struct {
+        fn f(cols: [*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+            _ = arity;
+            const bg: *Bag3 = @ptrCast(@alignCast(user.?));
+            const x = fx.dl_intern_str_of(bg.db, cols[0]) orelse return 1;
+            const y = fx.dl_intern_str_of(bg.db, cols[1]) orelse return 1;
+            const z = fx.dl_intern_str_of(bg.db, cols[2]) orelse return 1;
+            const xd = bg.alloc.dupe(u8, std.mem.span(x)) catch return 1;
+            const yd = bg.alloc.dupe(u8, std.mem.span(y)) catch return 1;
+            const zd = bg.alloc.dupe(u8, std.mem.span(z)) catch return 1;
+            bg.a.append(bg.alloc, xd) catch return 1;
+            bg.b.append(bg.alloc, yd) catch return 1;
+            bg.c.append(bg.alloc, zd) catch return 1;
+            return 0;
+        }
+    }.f;
+    var obag = Bag3{ .db = db, .alloc = arena.allocator() };
+    _ = fx.dl_query(db, "src_of", &bag3Cb, &obag);
+    try testing.expectEqual(@as(usize, 2), obag.c.items.len);
+    for (sbag.a.items, sbag.b.items) |src, name| {
+        var deriv: ?[]const u8 = null;
+        for (obag.a.items, obag.b.items, obag.c.items) |d, s2, n2| {
+            if (!std.mem.eql(u8, n2, name)) continue;
+            try testing.expect(deriv == null); // one row per name here
+            try testing.expectEqualStrings(src, s2); // src pairs
+            deriv = d;
+        }
+        try testing.expect(deriv != null);
+        // and the deriv hash IS the store hash for that name
+        var sh: ?[]const u8 = null;
+        for (tbag.a.items, tbag.b.items) |h, n3| {
+            if (std.mem.eql(u8, n3, name)) sh = h;
+        }
+        try testing.expect(sh != null);
+        try testing.expectEqualStrings(sh.?, deriv.?);
+    }
 
     // activate_root == the store root, exactly one row
     var root_buf: [PATH_MAX]u8 = undefined;
