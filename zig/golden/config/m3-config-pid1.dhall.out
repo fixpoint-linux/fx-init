@@ -45,3 +45,4 @@ service[2].probe_kind=FX_PROBE_NONE
 service[2].probe_arg=-
 service[2].console=-
 grace_ms=5000
+agent_service=-

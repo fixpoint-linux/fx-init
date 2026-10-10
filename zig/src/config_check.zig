@@ -62,5 +62,9 @@ pub fn main(init: std.process.Init) !void {
         try out.print("etc[{d}].content={s}\n", .{ i, f.content });
     }
     try out.print("grace_ms={d}\n", .{cfg.grace_ms});
+    // agentService rides the dump for the same reason console does (M6):
+    // config_diff must SEE a walker regression that drops or mis-parses
+    // the declaration, not just the refusals validation would catch.
+    try out.print("agent_service={s}\n", .{cfg.agent_service orelse "-"});
     try out.flush();
 }

@@ -120,6 +120,11 @@ pub const FxConfig = struct {
     packages: []const []const u8,
     users: []const FxUser,
     services: []const FxService,
+    // REQUIRED in the config record (the FIELD cannot be omitted —
+    // build_config refuses; the VALUE may be None to declare "this system
+    // has no agent service").  validate() refuses a named agent that does
+    // not exist or is not a console service; see the comment there.
+    agent_service: ?[]const u8,
     extra_etc: []const FxEtcFile,
     grace_ms: u32, // default 30000
 };
@@ -606,6 +611,29 @@ fn validate(cfg: *FxConfig, e: *ErrBuf) error{FxConfig}!void {
                 return e.set("duplicate uid {d} (users '{s}' and '{s}')", .{ u.uid, j.name, u.name });
         }
     }
+    // The declared AGENT service must exist and MUST be a console service.
+    // fx-init pins 'failed' for a NON-console service that exits during the
+    // boot grace window WITHOUT consulting the exit status (init.zig
+    // reap_children), and the agent's refusal path deliberately exits 0 — a
+    // non-console agent would turn every refusal into a roll-forward
+    // oscillator: the pinned failure makes the next boot roll forward to an
+    // older ok generation that re-runs the agent, which refuses again.
+    // Refusing HERE puts the failure at config-check/activation, where the
+    // operator sees it named, instead of as that spiral.  (fx-init itself
+    // needs the identity for NOTHING else: the console exemption at boot
+    // follows from the service's own console flag.)
+    if (cfg.agent_service) |name| {
+        var found = false;
+        for (cfg.services) |*s| {
+            if (!std.mem.eql(u8, s.name, name)) continue;
+            found = true;
+            if (s.console == null)
+                return e.set("agentService '{s}': the agent service must be a console service (console = Some \"console\") — a non-console service that exits during the boot grace window pins the boot failed regardless of exit status, and the agent's refusal path exits 0 by design", .{name});
+            break;
+        }
+        if (!found)
+            return e.set("agentService '{s}' references an unknown service", .{name});
+    }
 }
 
 // ─── Structural walk ────────────────────────────────────────────────────────
@@ -616,6 +644,7 @@ fn build_config(out: *FxConfig, nf: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!v
         .packages = &.{},
         .users = &.{},
         .services = &.{},
+        .agent_service = null,
         .extra_etc = &.{},
         .grace_ms = 30000,
     };
@@ -672,6 +701,16 @@ fn build_config(out: *FxConfig, nf: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!v
     if (etc) |et| try map_extra_etc(out, et, e);
 
     if (try opt_nat(rec, "bootGraceMs", e, "config")) |g| out.grace_ms = g;
+
+    // agentService: Optional Text naming the agent service — but the FIELD
+    // ITSELF IS REQUIRED.  An optional field is silently inert for every
+    // deployment that forgets it; "this system has no agent" must be
+    // DECLARED (None), not defaulted to.  The presence check is the
+    // load-bearing half; the value's existence + console-ness is enforced
+    // in validate() with its siblings.
+    if (rec_get(rec, "agentService") == null)
+        return e.set("config missing 'agentService' (declare None Text if this system has no agent service)", .{});
+    out.agent_service = try opt_text(rec, "agentService", e, "config");
 
     return validate(out, e);
 }
@@ -862,6 +901,7 @@ test "console field: Some \"console\" parses, other values rejected, None defaul
         \\        ]
         \\    , extraEtc = None (List { path : Text, content : Text })
         \\    , bootGraceMs = Some 3000
+        \\    , agentService = Some "sh"
         \\    }
         \\
     ;
@@ -892,6 +932,73 @@ test "console field: Some \"console\" parses, other values rejected, None defaul
     var cfg2: FxConfig = undefined;
     try testing.expectError(error.FxConfig, fx_config_load(&cfg2, bad_path, &e));
     try testing.expect(std.mem.indexOf(u8, e.slice(), "console 'tty7777'") != null);
+}
+
+test "agentService: field required; Some non-console/unknown refused; Some console and None ok" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const pre =
+        \\let Probe = < Tcp : Natural | Unix : Text | File : Text >
+        \\let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
+        \\                restart : Optional Text, backoffMs : Optional Natural,
+        \\                probe : Optional Probe,
+        \\                env : Optional (List { key : Text, value : Text }),
+        \\                console : Optional Text }
+        \\let User = { name : Text, uid : Natural, groups : List Text }
+        \\in  { hostname = "fixbox"
+        \\    , packages = [] : List Text
+        \\    , users = [ { name = "root", uid = 0, groups = [] : List Text } ]
+        \\    , services =
+        \\        [ { name = "sh", argv = [ "/usr/fx-core/bin/fxsh" ], pkg = None Text,
+        \\            on = "all", restart = Some "never", backoffMs = None Natural,
+        \\            probe = None Probe,
+        \\            env = None (List { key : Text, value : Text }),
+        \\            console = Some "console" }
+        \\        , { name = "plain", argv = [ "/bin/true" ], pkg = None Text,
+        \\            on = "all", restart = None Text, backoffMs = None Natural,
+        \\            probe = None Probe,
+        \\            env = None (List { key : Text, value : Text }),
+        \\            console = None Text }
+        \\        ]
+        \\    , extraEtc = None (List { path : Text, content : Text })
+        \\    , bootGraceMs = Some 3000
+        \\
+    ;
+    const post =
+        \\    }
+        \\
+    ;
+    // load(agent_line, ...): writes <tmp>/cfg.dhall with the given
+    // agentService line spliced in ("" omits the field entirely) and loads
+    // it. want_err != null expects that refusal; want_name is the expected
+    // cfg.agent_service on success ("" = None).
+    const Case = struct { line: []const u8, want_err: ?[]const u8, want_name: []const u8 };
+    const cases = [_]Case{
+        .{ .line = ", agentService = Some \"sh\"", .want_err = null, .want_name = "sh" },
+        .{ .line = ", agentService = None Text", .want_err = null, .want_name = "" },
+        // omission is refused LOUDLY, not defaulted to None
+        .{ .line = "", .want_err = "config missing 'agentService'", .want_name = "" },
+        // a NON-console agent is the oscillator shape: refused, named
+        .{ .line = ", agentService = Some \"plain\"", .want_err = "agentService 'plain': the agent service must be a console service", .want_name = "" },
+        .{ .line = ", agentService = Some \"ghost\"", .want_err = "agentService 'ghost' references an unknown service", .want_name = "" },
+    };
+    for (cases) |c| {
+        const body = std.fmt.allocPrint(gpa_alloc, "{s}{s}{s}", .{ pre, c.line, post }) catch return error.SkipZigTest;
+        defer gpa_alloc.free(body);
+        try tmp.dir.writeFile(io, .{ .sub_path = "cfg.dhall", .data = body });
+        const path = try std.fmt.allocPrint(gpa_alloc, ".zig-cache/tmp/{s}/cfg.dhall", .{tmp.sub_path});
+        defer gpa_alloc.free(path);
+        var e = ErrBuf{};
+        var cfg: FxConfig = undefined;
+        if (c.want_err) |want| {
+            try testing.expectError(error.FxConfig, fx_config_load(&cfg, path, &e));
+            try testing.expect(std.mem.indexOf(u8, e.slice(), want) != null);
+        } else {
+            try fx_config_load(&cfg, path, &e);
+            try testing.expectEqualStrings(c.want_name, cfg.agent_service orelse "");
+        }
+    }
 }
 
 /// The exact extraEtc path predicate from map_extra_etc (config.c:339-343),

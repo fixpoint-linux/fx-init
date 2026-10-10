@@ -210,6 +210,7 @@ in  { hostname = "fixbox-alt"
         ]
     , extraEtc = None (List { path : Text, content : Text })
     , bootGraceMs = Some 5000
+    , agentService = None Text
     }
 EOF
 # the crasher variant for the NEGATIVE control (heartbeat + crasher-second)

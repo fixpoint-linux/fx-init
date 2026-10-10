@@ -20,5 +20,5 @@ in  { hostname = "fixbox"
             env = None (List { key : Text, value : Text }) }
         ]
     , extraEtc = Some [ { path = "motd", content = "welcome to fixbox" } ]
-    , bootGraceMs = Some 5000
+    , bootGraceMs = Some 5000, agentService = None Text
     }

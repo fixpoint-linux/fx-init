@@ -130,6 +130,7 @@ CFG_WIDE="$WORK/config-svc70.dhall"
     printf ' ]\n'
     printf '    , extraEtc = None (List { path : Text, content : Text })\n'
     printf '    , bootGraceMs = Some 8000\n'
+    printf '    , agentService = None Text\n'
     printf '    }\n'
 } > "$CFG_WIDE"
 echo "qemu-svclimit: generated $CFG_WIDE ($NSVC services)"

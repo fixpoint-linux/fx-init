@@ -148,6 +148,7 @@ in  { hostname = "probebox"
                    { name = "ambigd", argv = [ "ambig" ], pkg = Some "ambig", on = "all", restart = Some "always", backoffMs = Some 500, probe = None Probe, env = None (List { key : Text, value : Text }), console = None Text } ] : List Service
     , extraEtc = None (List { path : Text, content : Text })
     , bootGraceMs = Some 30000
+    , agentService = None Text
     }
 EOF
     _prov() { # pre-create the closure dirs for the CURRENT source

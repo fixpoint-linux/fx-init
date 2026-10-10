@@ -1553,6 +1553,7 @@ test "serialize_generation golden bytes" {
     };
     const cfg = FxConfig{
         .hostname = "h",
+        .agent_service = null,
         .packages = &.{},
         .users = &.{},
         .services = &.{
@@ -1645,6 +1646,7 @@ test "emit_buildfile: empty etc/bin render ] : List Action" {
 test "render_passwd/render_group incl. supplementary-gid rule" {
     const cfg = FxConfig{
         .hostname = "h",
+        .agent_service = null,
         .packages = &.{},
         .users = &.{
             .{ .name = "root", .uid = 0, .groups = &.{} },

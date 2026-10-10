@@ -36,3 +36,4 @@ service[1].console=-
 etc[0].path=motd
 etc[0].content=welcome to fixbox
 grace_ms=5000
+agent_service=-

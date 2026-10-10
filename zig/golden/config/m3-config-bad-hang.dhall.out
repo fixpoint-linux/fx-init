@@ -29,3 +29,4 @@ service[1].probe_kind=FX_PROBE_NONE
 service[1].probe_arg=-
 service[1].console=-
 grace_ms=2000
+agent_service=-

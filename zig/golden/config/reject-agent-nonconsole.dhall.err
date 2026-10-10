@@ -1,0 +1,1 @@
+fx-config-dump: agentService 'agentd': the agent service must be a console service (console = Some "console") — a non-console service that exits during the boot grace window pins the boot failed regardless of exit status, and the agent's refusal path exits 0 by design

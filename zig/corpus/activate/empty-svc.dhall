@@ -10,4 +10,4 @@ in  { hostname = "empty"
     , users = [ { name = "root", uid = 0, groups = [ "root" ] : List Text } ]
     , services = [] : List Service
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = None Natural }
+    , bootGraceMs = None Natural, agentService = None Text }

@@ -16,4 +16,4 @@ in  { hostname = "noclosure"
             probe = None Probe,
             env = None (List { key : Text, value : Text }) } ]
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = None Natural }
+    , bootGraceMs = None Natural, agentService = None Text }

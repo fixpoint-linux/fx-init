@@ -58,4 +58,5 @@ in  { hostname = "fixbox-diff"
              , { path = "issue.net", content = "fixbox diff fixture" }
              ] : Optional (List { path : Text, content : Text })
     , bootGraceMs = Some 4000
+    , agentService = None Text
     }

@@ -4,4 +4,4 @@ in  { hostname = "nofields"
     , packages = [ "dhake", "fx-init", "fxctl", "fx-activate" ]
     , users = [] : List { name : Text, uid : Natural, groups : List Text }
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = None Natural }
+    , bootGraceMs = None Natural, agentService = None Text }

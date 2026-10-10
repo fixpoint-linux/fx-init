@@ -22,4 +22,5 @@ in  { hostname = "fixbox"
         ]
     , extraEtc = None (List { path : Text, content : Text })
     , bootGraceMs = Some 8000
+    , agentService = None Text
     }

@@ -11,4 +11,4 @@ in  { hostname = "fixbox"
     , users = [] : List { name : Text, uid : Natural, groups : List Text }
     , services = [] : List Service
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = None Natural }
+    , bootGraceMs = None Natural, agentService = None Text }

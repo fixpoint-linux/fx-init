@@ -17,5 +17,5 @@ in  { hostname = "fixbox"
             env = None (List { key : Text, value : Text }) }
         ]
     , extraEtc = None (List { path : Text, content : Text })
-    , bootGraceMs = Some 1500
+    , bootGraceMs = Some 1500, agentService = None Text
     }
