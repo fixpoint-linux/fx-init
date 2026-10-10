@@ -716,12 +716,57 @@ fn bootlog_path(out: [*]u8, cap: usize) void {
     snfmtRaw(out, cap, "{s}/.bootlog", .{span(g_store)});
 }
 
+/// Find the `fx.bootnonce=<hex>` token in a kernel command line (the FIRST
+/// token-start occurrence wins, exactly like parse_kernel_store).  The value
+/// ends at the next space or control byte and must be 1..64 bytes; the
+/// literal "none" is RESERVED as the writer's no-nonce placeholder, so a
+/// host passing it is refused (treated as absent) rather than allowed to
+/// mint indistinguishable placeholder lines.
+fn parse_kernel_nonce(text: []const u8) ?[]const u8 {
+    const key = "fx.bootnonce=";
+    var rest = text;
+    while (std.mem.indexOf(u8, rest, key)) |hit| {
+        if (hit != 0 and rest[hit - 1] != ' ') {
+            rest = rest[hit + key.len ..]; // substring of another token: skip it
+            continue;
+        }
+        const val = rest[hit + key.len ..];
+        var end: usize = 0;
+        while (end < val.len and val[end] > ' ') end += 1;
+        if (end == 0 or end > 64) return null;
+        if (std.mem.eql(u8, val[0..end], "none")) return null;
+        return val[0..end];
+    }
+    return null;
+}
+
+/// Apply the kernel command line's `fx.bootnonce=` beside fx.store= — same
+/// window (after mount_early, before the first record append: decide_boot_version
+/// can write a .recovery row before anything else).  Absent is the NORMAL
+/// case (hand-boot, every non-harness launch) and stays silent: the
+/// placeholder does the talking on the record lines.  A nonce actually
+/// issued gets ONE console line so the host can see its token was read.
+fn apply_kernel_nonce() void {
+    var p: [512]u8 = undefined;
+    const root: []const u8 = if (g_probe_root) |r| span(r) else "";
+    _ = snfmt(&p, "{s}/proc/cmdline", .{root});
+    const f = fopen(@ptrCast(&p), "r") orelse return;
+    defer _ = fclose(f);
+    var buf: [4096]u8 = undefined;
+    const n = fread(&buf, 1, buf.len, f);
+    const nonce = parse_kernel_nonce(std.mem.sliceTo(buf[0..n], 0)) orelse return;
+    @memcpy(g_boot_nonce_buf[0..nonce.len], nonce);
+    g_boot_nonce_buf[nonce.len] = 0;
+    g_boot_nonce = g_boot_nonce_buf[0..nonce.len];
+    errf("fx-init: boot nonce {s}\n", .{nonce});
+}
+
 fn bootlog_append(v: u32, status: [*:0]const u8, epoch: u32) void {
     var p: [1100]u8 = undefined;
     bootlog_path(&p, p.len);
     _ = mkdirp(g_store);
     const f = fopen(@ptrCast(&p), "a") orelse return;
-    _ = fprintf(f, "%u %s %u\n", v, status, epoch);
+    _ = fprintf(f, "%u %s %u %s\n", v, status, epoch, boot_nonce_str());
     _ = fflush(f);
     _ = fsync(fileno(f));
     _ = fclose(f);
@@ -840,7 +885,12 @@ const RECOVERY_HEADER =
     \\# Written only by fx-init at the roll-forward decision. Root in-guest
     \\# can forge or truncate it exactly as it can .bootlog; the counts are
     \\# reconstructible from .bootlog x the store's version/genhash history.
-    \\# line: <epoch-s> <published-version> <from-failed-version> <content-genhash|->
+    \\# line: <epoch-s> <published-version> <from-failed-version> <content-genhash|-> <boot-nonce|none>
+    \\# The final field is THIS boot's fx.bootnonce= token from the kernel
+    \\# command line (the HOST's per-launch record of the boot that wrote the
+    \\# row; "none" = the host issued no nonce — an operator hand-boot).
+    \\# It binds the row to that boot the way .bootlog's 4th field binds a
+    \\# line: same boot, same nonce, fx-init never writes without one.
     \\
 ;
 
@@ -852,7 +902,7 @@ fn recovery_path(out: [*]u8, cap: usize) void {
 /// time with sort(1), then the version pair, then the content id ("-" when
 /// the genhash was unresolvable — an honest absence, not a guess).
 fn recovery_line(out: []u8, epoch: u32, published: u32, from_failed: u32, gh: []const u8) []const u8 {
-    return snfmt(out, "{d} {d} {d} {s}\n", .{ epoch, published, from_failed, gh });
+    return snfmt(out, "{d} {d} {d} {s} {s}\n", .{ epoch, published, from_failed, gh, boot_nonce_str() });
 }
 
 /// Ensure the journal (with its definition header) exists on every store —
@@ -4174,6 +4224,30 @@ fn usage(o: *FILE) void {
 /// points here, so the storage must outlive apply_kernel_store's frame.
 var g_store_buf: [256]u8 = [_]u8{0} ** 256;
 
+/// THE PER-BOOT NONCE — the host's own record of THIS boot, handed down on
+/// the kernel command line (`fx.bootnonce=<hex>`, minted per launch by the
+/// hypervisor).  fx-init stamps it on every .bootlog line and .recovery row
+/// it appends during this PID1 lifetime, so the host-side audit
+/// (fx-harness's fx-audit, fed the host's nonce ledger) can bind record
+/// growth to the exact boot that wrote it: a forged line-PAIR appended into
+/// the slack of a silent boot cannot wear a nonce it was never issued (the
+/// guest can read /proc/cmdline and learn ONLY this boot's nonce — future
+/// nonces do not exist yet, past ones appear in-guest solely on lines that
+/// already spent their per-boot line budget).  null = the host issued none
+/// (an operator booting by hand): every line then carries the DISTINCT,
+/// non-hex placeholder "none" — never a guessable or empty value — so the
+/// audit can tell "no nonce was issued" from "a nonce was issued and this
+/// line does not carry it".
+var g_boot_nonce: ?[]const u8 = null;
+var g_boot_nonce_buf: [65]u8 = [_]u8{0} ** 65;
+
+/// The string every appended record line carries as its nonce field
+/// (NUL-terminated: boot_nonce_buf[nonce.len] is always 0).
+fn boot_nonce_str() [*:0]const u8 {
+    if (g_boot_nonce) |_| return @ptrCast(&g_boot_nonce_buf);
+    return "none";
+}
+
 /// Find the `fx.store=<path>` token in a kernel command line and return the
 /// path, or null when there is none to use (the FIRST token-start occurrence
 /// wins).  The kernel passes rdinit NO argv (measured), so /proc/cmdline is
@@ -4311,6 +4385,10 @@ pub fn main(init: std.process.Init) !void {
     // banner shows the chosen store; ensure_disk_store below keeps its
     // existing precedence and may still relocate g_store afterwards.
     apply_kernel_store(store_explicit);
+    // the per-boot nonce rides the same channel (the kernel command line)
+    // and must be latched before ANY record append — decide_boot_version
+    // below can write a .recovery row before anything else this boot does.
+    apply_kernel_nonce();
     errf("fx-init: boot start store {s}\n", .{span(g_store)});
     // the persistent store must be up (and g_store repointed at it) before
     // ANY store handle is opened — the first open is inside
@@ -4530,6 +4608,85 @@ test "parse_kernel_store: the shapes a kernel command line actually has" {
     // falling through to a later non-empty token
     try std.testing.expectEqualStrings("/first", parse_kernel_store("fx.store=/first fx.store=/second").?);
     try std.testing.expect(parse_kernel_store("fx.store= fx.store=/second") == null);
+}
+
+test "parse_kernel_nonce: token-start, reserved placeholder, length bound" {
+    // token-start matches, value ends at space/control — the store battery's
+    // discipline, applied to the nonce
+    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.bootnonce=a1b2c3d4e5f60718").?);
+    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.bootnonce=a1b2c3d4e5f60718 console=ttyS0").?);
+    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.store=/fx/store fx.bootnonce=a1b2c3d4e5f60718 panic=-1\n").?);
+    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("a=1  fx.bootnonce=a1b2c3d4e5f60718  b=2").?);
+    // a substring of another token is not a token (the fx.store lesson)
+    try std.testing.expect(parse_kernel_nonce("notfx.bootnonce=deadbeef") == null);
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=") == null);
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce= console=ttyS0") == null);
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=\n") == null);
+    // "none" is the WRITER's placeholder — a host may not mint lines that
+    // read as "no nonce was issued"
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=none") == null);
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=none fx.bootnonce=deadbeef01") == null); // first token wins, and it is reserved
+    // length bound: the 65-byte buffer backs the global; a longer token
+    // must not be truncated into a DIFFERENT nonce silently
+    const nonce65 = "d" ** 65;
+    const nonce64 = "d" ** 64;
+    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=" ++ nonce65) == null);
+    try std.testing.expectEqualStrings(nonce64, parse_kernel_nonce("fx.bootnonce=" ++ nonce64).?); // the cap itself is legal
+    // no token: the normal case (hand-boot)
+    try std.testing.expect(parse_kernel_nonce("console=ttyS0,115200 rdinit=/fx/store/x/fx-init fx.store=/fx/store panic=-1 oops=panic\n") == null);
+}
+
+test "bootlog_append + recovery_line carry the boot nonce as a trailing field" {
+    // the additive 4th/5th field: every existing reader parses with 2-4
+    // leading conversions and ignores the tail (bootlog_last "%u %63s",
+    // the harness outcome reader "%lu %31s %lu" / "%lu %lu %lu %71s"), so
+    // the field may ONLY ride at the END.  This test pins the writer side:
+    // the placeholder when no nonce was issued, the verbatim token when
+    // one was, and one nonce for EVERY line and row of the same boot.
+    const io = std.testing.io;
+    const saved_io = g_io;
+    const saved_store = g_store;
+    const saved_nonce = g_boot_nonce;
+    const saved_buf = g_boot_nonce_buf;
+    var seed: [8]u8 = undefined;
+    io.random(&seed);
+    var rb: [96:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&rb, "/tmp/fx-nonce-{x:0>16}", .{std.mem.readInt(u64, &seed, .little)});
+    defer {
+        g_io = saved_io;
+        g_store = saved_store;
+        g_boot_nonce = saved_nonce;
+        g_boot_nonce_buf = saved_buf;
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    }
+    g_io = io;
+    g_store = root.ptr;
+    g_boot_nonce_buf = [_]u8{0} ** 65;
+    // no nonce issued (the operator hand-boot): the DISTINGUISHABLE
+    // placeholder, never an empty or guessable value
+    g_boot_nonce = null;
+    var l0: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("1700000000 9 7 feedface none\n", recovery_line(&l0, 1700000000, 9, 7, "feedface"));
+    bootlog_append(7, "in-progress", 1697000001);
+    bootlog_append(7, "ok", 1697000009);
+    // a nonce issued: latch it exactly as apply_kernel_nonce does
+    @memcpy(g_boot_nonce_buf[0..8], "deadbeef");
+    g_boot_nonce_buf[8] = 0;
+    g_boot_nonce = g_boot_nonce_buf[0..8];
+    var l1: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("1700000000 9 7 feedface deadbeef\n", recovery_line(&l1, 1700000000, 9, 7, "feedface"));
+    bootlog_append(9, "failed", 1697000020);
+    var bp: [1100]u8 = undefined;
+    bootlog_path(&bp, bp.len);
+    const f = fopen(@ptrCast(&bp), "r") orelse return error.Bootlog;
+    var got: [512]u8 = [_]u8{0} ** 512;
+    _ = fread(&got, 1, got.len - 1, f);
+    _ = fclose(f);
+    const want =
+        "7 in-progress 1697000001 none\n" ++
+        "7 ok 1697000009 none\n" ++
+        "9 failed 1697000020 deadbeef\n";
+    try std.testing.expectEqualStrings(want, std.mem.sliceTo(&got, 0));
 }
 
 fn argstr(arg: [*]u8) []const u8 {
@@ -4875,10 +5032,25 @@ test "recovery journal: the header carries the definition (reader-facing contrac
 
 test "recovery_line: one data line, epoch-first, '-' for an unresolvable genhash" {
     var buf: [128]u8 = undefined;
+    // no nonce issued: the writer's placeholder rides the row (the default
+    // state of every test and every operator hand-boot)
     const l = recovery_line(&buf, 1697000001, 9, 7, "deadbeef");
-    try std.testing.expectEqualStrings("1697000001 9 7 deadbeef\n", l);
+    try std.testing.expectEqualStrings("1697000001 9 7 deadbeef none\n", l);
     // an unresolvable genhash still records the RECOVERY (it happened);
     // "-" is an honest absence, not a fabricated content id
     const l2 = recovery_line(&buf, 5, 12, 11, "-");
-    try std.testing.expectEqualStrings("5 12 11 -\n", l2);
+    try std.testing.expectEqualStrings("5 12 11 - none\n", l2);
+    // an issued nonce binds the row to the boot that wrote it
+    const saved = g_boot_nonce;
+    const saved_buf = g_boot_nonce_buf;
+    defer {
+        g_boot_nonce = saved;
+        g_boot_nonce_buf = saved_buf;
+    }
+    g_boot_nonce_buf = [_]u8{0} ** 65;
+    @memcpy(g_boot_nonce_buf[0..8], "deadbeef");
+    g_boot_nonce_buf[8] = 0;
+    g_boot_nonce = g_boot_nonce_buf[0..8];
+    const l3 = recovery_line(&buf, 6, 13, 12, "-");
+    try std.testing.expectEqualStrings("6 13 12 - deadbeef\n", l3);
 }
