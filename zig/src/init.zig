@@ -1464,6 +1464,72 @@ fn grace_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+/// The generation's declared agent service (the agent_svc store fact,
+/// written by fx-activate from the config's REQUIRED agentService field —
+/// the same dhall-cannot-reach-PID1 transport as boot_grace).  Empty = the
+/// generation declares no agent (agentService = None Text).
+var g_agent_svc: [128]u8 = [_]u8{0} ** 128;
+var g_agent_svc_got: c_int = 0;
+const AgentSvcCtx = struct {
+    db: *dl_db,
+    out: [*]u8,
+    cap: usize,
+    got: c_int = 0,
+};
+fn agent_svc_cb(c: [*]const u32, ar: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = ar;
+    const t: *AgentSvcCtx = @ptrCast(@alignCast(user.?));
+    const p = dl_intern_str_of(t.db, c[0]);
+    if (p != null and t.got == 0) {
+        _ = strncpy(t.out, p.?, t.cap - 1);
+        t.out[t.cap - 1] = 0;
+        t.got = 1;
+    }
+    return 0;
+}
+
+/// THE ACTIVATION-SWEEP AGENT EXEMPTION.  read_store_facts just rebuilt the
+/// service table from the activated (or rolled-back-to) generation, every
+/// row ST_PENDING, and the main loop's next pass STARTS them all — but the
+/// row the config itself names as its agent (agentService) is the judge of
+/// this very activation: the issuer is a still-running instance of it (the
+/// old table's rows are only FREED, never stopped), and a duplicate started
+/// mid-turn cannot open the single-writer runstore — it would die nonzero,
+/// land in ST_FAILED, and the any_failed arm would FAIL the generation the
+/// activation just committed (measured: the agent marks its own successful
+/// activation FAILED).  So REMOVE the row from the table: the sweep never
+/// starts it, boot_decision never judges it, and reap never matches it
+/// (the running instance is reaped anonymously, exactly like every other
+/// old-table row).  The exemption is BY IDENTITY (the config's own
+/// declaration), not by a naming convention, and it defers rather than
+/// suppresses: the NEXT boot's read_store_facts loads the same fact and
+/// starts the agent service normally — PID1 only refuses to start an agent
+/// as part of a mid-boot table swap handed to it by an activation.  A
+/// config that honestly redeclares the agent to something else (a different
+/// service name and argv, e.g. a verifier) is covered by the same rule: the
+/// new agent is not started by the sweep either; it boots with the next
+/// generation.  Ordinary services are untouched, and a generation that
+/// declares no agent (agent_svc absent) changes nothing.
+fn svc_drop_agent(action: [*:0]const u8) void {
+    if (g_agent_svc_got == 0 or g_agent_svc[0] == 0) return;
+    const sv = svc_find(@ptrCast(&g_agent_svc)) orelse return;
+    var m: [192]u8 = undefined;
+    _ = snfmt(&m, "agent service '{s}' exempt from the {s} restart sweep (the running instance judges it; it starts at the next boot)", .{ span(@ptrCast(&g_agent_svc)), span(action) });
+    log_line("fx-init", "info", @ptrCast(&m));
+    errf("fx-init: {s}\n", .{span(@ptrCast(&m))});
+    cfree(sv.argv);
+    cfree(sv.env_k);
+    cfree(sv.env_v);
+    const idx: usize = @intFromPtr(sv) - @intFromPtr(g_svc.?);
+    const i: usize = idx / @sizeOf(Svc);
+    var j: usize = i + 1;
+    while (j < @as(usize, @intCast(g_nsvc))) : (j += 1) {
+        g_svc.?[j - 1] = g_svc.?[j];
+    }
+    g_nsvc -= 1;
+    g_svc.?[@intCast(g_nsvc)] = Svc{};
+}
+
 /// Free the service table (shared by read_store_facts' rebuild and its
 /// svc-refusal path).  Leaves g_nsvc = 0: a refused configuration runs
 /// NOTHING — the first 64 rows would otherwise sit in the table with
@@ -1515,6 +1581,15 @@ fn read_store_facts(version: u32) c_int {
     var gc = GraceCtx{};
     _ = dl_query_version(db, version, "boot_grace", grace_cb, &gc);
     if (gc.got != 0 and gc.v > 0) g_grace_ms = gc.v;
+
+    // the generation's declared agent service, if any (see svc_drop_agent);
+    // refreshed on EVERY read (boot and activation) so a table swap always
+    // knows the identity it may need to exempt.
+    g_agent_svc = [_]u8{0} ** 128;
+    g_agent_svc_got = 0;
+    var asc = AgentSvcCtx{ .db = db, .out = @ptrCast(&g_agent_svc), .cap = g_agent_svc.len };
+    _ = dl_query_version(db, version, "agent_svc", agent_svc_cb, &asc);
+    if (asc.got != 0) g_agent_svc_got = 1;
 
     var sc = SvcCtx{ .db = db };
     _ = dl_query_version(db, version, "svc", svc_name_cb, &sc);
@@ -3397,6 +3472,13 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 resp_err(o, @ptrCast(&m));
                 return;
             }
+            // THE AGENT EXEMPTION (svc_drop_agent): the sweep that follows
+            // this response must not start a duplicate of the very instance
+            // that issued the activation — the running agent judges it, and
+            // a second instance would die on the single-writer runstore and
+            // FAIL the generation this handler just committed.  Done BEFORE
+            // the reply is flushed so the console line lands with it.
+            svc_drop_agent("activate");
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
@@ -3493,6 +3575,12 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 resp_err(o, @ptrCast(&m));
                 return;
             }
+            // THE AGENT EXEMPTION applies to the ROLLBACK sweep for the same
+            // reason as the activate arm: the rolled-back-to generation's
+            // agentService may be a row this table rebuild just reintroduced,
+            // and starting it mid-boot is the same duplicate (the running
+            // instance holds the runstore).  The next boot starts it.
+            svc_drop_agent("rollback");
             rt_txn_begin();
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
@@ -4968,6 +5056,69 @@ test "console service: ST_STARTED like any other (boot_decision ignores the cons
     // started + exited-cleanly (a user typed `exit`) -> still a clean ok
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(boot_decision(false, &.{ s_console_stopped }, true)));
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(boot_decision(false, &.{ s_console, s_console_stopped }, true)));
+}
+
+test "svc_drop_agent: removes the declared agent row, keeps the rest, no-ops without a declaration" {
+    // THE ACTIVATION-SWEEP AGENT EXEMPTION's table mechanics: the drop must
+    // remove EXACTLY the row the agent_svc fact names (the judge of the
+    // activation), leave every other row in order, free the dropped row's
+    // heap, and do NOTHING when the generation declares no agent — the last
+    // one is the boot path's guarantee (the SAME read_store_facts feeds the
+    // boot, where the agent MUST start).
+    const alloc = std.heap.c_allocator;
+    const saved_svc = g_svc;
+    const saved_nsvc = g_nsvc;
+    const saved_cap = g_svc_cap;
+    const saved_name = g_agent_svc;
+    const saved_got = g_agent_svc_got;
+    defer {
+        var i: c_int = 0;
+        while (i < g_nsvc) : (i += 1) {
+            cfree(g_svc.?[@intCast(i)].argv);
+            cfree(g_svc.?[@intCast(i)].env_k);
+            cfree(g_svc.?[@intCast(i)].env_v);
+        }
+        cfree(g_svc);
+        g_svc = saved_svc;
+        g_nsvc = saved_nsvc;
+        g_svc_cap = saved_cap;
+        g_agent_svc = saved_name;
+        g_agent_svc_got = saved_got;
+    }
+    const names = [_][]const u8{ "heartbeat", "b2verifier", "proof" };
+    const buf = alloc.alloc(Svc, 4) catch return error.OutOfMemory;
+    g_svc = buf.ptr;
+    g_svc_cap = 4;
+    g_nsvc = 3;
+    for (names, 0..) |n, k| {
+        buf[k] = Svc{};
+        _ = std.fmt.bufPrint(buf[k].name[0..n.len], "{s}", .{n}) catch unreachable;
+        buf[k].argv = @ptrCast(@alignCast(strdup("x")));
+        buf[k].env_k = @ptrCast(@alignCast(strdup("K")));
+        buf[k].env_v = @ptrCast(@alignCast(strdup("V")));
+    }
+    // declared agent absent from the table -> no-op (nothing to exempt)
+    g_agent_svc = [_]u8{0} ** 128;
+    g_agent_svc_got = 1;
+    _ = std.fmt.bufPrint(g_agent_svc[0.."ghost".len], "{s}", .{"ghost"}) catch unreachable;
+    svc_drop_agent("test");
+    try std.testing.expectEqual(@as(c_int, 3), g_nsvc);
+    // no fact at all (agentService = None) -> no-op
+    g_agent_svc = [_]u8{0} ** 128;
+    g_agent_svc_got = 0;
+    svc_drop_agent("test");
+    try std.testing.expectEqual(@as(c_int, 3), g_nsvc);
+    // the declared row IS in the table -> dropped, order preserved
+    g_agent_svc = [_]u8{0} ** 128;
+    g_agent_svc_got = 1;
+    _ = std.fmt.bufPrint(g_agent_svc[0.."b2verifier".len], "{s}", .{"b2verifier"}) catch unreachable;
+    svc_drop_agent("test");
+    try std.testing.expectEqual(@as(c_int, 2), g_nsvc);
+    try std.testing.expectEqualStrings("heartbeat", std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&g_svc.?[0].name)), 0));
+    try std.testing.expectEqualStrings("proof", std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&g_svc.?[1].name)), 0));
+    // the vacated tail slot is reset: a later drop cannot act on stale state
+    try std.testing.expectEqual(@as(c_int, 0), g_svc.?[2].state);
+    try std.testing.expectEqual(@as(c_int, 0), g_svc.?[2].pid);
 }
 
 test "next_timeout arithmetic" {

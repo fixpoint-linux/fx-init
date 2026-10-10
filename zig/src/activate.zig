@@ -1233,6 +1233,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .rel = "svc_bin", .arity = 2 },
         .{ .rel = "svc_backoff", .arity = 2 },
         .{ .rel = "svc_console", .arity = 2 },
+        .{ .rel = "agent_svc", .arity = 1 },
         .{ .rel = "user", .arity = 3 },
         .{ .rel = "tool_fxstore", .arity = 1 },
         .{ .rel = "boot_grace", .arity = 1 },
@@ -1297,6 +1298,19 @@ pub fn main(init: std.process.Init) !void {
     {
         const cols = [1]u32{cfg.grace_ms};
         addFact(db, "boot_grace", &cols);
+    }
+    // agent_svc(name) a1 — the config's agentService declaration, same
+    // transport reason as boot_grace: fx-init cannot read dhall, and PID1's
+    // activate/rollback handlers need the AGENT'S IDENTITY (not a naming
+    // convention) to exempt the agent service row from the post-activation
+    // restart sweep — the running instance is the judge of the activation,
+    // and a duplicate started mid-turn cannot open the single-writer
+    // runstore.  Written ONLY for Some: an absent fact = no declared agent
+    // (agentService = None Text), and clearRel above wipes a previous
+    // activation's declaration with the rest of the generation facts.
+    if (cfg.agent_service) |name| {
+        const cols = [1]u32{fx.dl_intern_str(db, dupeZ(name))};
+        addFact(db, "agent_svc", &cols);
     }
     // svc facts
     for (cfg.services) |*sv| {
