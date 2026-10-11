@@ -24,14 +24,19 @@
  *   - the kernel relation's sysname/release columns (real uname(2)) AND its
  *     nodename column (also real uname(2) — the HOSTNAME, which is why this
  *     was host-dependent: see the rt_rels comment)
- *   - the fs relation's fstype column (whatever /tmp is mounted as) and its
- *     capacity columns (the real backing fs's block counts)
+ *   - the fs relation ENTIRELY: every column comes from statvfs(2) on the real
+ *     /, /run and /fx/store, so masking the columns alone would still pin the
+ *     ROW SET — i.e. which mounts this host has.  NO fs coverage remains.
  *   - the file relation's uid/gid columns (a real stat(2) on the fixture
  *     file) and its mtime column
- * Fixture-derived content (log DBs, process/device/net tuples, the fs path
- * column, the file path/size/mode columns, kernel load/uptime/meminfo) is
- * pinned.  Fixture file modes are set EXPLICITLY by wf() so the file mode
- * column does not depend on the running umask.
+ *   - the process relation's rss_kb column: the fixture supplies the page
+ *     COUNT (stat field 21) but the multiplier is a real
+ *     sysconf(_SC_PAGESIZE), so the value is pinned to the page size of
+ *     whichever host built the golden.
+ * Fixture-derived content (log DBs, process pid/ppid/uid/comm/state,
+ * device/net tuples, the file path/size/mode columns, kernel
+ * load/uptime/meminfo) is pinned.  Fixture file modes are set EXPLICITLY by
+ * wf() so the file mode column does not depend on the running umask.
  *
  * Usage: log_probe_live --pin|--check <golden-dir>   (check is the default
  * fxctl_diff.sh/log_probe_diff.sh mode; --pin re-captures goldens from the
@@ -149,30 +154,72 @@ static char *dump_rel(struct dl_db *db, const char *rel, uint8_t arity,
     { "log", 4, 0xEu, 0xFu }, { "__postings__", 2, 0x0u, 0x3u }
 static const struct { const char *rel; uint8_t arity; uint32_t symmask, colmask; } log_rels[] = { LOG_RELS };
 /* probe relations, with the machine-varying columns masked OUT.
- * Column meanings, from the arity + the Zig port's tuple layout
- * (src/probe.zig):
- *   fs     cols 0-4 = path, fstype, total, used, avail.  col1 fstype is
- *          whatever /tmp's backing fs is, and cols 2-4 are capacity numbers
- *          of the REAL backing filesystems (block counts move as the host fs
- *          fills) — only the path column is pinnable.
- *   file   cols 0-5 = path, size, mode, uid, gid, mtime.  cols 3/4 (uid/gid)
- *          are a real stat(2) on the fixture file, i.e. the CREATING USER's;
- *          col5 is a live mtime epoch.  Path/size/mode come from the fixture
- *          (wf() sets the mode explicitly, so it does not depend on umask).
+ *
+ * THE RULE: a column is pinned only if THE FIXTURE supplies its value.  Each
+ * entry names that source in src/probe.zig, so the mask can be checked against
+ * the code instead of trusted.  What the driver cannot redirect — uname(2),
+ * statvfs(2), the uid/gid half of stat(2), sysconf(_SC_PAGESIZE) — stays
+ * masked, because pinning it pins the CAPTURE HOST and produces a golden that
+ * can only match where it was captured.  (This file's goldens were red on any
+ * other machine twice for exactly that reason: the nodename column, then the
+ * uid/gid columns.)
+ *
+ *   process cols 0-5 = pid, ppid, uid, comm, state, rss_kb.
+ *           cols 0-4 are the fixture alone: pid is the /proc/<pid> DIRECTORY
+ *           NAME and ppid/state/comm are fields 1/0/(...) of the fixture's
+ *           stat file (:204-232); uid is the fixture's status "Uid:" line
+ *           (:253-258).  PINNED.
+ *           col5 rss_kb = the fixture's stat field 21 — a PAGE COUNT — times
+ *           sysconf(_SC_PAGESIZE)/1024 (:197-198, :249-250).  The fixture
+ *           supplies the count, the MULTIPLIER IS A REAL SYSCALL: 4 KiB pages
+ *           compute 400 here, 16 KiB pages compute 1600 on a 16 KiB host.
+ *           MASKED (0x3F -> 0x1F) — fixture-anchored, not host-independent.
+ *           COST: the golden no longer pins the rss_kb arithmetic.  The
+ *           in-process CHECKs below still assert it, against a multiplier read
+ *           from the same sysconf, so they catch a wrong field or a doubled
+ *           multiplier but are no longer an absolute 400/1024.
+ *   fs     cols 0-4 = path, fstype, total, used, avail — all from statvfs(2)
+ *           on the REAL /, /run and /fx/store (:271-287), which SKIPS every
+ *           path that fails.  Masking cols 1-4 left the ROW SET pinned, i.e.
+ *           WHICH MOUNTS THIS HOST HAS (2 rows here, 1 on a host without /run)
+ *           — the same capture-host fingerprint the nodename column was.
+ *           MASKED ENTIRELY (0x01 -> 0x00, as env is).
+ *           COST, STATED: the fs port now has NO harness coverage at all.
+ *           statvfs(2) cannot be pointed at a fixture, so the only way to
+ *           cover it is to make the probe fixture-aware — which would change
+ *           its documented "statvfs always hits the real filesystem"
+ *           behaviour.  That is a different unit and was NOT done here; until
+ *           it is, the fs port is unverified by this harness.
+ *   file   cols 0-5 = path, size, mode, uid, gid, mtime.
+ *           col0 is the logical path (a literal, :299); cols 1/2 are stat(2)
+ *           on the FIXTURE file (:296), whose size and mode wf() sets
+ *           explicitly (0640, not the running umask).  PINNED.
+ *           cols 3/4 (uid/gid) are the CREATING USER's and col5 is a live
+ *           mtime epoch.  MASKED.
  *   kernel cols 0-6 = sysname, release, nodename, uptime_s, load1_x100,
- *          memtotal_kb, memfree_kb.  cols 0/1 (sysname/release) AND col2
- *          (nodename = THE HOSTNAME) are real uname(2) values — the module
- *          documents that on purpose (src/probe.zig:406-410) — so only the
- *          numerics, which come from the fixture's /proc files, are pinned.
- *   env    machine environ — masked out entirely.
+ *           memtotal_kb, memfree_kb.
+ *           cols 3-6 come from the fixture's /proc/{uptime,loadavg,meminfo}
+ *           (:383-405).  PINNED.
+ *           cols 0/1 (sysname/release) and col2 (nodename = THE HOSTNAME) are
+ *           real uname(2) values; the module documents that on purpose
+ *           (:380-410).  MASKED.
+ *   device cols 0-4 = name, 0, ifindex, "net", 0.
+ *           name is the fixture's /sys/class/net/<iface> DIRECTORY NAME,
+ *           ifindex its ifindex file, cols 1/4 literal zeros (:356-360).
+ *           PINNED, all five.
+ *   net    cols 0-5 = iface, addr, mac, state, rx_bytes, tx_bytes — every one
+ *           read from the fixture's /sys/class/net/<iface>/ files (:319-357).
+ *           PINNED, all six.
+ *   env    cols 0-1 = key, value from THIS PROCESS's environ (:421-434).
+ *           MASKED ENTIRELY — nothing in it is the fixture's.
  */
 static const struct { const char *rel; uint8_t arity; uint32_t symmask, colmask; } rt_rels[] = {
-    { "process", 6, 0x18u, 0x3Fu },  /* comm, state — all columns */
-    { "fs", 5, 0x03u, 0x01u },       /* path only (fstype + capacity dropped) */
+    { "process", 6, 0x18u, 0x1Fu },  /* pid, ppid, uid, comm, state (rss_kb = fixture pages x REAL page size) */
+    { "fs", 5, 0x03u, 0x00u },       /* nothing: the ROW SET is statvfs on real paths — a host fingerprint */
     { "file", 6, 0x01u, 0x07u },     /* path, size, mode (uid/gid = real stat; mtime = live epoch) */
-    { "device", 5, 0x09u, 0x1Fu },   /* name, type — all columns */
+    { "device", 5, 0x09u, 0x1Fu },   /* name, ifindex — all columns */
     { "kernel", 7, 0x07u, 0x78u },   /* uptime/load/meminfo numerics (uname sysname+release+nodename dropped) */
-    { "net", 6, 0x0Fu, 0x3Fu },      /* iface, addr, mac, state — all columns */
+    { "net", 6, 0x0Fu, 0x3Fu },      /* iface, addr, mac, state, rx, tx — all columns */
     { "env", 2, 0x03u, 0x0u },       /* machine environ — nothing pinned */
 };
 
@@ -323,6 +370,20 @@ static int find_net(struct dl_db *db, const char *iface, uint32_t cols[6]) {
     int got = (dl_iter_next(it, cols) == 1) ? 1 : 0;
     dl_iter_close(it);
     return got;
+}
+
+/* Expected rss_kb for a fixture process: the fixture's stat field 21 is a PAGE
+ * COUNT (100 for pid 1, 256 for pid 100) and probe.zig multiplies it by the
+ * real sysconf(_SC_PAGESIZE)/1024, defaulting to 4 (src/probe.zig:197-198,
+ * :249-250).  Asserting the literal 400/1024 would re-pin the page size of
+ * whichever host captured the golden — the column is masked in the dump for
+ * that reason, and the assertion has to be host-independent too or the suite
+ * is still red on a 16 KiB-page host.  Deriving the multiplier from the same
+ * sysconf (same guard) still fails if the probe reads the wrong stat field or
+ * applies the multiplier twice. */
+static uint32_t fixture_rss_kb(uint32_t pages) {
+    long pg = sysconf(_SC_PAGESIZE);
+    return pages * (uint32_t)(pg > 0 ? pg / 1024 : 4);
 }
 
 /* ─── part 1: log ────────────────────────────────────────────────────────── */
@@ -560,14 +621,16 @@ static void probe_part(void) {
         CHECK(zz[0] == 1 && zz[1] == 0 && zz[2] == 0, "REPLAY: pid1 pid/ppid/uid");
         CHECK(!strcmp(dl_intern_str_of(z, zz[3]), "init"), "REPLAY: pid1 comm == init");
         CHECK(!strcmp(dl_intern_str_of(z, zz[4]), "S"), "REPLAY: pid1 state == S");
-        CHECK(zz[5] == 400, "REPLAY: pid1 rss_kb == 400 (got %u)", zz[5]);
+        CHECK(zz[5] == fixture_rss_kb(100),
+              "REPLAY: pid1 rss_kb == 100 pages x this host's page size (got %u)", zz[5]);
     }
     if (find_process(z, 100, zz) == 1) {
         CHECK(zz[0] == 100 && zz[1] == 1 && zz[2] == 1000, "REPLAY: pid100 pid/ppid/uid");
         CHECK(!strcmp(dl_intern_str_of(z, zz[3]), "worker process"),
               "REPLAY: pid100 comm (spaces) (got '%s')", dl_intern_str_of(z, zz[3]));
         CHECK(!strcmp(dl_intern_str_of(z, zz[4]), "R"), "REPLAY: pid100 state == R");
-        CHECK(zz[5] == 1024, "REPLAY: pid100 rss_kb == 1024 (got %u)", zz[5]);
+        CHECK(zz[5] == fixture_rss_kb(256),
+              "REPLAY: pid100 rss_kb == 256 pages x this host's page size (got %u)", zz[5]);
     }
     CHECK(dl_count(z, "net") == 2, "REPLAY: zig net count == 2");
     CHECK(dl_count(z, "device") == 2, "REPLAY: zig device count == 2");
