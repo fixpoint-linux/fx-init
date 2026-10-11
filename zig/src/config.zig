@@ -115,6 +115,82 @@ pub const FxEtcFile = struct {
     content: []const u8,
 };
 
+// ─── inline packages (baliveau §6a E) ──────────────────────────────────────
+//
+// The agent's write surface is its CONFIG, so that is where its packages
+// are declared: no new file becomes agent-writable, and fx-activate merges
+// these into the package set BEFORE computing the closure (a config-declared
+// package is resolvable by the same path a host-declared one is).  The
+// shapes below mirror the fxstore Package/Src/Action types one-for-one
+// (packageset.zig); config.zig cannot import that module (the build wires
+// `dhall` only into config_mod), so fx-activate converts at the merge.
+//
+// The recipe is admitted ONLY as a composition over a HOST-FROZEN Action
+// subset — the subset IS the capability (§6a).  Which actions are refused
+// and why is decided in validate(), with the other cross-field refusals.
+
+/// The eleven Action alternatives (packageset.zig ActionKind order).  All
+/// are parsed; whether an agent may DECLARE one is validate()'s call, not
+/// the walker's.
+pub const FxPkgActionKind = enum(u8) {
+    shell,
+    copy,
+    mkdir,
+    rm,
+    touch,
+    move,
+    symlink,
+    chmod,
+    echo,
+    env,
+    run,
+
+    /// The Dhall union tag, as the refusal and the config_check dump name it.
+    pub fn name(k: FxPkgActionKind) []const u8 {
+        return switch (k) {
+            .shell => "Shell",
+            .copy => "Copy",
+            .mkdir => "Mkdir",
+            .rm => "Rm",
+            .touch => "Touch",
+            .move => "Move",
+            .symlink => "Symlink",
+            .chmod => "Chmod",
+            .echo => "Echo",
+            .env => "Env",
+            .run => "Run",
+        };
+    }
+};
+
+pub const FxPkgAction = struct {
+    kind: FxPkgActionKind,
+    a: ?[]const u8 = null, // payload: shell text / from / path / text / key / argv[0]
+    b: ?[]const u8 = null, // copy-move-symlink to / chmod mode / env value
+    argv: []const []const u8 = &.{}, // Run only
+};
+
+pub const FxPkgSrcKind = enum(u8) { path, fetch };
+
+/// Parsed so a Fetch can be REFUSED BY NAME in validate(); an agent-declared
+/// package never carries one past validation.
+pub const FxPkgSrc = struct {
+    kind: FxPkgSrcKind = .path,
+    path: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    hash: ?[]const u8 = null,
+};
+
+pub const FxPackage = struct {
+    name: []const u8,
+    version: []const u8,
+    src: FxPkgSrc = .{},
+    deps: []const []const u8 = &.{},
+    excludes: []const []const u8 = &.{},
+    target: []const u8,
+    recipe: []const FxPkgAction = &.{},
+};
+
 pub const FxConfig = struct {
     hostname: []const u8,
     packages: []const []const u8,
@@ -127,6 +203,16 @@ pub const FxConfig = struct {
     agent_service: ?[]const u8,
     extra_etc: []const FxEtcFile,
     grace_ms: u32, // default 30000
+    // inlinePackages: Optional (List Package), defaulting to empty.  Unlike
+    // agentService, its ABSENCE is not a silent hole, so the field is
+    // optional like extraEtc: agentService names an EXISTING service whose
+    // identity fx-init needs at boot, so forgetting it silently changes
+    // boot behavior; a package that is not declared simply does not exist —
+    // nothing can name, depend on, or build it, and "no agent-authored
+    // packages" is an honest state, not a forgotten obligation.  (A declared
+    // package nothing references is equally inert: merged, never closed
+    // over, invisible to the generation hash.)
+    inline_packages: []const FxPackage = &.{},
 };
 
 pub const err_cap_default = 2048;
@@ -583,6 +669,332 @@ fn map_extra_etc(cfg: *FxConfig, list_in: ?*dhallz.Term, e: *ErrBuf) error{FxCon
     cfg.extra_etc = files[0..i];
 }
 
+// ─── inlinePackages: Optional (List Package) — §6a E ──────────────────────
+//
+// Walker mirrors the packageset.zig Package/Src/Action walk one-for-one
+// (rec_get + list traversal + union_selected), because the config must
+// produce the same shapes a host-declared package produces.  Structural
+// errors are the walker's; the SUBSET refusals (Shell / Run-relative /
+// Fetch / deps) are validate()'s, with the other cross-field rules.
+
+/// map_action (packageset.zig) into a config-owned FxPkgAction: every one
+/// of the eleven alternatives parses, Shell included — validate() decides
+/// what an agent may declare, so a refused action is REFUSED BY NAME with
+/// its rule, never a parse accident.
+fn map_inline_action(u: ?*dhallz.Term, where: []const u8, e: *ErrBuf) error{FxConfig}!FxPkgAction {
+    if (u == null or u.?.tag != .TmUnionLit)
+        return e.set("{s}: recipe element must be an Action union (< Tag = v >)", .{where});
+    const sel = union_selected(u) orelse
+        return e.set("{s}: malformed Action union", .{where});
+    const tag = std.mem.span(sel.label.?);
+    const val = sel.value.?;
+    var act: FxPkgAction = .{ .kind = .shell };
+    if (std.mem.eql(u8, tag, "Shell")) {
+        act.kind = .shell;
+        act.a = term_text_cstr(val) orelse
+            return e.set("{s}: < Shell = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, tag, "Copy")) {
+        act.kind = .copy;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Copy must be a {{ from, to }} record", .{where});
+        act.a = try need_text(val, "from", where, e);
+        act.b = try need_text(val, "to", where, e);
+    } else if (std.mem.eql(u8, tag, "Mkdir")) {
+        act.kind = .mkdir;
+        act.a = term_text_cstr(val) orelse
+            return e.set("{s}: < Mkdir = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, tag, "Rm")) {
+        act.kind = .rm;
+        act.a = term_text_cstr(val) orelse
+            return e.set("{s}: < Rm = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, tag, "Touch")) {
+        act.kind = .touch;
+        act.a = term_text_cstr(val) orelse
+            return e.set("{s}: < Touch = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, tag, "Move")) {
+        act.kind = .move;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Move must be a {{ from, to }} record", .{where});
+        act.a = try need_text(val, "from", where, e);
+        act.b = try need_text(val, "to", where, e);
+    } else if (std.mem.eql(u8, tag, "Symlink")) {
+        act.kind = .symlink;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Symlink must be a {{ from, to }} record", .{where});
+        act.a = try need_text(val, "from", where, e);
+        act.b = try need_text(val, "to", where, e);
+    } else if (std.mem.eql(u8, tag, "Chmod")) {
+        act.kind = .chmod;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Chmod must be a {{ path, mode }} record", .{where});
+        act.a = try need_text(val, "path", where, e);
+        act.b = try need_text(val, "mode", where, e);
+    } else if (std.mem.eql(u8, tag, "Echo")) {
+        act.kind = .echo;
+        act.a = term_text_cstr(val) orelse
+            return e.set("{s}: < Echo = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, tag, "Env")) {
+        act.kind = .env;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Env must be a {{ key, value }} record", .{where});
+        act.a = try need_text(val, "key", where, e);
+        act.b = try need_text(val, "value", where, e);
+    } else if (std.mem.eql(u8, tag, "Run")) {
+        act.kind = .run;
+        if (val.tag != .TmRecordLit)
+            return e.set("{s}: Run must be a {{ argv : List Text }} record", .{where});
+        const argv_list = rec_get(val, "argv") orelse
+            return e.set("{s}: Run must have an 'argv' field", .{where});
+        const n = list_length(argv_list);
+        if (n == 0)
+            return e.set("{s}: Run argv must be non-empty", .{where});
+        const av = gpa_alloc.alloc([]const u8, n) catch
+            return e.set("out of memory", .{});
+        var i: usize = 0;
+        var p: ?*dhallz.Term = argv_list;
+        while (p) |t| : (p = t.as.cons.tail) {
+            if (t.tag != .TmCons) break;
+            av[i] = term_text_cstr(t.as.cons.head) orelse
+                return e.set("{s}: Run argv elements must be Text", .{where});
+            i += 1;
+        }
+        act.argv = av[0..i];
+        act.a = act.argv[0]; // program name, like packageset's map_action
+    } else {
+        return e.set("{s}: unknown action '< {s} = ... >'", .{ where, tag });
+    }
+    return act;
+}
+
+/// map_src (packageset.zig): both alternatives parse; a Fetch is refused in
+/// validate() by name, so it must survive the walk.
+fn map_inline_src(out: *FxPkgSrc, u: ?*dhallz.Term, where: []const u8, e: *ErrBuf) error{FxConfig}!void {
+    out.* = .{ .kind = .path };
+    if (u == null or u.?.tag != .TmUnionLit)
+        return e.set("{s}: src must be < Path = Text | Fetch = {{ url, hash }} >", .{where});
+    const sel = union_selected(u) orelse
+        return e.set("{s}: malformed src union", .{where});
+    const label = std.mem.span(sel.label.?);
+    if (std.mem.eql(u8, label, "Path")) {
+        out.kind = .path;
+        // RAW text, like the C's strdup: canonicalization of a relative
+        // path against the config's directory is fx-activate's job (it
+        // knows the config's path; this module does not).
+        out.path = term_text_cstr(sel.value) orelse
+            return e.set("{s}: < Path = ... > value must be Text", .{where});
+    } else if (std.mem.eql(u8, label, "Fetch")) {
+        out.kind = .fetch;
+        const v = sel.value.?;
+        if (v.tag != .TmRecordLit)
+            return e.set("{s}: Fetch must be a {{ url, hash }} record", .{where});
+        out.url = try need_text(v, "url", where, e);
+        out.hash = try need_text(v, "hash", where, e);
+    } else {
+        return e.set("{s}: unknown src alternative '< {s} = ... >' (expected Path or Fetch)", .{ where, label });
+    }
+}
+
+/// map_package (packageset.zig) into a config-owned FxPackage.  `excludes`
+/// is optional (absent = empty), and its entries follow the same clean-path
+/// rules as the package-set walk: an entry that can never match would
+/// silently keep hashing content the author meant to exclude.
+fn map_inline_package(rec: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!FxPackage {
+    var p: FxPackage = .{ .name = "", .version = "", .target = "" };
+
+    p.name = try need_text(rec, "name", "package", e);
+    const where = try alloc_where(gpa_alloc, "package", p.name, e);
+
+    p.version = try need_text(rec, "version", where, e);
+
+    const src_t = rec_get(rec, "src") orelse
+        return e.set("{s}: missing field 'src'", .{where});
+    try map_inline_src(&p.src, src_t, where, e);
+
+    const deps = rec_get(rec, "deps") orelse
+        return e.set("{s}: missing field 'deps'", .{where});
+    if (deps.tag != .TmNil and deps.tag != .TmCons)
+        return e.set("{s}: 'deps' must be a List Text", .{where});
+    const ndeps = list_length(deps);
+    const dep_arr = gpa_alloc.alloc([]const u8, ndeps) catch
+        return e.set("out of memory", .{});
+    var i: usize = 0;
+    var q: ?*dhallz.Term = deps;
+    while (q) |t| : (q = t.as.cons.tail) {
+        if (t.tag != .TmCons) break;
+        dep_arr[i] = term_text_cstr(t.as.cons.head) orelse
+            return e.set("{s}: dependency name must be Text", .{where});
+        i += 1;
+    }
+    p.deps = dep_arr[0..i];
+
+    if (rec_get(rec, "excludes")) |excl| {
+        if (excl.tag != .TmNil and excl.tag != .TmCons)
+            return e.set("{s}: 'excludes' must be a List Text", .{where});
+        const nexcl = list_length(excl);
+        const ex_arr = gpa_alloc.alloc([]const u8, nexcl) catch
+            return e.set("out of memory", .{});
+        var j: usize = 0;
+        var xq: ?*dhallz.Term = excl;
+        while (xq) |t| : (xq = t.as.cons.tail) {
+            if (t.tag != .TmCons) break;
+            const x = term_text_cstr(t.as.cons.head) orelse
+                return e.set("{s}: excludes entry must be Text", .{where});
+            if (x.len == 0 or x[0] == '/' or
+                (x.len >= 2 and x[0] == '.' and x[1] == '/') or
+                x[x.len - 1] == '/' or std.mem.indexOf(u8, x, "//") != null or
+                std.mem.eql(u8, x, ".") or std.mem.eql(u8, x, ".."))
+            {
+                return e.set("{s}: excludes entry '{s}' is not a clean relative path within the src tree", .{ where, x });
+            }
+            ex_arr[j] = x;
+            j += 1;
+        }
+        p.excludes = ex_arr[0..j];
+    }
+
+    const build = rec_get(rec, "build") orelse
+        return e.set("{s}: missing or non-record 'build' (need {{ target, recipe }})", .{where});
+    if (build.tag != .TmRecordLit)
+        return e.set("{s}: missing or non-record 'build' (need {{ target, recipe }})", .{where});
+    p.target = try need_text(build, "target", where, e);
+
+    const recipe = rec_get(build, "recipe") orelse
+        return e.set("{s}: build missing 'recipe'", .{where});
+    if (recipe.tag != .TmNil and recipe.tag != .TmCons)
+        return e.set("{s}: 'recipe' must be a List Action", .{where});
+    const nrec = list_length(recipe);
+    const rec_arr = gpa_alloc.alloc(FxPkgAction, nrec) catch
+        return e.set("out of memory", .{});
+    var k: usize = 0;
+    var rq: ?*dhallz.Term = recipe;
+    while (rq) |t| : (rq = t.as.cons.tail) {
+        if (t.tag != .TmCons) break;
+        rec_arr[k] = try map_inline_action(t.as.cons.head, where, e);
+        k += 1;
+    }
+    p.recipe = rec_arr[0..k];
+    return p;
+}
+
+fn map_inline_packages(cfg: *FxConfig, list_in: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!void {
+    var list = list_in;
+    if (list == null or list.?.tag == .TmNone) {
+        cfg.inline_packages = &.{};
+        return;
+    }
+    if (list.?.tag == .TmSome) list = list.?.as.some.val;
+    if (list.?.tag == .TmNil) {
+        cfg.inline_packages = &.{};
+        return;
+    }
+    if (list.?.tag != .TmCons)
+        return e.set("inlinePackages must be a List Package", .{});
+    var pkg_list: std.ArrayList(FxPackage) = .empty;
+    var q = list;
+    while (q) |t| : (q = t.as.cons.tail) {
+        if (t.tag != .TmCons) break;
+        const item = t.as.cons.head;
+        if (item == null or item.?.tag != .TmRecordLit)
+            return e.set("inlinePackages entries must be Package records", .{});
+        const p = try map_inline_package(item, e);
+        pkg_list.append(gpa_alloc, p) catch return e.set("out of memory", .{});
+    }
+    cfg.inline_packages = pkg_list.items;
+}
+
+// ─── inline-package subset validation (§6a A/B/D + §6b stance) ────────────
+//
+// THE SUBSET IS THE CAPABILITY.  An agent-authored recipe is admitted only
+// as a composition over a host-frozen Action subset, and every refusal
+// below fires AT CONFIG LOAD — which config_check and fx-activate both go
+// through, so both refuse with the same message from this one place.  An
+// out-of-subset action must never survive to build time: a recipe that is
+// only rejected when it runs has already been accepted by the system.
+
+/// The store-dir name predicate, mirroring packageset.zig name_safe (itself
+/// the packageset.c:192-199 port).  Duplicated here because config.zig
+/// cannot import the fxstore module (build wires `dhall` only into
+/// config_mod); store dirs are named "<hex64>-<name>", so a name with '/'
+/// or a leading '.' could escape the store root.  packageset.zig's copy
+/// remains the authority for the host set; this one guards the inline set.
+fn inline_name_safe(s: []const u8) bool {
+    if (s.len == 0 or !std.ascii.isAlphanumeric(s[0])) return false;
+    for (s[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and
+            c != '.' and c != '_' and c != '+' and c != '-') return false;
+    }
+    return true;
+}
+
+fn validate_inline_packages(cfg: *FxConfig, e: *ErrBuf) error{FxConfig}!void {
+    // duplicate names: the merge would otherwise let the second silently
+    // shadow the first inside the merged set
+    for (cfg.inline_packages, 0..) |*p, i| {
+        for (cfg.inline_packages[0..i]) |*j| {
+            if (std.mem.eql(u8, p.name, j.name))
+                return e.set("duplicate inline package name '{s}'", .{p.name});
+        }
+    }
+    for (cfg.inline_packages) |*p| {
+        const where = try alloc_where(gpa_alloc, "package", p.name, e);
+        if (!inline_name_safe(p.name))
+            return e.set("{s}: invalid package name (need [A-Za-z0-9][A-Za-z0-9._+-]*)", .{where});
+
+        // src: a Fetch is network egress, and the guest has none (CONFIG_NET
+        // is unset on the pinned kernel) — permitting it would be a
+        // capability hole rather than a shortcut.
+        if (p.src.kind == .fetch)
+            return e.set("{s}: agent-declared package src must be < Path = ... > — Fetch is network egress, the guest has none (CONFIG_NET unset), so a fetch here is a capability hole rather than a shortcut", .{where});
+
+        // deps: the derivation hash serialises each dep's FULL STORE PATH
+        // (fxstore derivation.zig: "each direct dep's FULL store path"), so
+        // a dep-carrying package hashes differently under every store root.
+        // The pre-declared slot (fx-init e825d52) is dependency-free for
+        // exactly this property: only a dependency-free package hashes
+        // identically wherever it is built and activated.
+        if (p.deps.len > 0)
+            return e.set("{s}: agent-declared packages must have deps = [] — the derivation hash serialises each dep's FULL STORE PATH, so a dep-carrying package hashes differently under every store root (the pre-declared slot's dependency-freedom is load-bearing, e825d52)", .{where});
+
+        for (p.recipe, 0..) |*act, n| {
+            // Shell is `<shell> -c <arbitrary text>` (fxstore build.zig
+            // run_shell): ONE action that dissolves every other bound on
+            // the recipe — it subsumes the Run rule below and every path
+            // action besides.  Host-frozen package sets keep it (their
+            // recipes are trusted); agent-declared packages never do, and
+            // the split is this refusal.
+            if (act.kind == .shell)
+                return e.set("{s}: recipe action {d} ({s}) is outside the agent-authorable action subset — Shell is '<shell> -c <arbitrary text>', one action that dissolves every other bound; host-frozen package sets keep it, agent-declared packages do not", .{ where, n, act.kind.name() });
+
+            // Run goes through execvp(argv[0]) and the recipe controls the
+            // environment (Env setenv's into the build process, the child
+            // prepends to PATH), so a relative argv[0] names a binary the
+            // package itself may have supplied.  The substrate already
+            // applies exactly this discipline to itself when it execs
+            // bwrap: "execvp('bwrap') searches the CURRENT PATH, which
+            // recipes control.  The child execs this ABSOLUTE path (no
+            // PATH search)" (fxstore build.zig).  Same rule, applied to
+            // the agent's recipes.
+            if (act.kind == .run) {
+                const prog = act.argv[0];
+                if (prog.len == 0 or prog[0] != '/')
+                    return e.set("{s}: recipe action {d} (Run) argv[0] '{s}' must be an ABSOLUTE path — Run is execvp(argv[0]) and the recipe controls PATH (Env prepends to it), so a relative argv[0] can name a binary the package supplied; the substrate execs bwrap by ABSOLUTE path for exactly this reason", .{ where, n, prog });
+            }
+        }
+        // The remaining actions (Copy Mkdir Rm Touch Move Symlink Chmod Echo
+        // Env, and Run with an absolute argv[0]) are ADMITTED — and their
+        // REACH IS NOT BOUNDED BY THIS UNIT.  §6a's element (C), confining
+        // each action's paths to its build workdir, was downgraded to
+        // optional defence-in-depth by §6b (auditing, not proofing: the VM
+        // is the boundary, and no kernel sandbox primitive exists in the
+        // guest).  What this subset buys is the removal of whole classes of
+        // ACCIDENT — an arbitrary shell line, a PATH-shadowed binary,
+        // network egress — and a narrower surface to audit, NOT a bound on
+        // what an admitted action can touch.  An out-of-bounds write is
+        // made VISIBLE by the audit seat (host-side record comparison) and
+        // answered by rollback, not prevented here.
+    }
+}
+
 // ─── Validation pass (cross-field) ──────────────────────────────────────────
 
 fn validate(cfg: *FxConfig, e: *ErrBuf) error{FxConfig}!void {
@@ -634,6 +1046,8 @@ fn validate(cfg: *FxConfig, e: *ErrBuf) error{FxConfig}!void {
         if (!found)
             return e.set("agentService '{s}' references an unknown service", .{name});
     }
+
+    try validate_inline_packages(cfg, e);
 }
 
 // ─── Structural walk ────────────────────────────────────────────────────────
@@ -699,6 +1113,12 @@ fn build_config(out: *FxConfig, nf: ?*dhallz.Term, e: *ErrBuf) error{FxConfig}!v
 
     const etc = rec_get(rec, "extraEtc");
     if (etc) |et| try map_extra_etc(out, et, e);
+
+    // inlinePackages: Optional (List Package) — see the FxConfig field
+    // comment for why absence is legitimate here and is not for
+    // agentService.  Parsed after the reference list, beside extraEtc.
+    const ipkgs = rec_get(rec, "inlinePackages");
+    if (ipkgs) |it| try map_inline_packages(out, it, e);
 
     if (try opt_nat(rec, "bootGraceMs", e, "config")) |g| out.grace_ms = g;
 
@@ -1011,5 +1431,164 @@ fn clean_etc_path(p: []const u8, e: *ErrBuf) error{FxConfig}!void {
         p[p.len - 1] == '/')
     {
         return e.set("extraEtc path '{s}' must be a clean relative path under etc/", .{p});
+    }
+}
+
+test "inlinePackages: Shell/Run-relative/Fetch/deps each refused BY NAME; admitted control passes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const pre =
+        \\let Probe = < Tcp : Natural | Unix : Text | File : Text >
+        \\let Service = { name : Text, argv : List Text, pkg : Optional Text, on : Text,
+        \\                restart : Optional Text, backoffMs : Optional Natural,
+        \\                probe : Optional Probe,
+        \\                env : Optional (List { key : Text, value : Text }),
+        \\                console : Optional Text }
+        \\let User = { name : Text, uid : Natural, groups : List Text }
+        \\in  { hostname = "fixbox"
+        \\    , packages = [] : List Text
+        \\    , users = [ { name = "root", uid = 0, groups = [] : List Text } ]
+        \\    , services =
+        \\        [ { name = "sh", argv = [ "/usr/fx-core/bin/fxsh" ], pkg = None Text,
+        \\            on = "all", restart = Some "never", backoffMs = None Natural,
+        \\            probe = None Probe,
+        \\            env = None (List { key : Text, value : Text }),
+        \\            console = Some "console" }
+        \\        ]
+        \\    , extraEtc = None (List { path : Text, content : Text })
+        \\
+    ;
+    const post =
+        \\    , bootGraceMs = Some 3000
+        \\    , agentService = None Text
+        \\    }
+        \\
+    ;
+    // one admitted package, all TEN admitted action kinds, in a fixed order
+    // the assertions walk back
+    const ok_pkg =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Path = "/fx/disk/agent-src/agentsvc" >,
+        \\        deps = [] : List Text, excludes = [ "scratch" ] : List Text,
+        \\        build = { target = "agentsvc", recipe =
+        \\          [ < Mkdir = "out" >
+        \\          , < Copy = { from = "Mcp.elm", to = "out/mcp.lua" } >
+        \\          , < Chmod = { path = "out/mcp.lua", mode = "0755" } >
+        \\          , < Echo = "built" >
+        \\          , < Env = { key = "FX", value = "1" } >
+        \\          , < Touch = "out/stamp" >
+        \\          , < Run = { argv = [ "/usr/fx-agent/bin/luajit", "-b", "Mcp.elm", "out/mcp.lua" ] } >
+        \\          , < Symlink = { from = "out/mcp.lua", to = "mcp" } >
+        \\          , < Move = { from = "out/mcp.lua", to = "out/mcp2.lua" } >
+        \\          , < Rm = "out/stamp" >
+        \\          ] } } ]
+        \\
+    ;
+    // load(line): write <tmp>/cfg.dhall with the given inlinePackages
+    // expression (ok_pkg absent = field omitted) and load it.
+    const Case = struct { line: ?[]const u8, want_err: ?[]const u8 };
+    const cases = [_]Case{
+        // absent is the honest "no agent-authored packages" state
+        .{ .line = null, .want_err = null },
+        // THE CONTROL: every admitted action kind parses and validates
+        .{ .line = ok_pkg, .want_err = null },
+        // the four subset refusals, each naming package + action + rule
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Path = "/fx/disk/agent-src/agentsvc" >,
+        \\        deps = [] : List Text,
+        \\        build = { target = "agentsvc", recipe =
+        \\          [ < Mkdir = "out" >, < Shell = "make all" > ] } } ]
+        \\
+        , .want_err = "package 'agentsvc': recipe action 1 (Shell) is outside the agent-authorable action subset" },
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Path = "/fx/disk/agent-src/agentsvc" >,
+        \\        deps = [] : List Text,
+        \\        build = { target = "agentsvc", recipe =
+        \\          [ < Run = { argv = [ "./configure", "--prefix=/build" ] } > ] } } ]
+        \\
+        , .want_err = "recipe action 0 (Run) argv[0] './configure' must be an ABSOLUTE path" },
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Fetch = { url = "https://example.com/a.tgz", hash = "f2ca1bb3c199e6c9eda0f4d1e7bb8b4b0f1b2a3c4d5e6f708192a3b4c5d6e7f8" } >,
+        \\        deps = [] : List Text,
+        \\        build = { target = "agentsvc", recipe = [ < Echo = "x" > ] } } ]
+        \\
+        , .want_err = "package 'agentsvc': agent-declared package src must be < Path = ... >" },
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Path = "/fx/disk/agent-src/agentsvc" >,
+        \\        deps = [ "dhake" ] : List Text,
+        \\        build = { target = "agentsvc", recipe = [ < Echo = "x" > ] } } ]
+        \\
+        , .want_err = "agent-declared packages must have deps = []" },
+        // dup within the list + unsafe name: merge-ordering hazards
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "agentsvc", version = "1.0",
+        \\        src = < Path = "/a" >, deps = [] : List Text,
+        \\        build = { target = "t", recipe = [ < Echo = "x" > ] } }
+        \\      , { name = "agentsvc", version = "2.0",
+        \\        src = < Path = "/b" >, deps = [] : List Text,
+        \\        build = { target = "t", recipe = [ < Echo = "x" > ] } } ]
+        \\
+        , .want_err = "duplicate inline package name 'agentsvc'" },
+        .{ .line =
+        \\    , inlinePackages = Some [ { name = "../evil", version = "1.0",
+        \\        src = < Path = "/a" >, deps = [] : List Text,
+        \\        build = { target = "t", recipe = [ < Echo = "x" > ] } } ]
+        \\
+        , .want_err = "package '../evil': invalid package name" },
+    };
+    for (cases) |c| {
+        const body = std.fmt.allocPrint(gpa_alloc, "{s}{s}{s}", .{
+            pre,
+            c.line orelse "",
+            post,
+        }) catch return error.SkipZigTest;
+        defer gpa_alloc.free(body);
+        try tmp.dir.writeFile(io, .{ .sub_path = "cfg.dhall", .data = body });
+        const path = try std.fmt.allocPrint(gpa_alloc, ".zig-cache/tmp/{s}/cfg.dhall", .{tmp.sub_path});
+        defer gpa_alloc.free(path);
+        var e = ErrBuf{};
+        var cfg: FxConfig = undefined;
+        if (c.want_err) |want| {
+            try testing.expectError(error.FxConfig, fx_config_load(&cfg, path, &e));
+            try testing.expect(std.mem.indexOf(u8, e.slice(), want) != null);
+        } else {
+            try fx_config_load(&cfg, path, &e);
+            try testing.expect(cfg.agent_service == null);
+        }
+    }
+
+    // the control's parsed shape: 10 recipe actions in order, excludes kept,
+    // src raw.  Re-load the ok case explicitly (the loop above freed nothing
+    // it needs, but assert against a fresh load for clarity).
+    {
+        const body = std.fmt.allocPrint(gpa_alloc, "{s}{s}{s}", .{ pre, ok_pkg, post }) catch return error.SkipZigTest;
+        defer gpa_alloc.free(body);
+        try tmp.dir.writeFile(io, .{ .sub_path = "ok.dhall", .data = body });
+        const path = try std.fmt.allocPrint(gpa_alloc, ".zig-cache/tmp/{s}/ok.dhall", .{tmp.sub_path});
+        defer gpa_alloc.free(path);
+        var e = ErrBuf{};
+        var cfg: FxConfig = undefined;
+        try fx_config_load(&cfg, path, &e);
+        try testing.expectEqual(@as(usize, 1), cfg.inline_packages.len);
+        const p = &cfg.inline_packages[0];
+        try testing.expectEqualStrings("agentsvc", p.name);
+        try testing.expectEqualStrings("1.0", p.version);
+        try testing.expectEqual(FxPkgSrcKind.path, p.src.kind);
+        try testing.expectEqualStrings("/fx/disk/agent-src/agentsvc", p.src.path.?);
+        try testing.expectEqual(@as(usize, 0), p.deps.len);
+        try testing.expectEqual(@as(usize, 1), p.excludes.len);
+        try testing.expectEqualStrings("scratch", p.excludes[0]);
+        try testing.expectEqualStrings("agentsvc", p.target);
+        const want_kinds = [_]FxPkgActionKind{ .mkdir, .copy, .chmod, .echo, .env, .touch, .run, .symlink, .move, .rm };
+        try testing.expectEqual(want_kinds.len, p.recipe.len);
+        for (want_kinds, 0..) |k, i| try testing.expectEqual(k, p.recipe[i].kind);
+        const run = p.recipe[6];
+        try testing.expectEqual(@as(usize, 4), run.argv.len);
+        try testing.expectEqualStrings("/usr/fx-agent/bin/luajit", run.argv[0]);
     }
 }

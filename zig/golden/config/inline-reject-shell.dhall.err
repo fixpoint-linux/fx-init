@@ -1,0 +1,3 @@
+fx: warning: config does not typecheck (structural walk continues):
+  type mismatch
+fx-config-dump: package 'agentsvc': recipe action 1 (Shell) is outside the agent-authorable action subset — Shell is '<shell> -c <arbitrary text>', one action that dissolves every other bound; host-frozen package sets keep it, agent-declared packages do not

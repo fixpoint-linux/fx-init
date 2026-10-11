@@ -1,0 +1,69 @@
+boot_grace 4000
+current 3
+generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
+generation_config H H H-system-generation/config.dhall
+install /bin/dhake H-dhake 0 H
+install /bin/fakesvc H-fakesvc 0 H
+install /bin/fx-activate H-fx-activate 0 H
+install /bin/fxctl H-fxctl 0 H
+install /bin/init H-fx-init 0 H
+install /etc/group H-system-generation/etc/group 420 H
+install /etc/hostname H-system-generation/etc/hostname 420 H
+install /etc/issue.net H-system-generation/etc/issue.net 420 H
+install /etc/motd H-system-generation/etc/motd 420 H
+install /etc/passwd H-system-generation/etc/passwd 420 H
+provides dhake H-dhake
+provides fakesvc H-fakesvc
+provides fx-activate H-fx-activate
+provides fx-init H-fx-init
+provides fxctl H-fxctl
+svc consh all never
+svc gated up:heartbeat on-failure
+svc heartbeat all always
+svc netty net on-failure
+svc ready sock:tcp:4053 on-failure
+svc timed time:250 never
+svc unixy sock:unix:/run/x.sock never
+svc_argv consh 0 /usr/fx-core/bin/fxsh
+svc_argv gated 0 fakesvc
+svc_argv gated 1 gated
+svc_argv heartbeat 0 fakesvc
+svc_argv heartbeat 1 ok
+svc_argv netty 0 /bin/true
+svc_argv ready 0 /bin/sh
+svc_argv ready 1 -c
+svc_argv ready 2 echo hi
+svc_argv timed 0 /bin/true
+svc_argv unixy 0 fakesvc
+svc_argv unixy 1 unix
+svc_backoff consh 1000
+svc_backoff gated 1000
+svc_backoff heartbeat 500
+svc_backoff netty 1000
+svc_backoff ready 1000
+svc_backoff timed 1000
+svc_backoff unixy 250
+svc_bin consh /usr/fx-core/bin/fxsh
+svc_bin gated H-fakesvc/fakesvc
+svc_bin heartbeat H-fakesvc/fakesvc
+svc_bin netty /bin/true
+svc_bin ready /bin/sh
+svc_bin timed /bin/true
+svc_bin unixy H-fakesvc/fakesvc
+svc_console consh 1
+svc_console gated 0
+svc_console heartbeat 0
+svc_console netty 0
+svc_console ready 0
+svc_console timed 0
+svc_console unixy 0
+svc_env unixy K V
+svc_probe netty tcp 7
+svc_probe ready file /run/ready
+svc_probe unixy unix /run/x.sock
+tool_fxstore /bin/fx-activate
+user al 1000 wheel,root
+user root 0 root
+version 1
+version 2
+version 3

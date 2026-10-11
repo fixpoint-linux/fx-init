@@ -1,0 +1,16 @@
+hostname=fixbox
+package[0]=dhake
+user[0].name=root
+user[0].uid=0
+service[0].name=sh
+service[0].argv[0]=/usr/fx-core/bin/fxsh
+service[0].pkg=-
+service[0].on_kind=FX_ON_ALL
+service[0].on_arg=-
+service[0].restart=FX_RESTART_NEVER
+service[0].backoff_ms=1000
+service[0].probe_kind=FX_PROBE_NONE
+service[0].probe_arg=-
+service[0].console=console
+grace_ms=3000
+agent_service=sh

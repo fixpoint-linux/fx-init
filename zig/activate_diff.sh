@@ -66,16 +66,31 @@ normalize() {
         -e 's/ [0-9]\{10\}$/ E/'
 }
 
-# run_side CFG NRUNS — fresh store, pre-build closure dirs, run the
-# activator NRUNS times (idempotency case), dump facts; every artifact is
-# normalized in place.
+# run_side CFG NRUNS [EXTRA_DIRS] — fresh store, pre-build closure dirs, run
+# the activator NRUNS times (idempotency case), dump facts; every artifact is
+# normalized in place.  EXTRA_DIRS: additional store-relative dirs to
+# pre-build (space-separated) — used by the inline-closure case, whose
+# agent-declared package is not in the host package set so activate_paths
+# cannot enumerate it; the hardcoded dir name IS the fixture's derivation
+# hash (content-derived, stable across machines — if the fixture src tree or
+# recipe drifts, activation fails 'not built' and the case goes red).
 run_side() {
-    cfg=$1 nruns=$2
+    cfg=$1 nruns=$2 extra=${3:-}
 
     rm -rf "$STORE"
+    # n.genhash.empty is a per-case marker but lived in the shared $WORK:
+    # once the first failing case created it, every LATER case — including
+    # succeeding ones — took the no-generation branch, so the genhash golden
+    # and the raw-hash idempotency check silently no-opped for every case
+    # after the first failure (the idempotency case included).  Clear it per
+    # case so each case asserts what it actually produced.
+    rm -f "$WORK/n.genhash.empty"
     rels=$("$PATHS" --store "$STORE" --package-set "$CORPUS/package-set.dhall" $ROOTS) || {
         echo "activate_diff: activate_paths failed" >&2; return 1; }
     for d in $rels; do
+        mkdir -p "$STORE/$d" && echo built > "$STORE/$d/payload"
+    done
+    for d in $extra; do
         mkdir -p "$STORE/$d" && echo built > "$STORE/$d/payload"
     done
 
@@ -139,8 +154,8 @@ check_one() {
 }
 
 run_case() {
-    name=$1; cfg=$2; nruns=$3
-    run_side "$cfg" "$nruns" || { fail=$((fail + 1)); echo "FAIL $name (run_side)"; return; }
+    name=$1; cfg=$2; nruns=$3; extra=${4:-}
+    run_side "$cfg" "$nruns" "$extra" || { fail=$((fail + 1)); echo "FAIL $name (run_side)"; return; }
 
     ok=1
     i=1
@@ -189,6 +204,14 @@ run_case bad-on          bad-on.dhall               1
 run_case parse-err       parse-err.dhall            1
 run_case missing-field   missing-field.dhall        1
 run_case idempotency     full.dhall                 2
+# agent-declared packages (baliveau §6a): the merge, the collision refusal,
+# and the builds control.  inline-inert's raw genhash must EQUAL full's (the
+# field is invisible to the serialization until used — asserted by the
+# raw-hash note in the unit report); inline-collide must be refused naming
+# 'dhake'; inline-closure grows the closure to six and MOVES the genhash.
+run_case inline-inert    inline-inert.dhall         1
+run_case inline-collide  inline-collide.dhall       1
+run_case inline-closure  inline-closure.dhall       1 "a8f5d858889748e2da30d00c100e7b0cad09911705d15b2d517cdb8315731a01-agentsvc"
 
 echo "activate_diff: $pass passed, $fail failed"
 [ "$fail" = 0 ]

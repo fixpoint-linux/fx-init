@@ -66,5 +66,28 @@ pub fn main(init: std.process.Init) !void {
     // config_diff must SEE a walker regression that drops or mis-parses
     // the declaration, not just the refusals validation would catch.
     try out.print("agent_service={s}\n", .{cfg.agent_service orelse "-"});
+    // inlinePackages rides the dump per-entry (the services/users/etc
+    // convention: an empty list prints nothing, so pre-inlinePackages
+    // goldens are byte-identical — the field is invisible until used).
+    for (cfg.inline_packages, 0..) |*p, i| {
+        try out.print("ipkg[{d}].name={s}\n", .{ i, p.name });
+        try out.print("ipkg[{d}].version={s}\n", .{ i, p.version });
+        switch (p.src.kind) {
+            .path => try out.print("ipkg[{d}].src=path:{s}\n", .{ i, p.src.path orelse "-" }),
+            .fetch => try out.print("ipkg[{d}].src=fetch:{s}:{s}\n", .{ i, p.src.url orelse "-", p.src.hash orelse "-" }),
+        }
+        for (p.deps, 0..) |d, j|
+            try out.print("ipkg[{d}].deps[{d}]={s}\n", .{ i, j, d });
+        for (p.excludes, 0..) |x, j|
+            try out.print("ipkg[{d}].excludes[{d}]={s}\n", .{ i, j, x });
+        try out.print("ipkg[{d}].target={s}\n", .{ i, p.target });
+        for (p.recipe, 0..) |*act, j| {
+            try out.print("ipkg[{d}].recipe[{d}].kind={s}\n", .{ i, j, act.kind.name() });
+            try out.print("ipkg[{d}].recipe[{d}].a={s}\n", .{ i, j, act.a orelse "-" });
+            try out.print("ipkg[{d}].recipe[{d}].b={s}\n", .{ i, j, act.b orelse "-" });
+            for (act.argv, 0..) |av, k|
+                try out.print("ipkg[{d}].recipe[{d}].argv[{d}]={s}\n", .{ i, j, k, av });
+        }
+    }
     try out.flush();
 }

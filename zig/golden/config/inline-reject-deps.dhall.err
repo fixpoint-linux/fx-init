@@ -1,0 +1,3 @@
+fx: warning: config does not typecheck (structural walk continues):
+  type mismatch
+fx-config-dump: package 'agentsvc': agent-declared packages must have deps = [] — the derivation hash serialises each dep's FULL STORE PATH, so a dep-carrying package hashes differently under every store root (the pre-declared slot's dependency-freedom is load-bearing, e825d52)

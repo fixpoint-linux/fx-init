@@ -1,0 +1,3 @@
+fx: warning: config does not typecheck (structural walk continues):
+  type mismatch
+fx-config-dump: package 'agentsvc': agent-declared package src must be < Path = ... > — Fetch is network egress, the guest has none (CONFIG_NET unset), so a fetch here is a capability hole rather than a shortcut

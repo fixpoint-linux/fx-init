@@ -1,0 +1,3 @@
+fx: warning: config does not typecheck (structural walk continues):
+  type mismatch
+fx-config-dump: package 'agentsvc': recipe action 0 (Run) argv[0] './configure' must be an ABSOLUTE path — Run is execvp(argv[0]) and the recipe controls PATH (Env prepends to it), so a relative argv[0] can name a binary the package supplied; the substrate execs bwrap by ABSOLUTE path for exactly this reason

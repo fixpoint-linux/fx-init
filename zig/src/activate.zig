@@ -956,6 +956,137 @@ fn commitClosureMeta(db: *DlDb, entries: []PathEntry, store_root: []const u8) vo
     }
 }
 
+// ─── inline-package merge (baliveau §6a E) ─────────────────────────────────
+
+/// Map a config-level FxPkgActionKind onto the fxstore ActionKind.  The two
+/// enums are declared in the same order (config.zig mirrors packageset.zig),
+/// but the mapping is EXPLICIT so a re-ordering on either side is a compile
+/// error here, not a silent tag remap.
+fn mapActionKind(k: cfg_mod.FxPkgActionKind) fx.ActionKind {
+    return switch (k) {
+        .shell => .shell,
+        .copy => .copy,
+        .mkdir => .mkdir,
+        .rm => .rm,
+        .touch => .touch,
+        .move => .move,
+        .symlink => .symlink,
+        .chmod => .chmod,
+        .echo => .echo,
+        .env => .env,
+        .run => .run,
+    };
+}
+
+/// Merge the config's inline packages into the (host-frozen) package set,
+/// BEFORE the closure is computed, so a config-declared package is
+/// resolvable by the same path a host-declared one is: its name may appear
+/// in config.packages (a closure root) or as a service's pkg.  The merged
+/// Package and its strings are duped into the set's arena — deinit() is the
+/// single free point, exactly as for a loaded package.
+///
+/// PRECEDENCE — the host-frozen set is authoritative: an inline package may
+/// only introduce a NEW name, and a collision is REFUSED LOUDLY (never
+/// silently shadowed), because a shadowed host package would substitute a
+/// trusted recipe with an untrusted one.  validate() has already refused
+/// duplicate names within the list and every out-of-subset action, so by
+/// the time this runs the inline definitions are admissible; only the
+/// collision against the host set remains to check.
+///
+/// Src paths follow the host package-set's own resolution rule
+/// (packageset.zig canonicalize_path): ABSOLUTE is kept verbatim, RELATIVE
+/// is realpath'd against the CONFIG's directory (where a host package's
+/// relative src resolves against the package-set file's directory).  A
+/// relative src whose tree is absent therefore fails HERE — loudly — and
+/// not in the closure walk; an absolute src preserves the host package's
+/// src-free fallback (in-guest re-activation without the source tree), and
+/// that is the shape the agent's own packages use (/fx/disk/agent-src/...).
+pub fn mergeInlinePackages(
+    ps: *PackageSet,
+    cfg: *const FxConfig,
+    config_path: []const u8,
+    e: *ErrBuf,
+) error{FxConfig}!void {
+    if (cfg.inline_packages.len == 0) return;
+
+    const a = ps.arena.allocator();
+    const base_dir = if (std.mem.lastIndexOfScalar(u8, config_path, '/')) |slash|
+        config_path[0..slash]
+    else
+        ".";
+
+    // find the list tail (append in config order, after the host packages)
+    var tail: *?*Package = &ps.head;
+    while (tail.*) |t| tail = &t.next;
+
+    for (cfg.inline_packages) |*ip| {
+        if (ps.find(ip.name) != null)
+            return e.set("inline package '{s}' collides with a host-frozen package of the same name — the host package set is authoritative and an inline package may only introduce a NEW name (a shadowed host package would substitute a trusted recipe with an untrusted one)", .{ip.name});
+
+        const p = a.create(Package) catch return e.set("out of memory", .{});
+        p.* = .{
+            .name = a.dupe(u8, ip.name) catch return e.set("out of memory", .{}),
+            .version = a.dupe(u8, ip.version) catch return e.set("out of memory", .{}),
+            .src = .{ .kind = .path },
+            .deps = &.{}, // validate() refused a non-empty deps list
+            .excludes = blk: {
+                const xs = a.alloc([]const u8, ip.excludes.len) catch return e.set("out of memory", .{});
+                for (ip.excludes, 0..) |x, i| xs[i] = a.dupe(u8, x) catch return e.set("out of memory", .{});
+                break :blk xs;
+            },
+            .target = a.dupe(u8, ip.target) catch return e.set("out of memory", .{}),
+        };
+        // src: absolute verbatim, relative realpath'd against the config's
+        // dir (the host package-set's own rule — see the doc comment)
+        if (ip.src.path.?[0] == '/') {
+            p.src.path = a.dupe(u8, ip.src.path.?) catch return e.set("out of memory", .{});
+        } else {
+            p.src.path = canonicalizeSrcPath(a, ip.src.path.?, base_dir) orelse
+                return e.set("package '{s}': cannot canonicalize src path '{s}' (relative inline src resolves against the config's directory and must exist there; absolute src paths are taken verbatim)", .{ ip.name, ip.src.path.? });
+        }
+
+        // recipe: config slice -> the package-set's linked list, order kept
+        var rtail: *?*fx.Action = &p.recipe;
+        for (ip.recipe) |*ia| {
+            const act = a.create(fx.Action) catch return e.set("out of memory", .{});
+            act.* = .{
+                .kind = mapActionKind(ia.kind),
+                .a = if (ia.a) |s| (a.dupe(u8, s) catch return e.set("out of memory", .{})) else null,
+                .b = if (ia.b) |s| (a.dupe(u8, s) catch return e.set("out of memory", .{})) else null,
+                .argv = blk: {
+                    const av = a.alloc([]const u8, ia.argv.len) catch return e.set("out of memory", .{});
+                    for (ia.argv, 0..) |v, i| av[i] = a.dupe(u8, v) catch return e.set("out of memory", .{});
+                    break :blk av;
+                },
+            };
+            rtail.* = act;
+            rtail = &act.next;
+        }
+
+        tail.* = p;
+        tail = &p.next;
+        ps.count += 1;
+    }
+}
+
+/// canonicalize_path (packageset.zig), the host package set's own relative
+/// src resolution: realpath(base_dir/path), absolute verbatim.  Re-declared
+/// here rather than re-exported through the facade so the fxstore checkout
+/// is untouched by this unit; the two must stay in step.
+fn canonicalizeSrcPath(a: std.mem.Allocator, path: []const u8, base_dir: []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    if (path[0] == '/') return a.dupe(u8, path) catch null;
+    const full = std.fmt.allocPrint(a, "{s}/{s}", .{ base_dir, path }) catch return null;
+    defer a.free(full);
+    const full_z = a.dupeZ(u8, full) catch return null;
+    defer a.free(full_z);
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    const r = realpath(full_z.ptr, &resolved) orelse return null;
+    return a.dupe(u8, std.mem.span(r)) catch null;
+}
+
+extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+
 // ─── CLI ──────────────────────────────────────────────────────────────────
 
 const usage_text =
@@ -1086,6 +1217,18 @@ pub fn main(init: std.process.Init) !void {
     }
     var cfg_sha: [65]u8 = undefined;
     fx.sha256_hex(cfg_bytes, &cfg_sha);
+
+    // §6a E: merge the config's inline packages into the (host-frozen)
+    // package set BEFORE the closure is computed, so an agent-declared
+    // package is resolvable by the same path a host-declared one is (a
+    // closure root in config.packages, or a service's pkg).  This is also
+    // where a name colliding with a host package is refused — loudly, since
+    // the merge is the only place both sets are visible.  Runs BEFORE the
+    // store is opened: a refused config must not touch the store at all.
+    mergeInlinePackages(&ps, &cfg, config_path_s, &e) catch {
+        std.debug.print("fx-activate: {s}\n", .{e.slice()});
+        std.process.exit(1);
+    };
 
     var se = fx.store.ErrBuf{};
     const s = fx.fx_store_open(g_io, store_root_s, &se) catch {
@@ -1619,6 +1762,224 @@ test "package-set load round-trip through the Zig store core" {
 
     try testing.expect(ps.find("beta") == beta);
     try testing.expect(ps.find("ghost") == null);
+}
+
+test "mergeInlinePackages: appends after host packages, maps kinds/srcs, refuses host collision by name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    try tmp.dir.createDirPath(io, "src/alpha");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/alpha/a.txt", .data = "alpha\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-set.dhall", .data =
+        \\let Src = < Path : Text | Fetch : { url : Text, hash : Text } >
+        \\let Action = < Shell : Text >
+        \\let Build = { target : Text, recipe : List Action }
+        \\let Package = { name : Text, version : Text, src : Src, deps : List Text,
+        \\                excludes : List Text, build : Build }
+        \\let PackageSet = { packages : List Package }
+        \\in  { packages =
+        \\        [ { name = "alpha", version = "1.0", src = < Path = "src/alpha" >,
+        \\            deps = [] : List Text, excludes = [] : List Text,
+        \\            build = { target = "alpha.bin", recipe = [] : List Action } } ]
+        \\        } : PackageSet
+    });
+    var ps_path_buf: [256]u8 = undefined;
+    const ps_path = try std.fmt.bufPrint(&ps_path_buf, ".zig-cache/tmp/{s}/package-set.dhall", .{tmp.sub_path});
+
+    var ps: PackageSet = undefined;
+    var pe = fx.packageset.ErrBuf{};
+    try fx.fx_packageset_load(&ps, ps_path, &pe);
+    defer ps.deinit();
+    try testing.expectEqual(@as(usize, 1), ps.count);
+
+    var e: ErrBuf = .{};
+    const actions = [_]cfg_mod.FxPkgAction{
+        .{ .kind = .mkdir, .a = "out" },
+        .{ .kind = .run, .argv = &.{ "/usr/fx-agent/bin/luajit", "-b" }, .a = "/usr/fx-agent/bin/luajit" },
+        .{ .kind = .copy, .a = "Mcp.elm", .b = "out/mcp.lua" },
+    };
+    const cfg = FxConfig{
+        .hostname = "h",
+        .agent_service = null,
+        .packages = &.{},
+        .users = &.{},
+        .services = &.{},
+        .extra_etc = &.{},
+        .grace_ms = 30000,
+        .inline_packages = &.{
+            .{
+                .name = "agentsvc",
+                .version = "1.0",
+                .src = .{ .kind = .path, .path = "src/alpha" }, // RELATIVE: realpath against the config's dir
+                .excludes = &.{"junk"},
+                .target = "agentsvc",
+                .recipe = &actions,
+            },
+        },
+    };
+
+    // relative src resolves against the CONFIG's directory (same tmp dir
+    // here); absolute is kept verbatim
+    try mergeInlinePackages(&ps, &cfg, ps_path, &e);
+    try testing.expectEqual(@as(usize, 2), ps.count);
+    const m = ps.find("agentsvc").?;
+    try testing.expect(m != ps.head); // appended AFTER the host package
+    try testing.expectEqualStrings("agentsvc", m.name);
+    try testing.expect(std.mem.endsWith(u8, m.src.path.?, "src/alpha")); // realpath'd
+    try testing.expectEqualStrings("agentsvc", m.target);
+    try testing.expectEqual(@as(usize, 1), m.excludes.len);
+    try testing.expectEqualStrings("junk", m.excludes[0]);
+    try testing.expectEqual(@as(usize, 0), m.deps.len);
+    // recipe order + kind mapping + payloads
+    try testing.expectEqual(fx.ActionKind.mkdir, m.recipe.?.kind);
+    try testing.expectEqualStrings("out", m.recipe.?.a.?);
+    const run = m.recipe.?.next.?;
+    try testing.expectEqual(fx.ActionKind.run, run.kind);
+    try testing.expectEqual(@as(usize, 2), run.argv.len);
+    try testing.expectEqualStrings("/usr/fx-agent/bin/luajit", run.argv[0]);
+    try testing.expectEqualStrings("/usr/fx-agent/bin/luajit", run.a.?);
+    const copy = run.next.?;
+    try testing.expectEqual(fx.ActionKind.copy, copy.kind);
+    try testing.expectEqualStrings("out/mcp.lua", copy.b.?);
+    try testing.expect(copy.next == null);
+
+    // ABSOLUTE src: verbatim, no normalization (the C strdup rule)
+    var ps2: PackageSet = undefined;
+    var pe2 = fx.packageset.ErrBuf{};
+    try fx.fx_packageset_load(&ps2, ps_path, &pe2);
+    defer ps2.deinit();
+    const cfg2 = FxConfig{
+        .hostname = "h",
+        .agent_service = null,
+        .packages = &.{},
+        .users = &.{},
+        .services = &.{},
+        .extra_etc = &.{},
+        .grace_ms = 30000,
+        .inline_packages = &.{
+            .{ .name = "agentsvc", .version = "1.0", .src = .{ .kind = .path, .path = "/fx/disk/agent-src/../agent-src/agentsvc" }, .target = "t" },
+        },
+    };
+    e = .{};
+    try mergeInlinePackages(&ps2, &cfg2, ps_path, &e);
+    try testing.expectEqualStrings("/fx/disk/agent-src/../agent-src/agentsvc", ps2.find("agentsvc").?.src.path.?);
+
+    // COLLISION with a host-frozen name: refused LOUDLY, by name — a
+    // shadowed host package would substitute a trusted recipe with an
+    // untrusted one, so this is a refusal, not a precedence
+    const cfg3 = FxConfig{
+        .hostname = "h",
+        .agent_service = null,
+        .packages = &.{},
+        .users = &.{},
+        .services = &.{},
+        .extra_etc = &.{},
+        .grace_ms = 30000,
+        .inline_packages = &.{
+            .{ .name = "alpha", .version = "9.9", .src = .{ .kind = .path, .path = "/nowhere" }, .target = "t" },
+        },
+    };
+    e = .{};
+    try testing.expectError(error.FxConfig, mergeInlinePackages(&ps2, &cfg3, ps_path, &e));
+    try testing.expect(std.mem.indexOf(u8, e.slice(), "inline package 'alpha' collides with a host-frozen package") != null);
+    // the refused merge left the set untouched
+    try testing.expectEqual(@as(usize, 2), ps2.count);
+    try testing.expectEqualStrings("1.0", ps2.find("alpha").?.version);
+
+    // a relative src whose tree is absent fails the merge loudly (realpath)
+    const cfg4 = FxConfig{
+        .hostname = "h",
+        .agent_service = null,
+        .packages = &.{},
+        .users = &.{},
+        .services = &.{},
+        .extra_etc = &.{},
+        .grace_ms = 30000,
+        .inline_packages = &.{
+            .{ .name = "ghostsvc", .version = "1.0", .src = .{ .kind = .path, .path = "src/ghost" }, .target = "t" },
+        },
+    };
+    e = .{};
+    try testing.expectError(error.FxConfig, mergeInlinePackages(&ps2, &cfg4, ps_path, &e));
+    try testing.expect(std.mem.indexOf(u8, e.slice(), "package 'ghostsvc': cannot canonicalize src path 'src/ghost'") != null);
+}
+
+test "mergeInlinePackages: an inline package closes over like a host one (computePaths)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    try tmp.dir.createDirPath(io, "src/agent");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/agent/Mcp.elm", .data = "module Mcp exposing (..)\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "package-set.dhall", .data =
+        \\let Src = < Path : Text | Fetch : { url : Text, hash : Text } >
+        \\let Action = < Shell : Text >
+        \\let Build = { target : Text, recipe : List Action }
+        \\let Package = { name : Text, version : Text, src : Src, deps : List Text,
+        \\                excludes : List Text, build : Build }
+        \\let PackageSet = { packages : List Package }
+        \\in  { packages = [] : List Package } : PackageSet
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.dhall", .data =
+        \\let Action = < Mkdir : Text | Copy : { from : Text, to : Text } | Run : { argv : List Text } >
+        \\in  { hostname = "fixbox"
+        \\    , packages = [ "agentsvc" ] : List Text
+        \\    , users = [ { name = "root", uid = 0, groups = [] : List Text } ]
+        \\    , services = [] : List { name : Text, argv : List Text, pkg : Optional Text, on : Text }
+        \\    , inlinePackages =
+        \\        Some [ { name = "agentsvc", version = "1.0",
+        \\            src = < Path = "src/agent" >,
+        \\            deps = [] : List Text, excludes = [] : List Text,
+        \\            build = { target = "agentsvc", recipe =
+        \\              [ < Mkdir = "out" >
+        \\              , < Copy = { from = "Mcp.elm", to = "out/mcp.lua" } >
+        \\              ] : List Action } } ]
+        \\    , agentService = None Text
+        \\    }
+    });
+    var path_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var ps_path_buf: [256]u8 = undefined;
+    const ps_path = try std.fmt.bufPrint(&ps_path_buf, "{s}/package-set.dhall", .{base});
+    var cfg_path_buf: [256]u8 = undefined;
+    const cfg_path = try std.fmt.bufPrint(&cfg_path_buf, "{s}/config.dhall", .{base});
+
+    var ps: PackageSet = undefined;
+    var pe = fx.packageset.ErrBuf{};
+    try fx.fx_packageset_load(&ps, ps_path, &pe);
+    defer ps.deinit();
+    try testing.expectEqual(@as(usize, 0), ps.count);
+
+    var cfg: FxConfig = undefined;
+    var ce: ErrBuf = .{};
+    try cfg_mod.fx_config_load(&cfg, cfg_path, &ce);
+
+    try mergeInlinePackages(&ps, &cfg, cfg_path, &ce);
+    try testing.expectEqual(@as(usize, 1), ps.count);
+
+    // the merged package resolves through the SAME closure path a host
+    // package takes: roots from config.packages -> closure -> topo ->
+    // content-hash -> derivation -> store path.  computePaths' isDir /
+    // fx_content_hash_dir read the g_io global that main() sets; set it
+    // here the same way.
+    g_io = io;
+    var se = fx.store.ErrBuf{};
+    var store_buf: [256]u8 = undefined;
+    const store_root = try std.fmt.bufPrint(&store_buf, "{s}/store", .{base});
+    const s = try fx.fx_store_open(io, store_root, &se);
+    defer _ = fx.fx_store_close(s);
+    const db = fx.fx_store_db(s).?;
+    var cerr: [PATH_MAX]u8 = undefined;
+    const entries = try computePaths(&ps, db, cfg.packages, store_root, &cerr, &ce);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("agentsvc", entries[0].p.name);
+    // src_of binds the source hash: the property that makes the agent's
+    // work attributable to the generation (§6a E)
+    try testing.expect(entries[0].src_hash != null);
+    // the store path is <root>/<derivation-hash>-agentsvc — basename is the
+    // store-relative form the genhash serialises
+    try testing.expect(std.mem.endsWith(u8, entries[0].path, "-agentsvc"));
 }
 
 test "buf helpers: u32be/lpstr/dhallStr byte shapes" {

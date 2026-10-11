@@ -1,0 +1,2 @@
+fx: warning: config does not typecheck (structural walk continues):
+  union literal alternative 'Copy' is not in the union type

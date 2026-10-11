@@ -1,0 +1,1 @@
+fx-activate: inline package 'dhake' collides with a host-frozen package of the same name — the host package set is authoritative and an inline package may only introduce a NEW name (a shadowed host package would substitute a trusted recipe with an untrusted one)
