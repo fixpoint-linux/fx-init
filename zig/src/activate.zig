@@ -843,6 +843,27 @@ pub fn writeFileP(path: []const u8, content: []const u8, e: *ErrBuf) error{Write
     }
 }
 
+/// Read a whole file's bytes into a c_allocator buffer (config.zig's
+/// read_all shape; process-lifetime leak, the CLI's stated policy).  Null on
+/// open/read failure — callers print their own context with errno.
+fn readAllBytes(path: []const u8) ?[]u8 {
+    var path_buf: [PATH_MAX:0]u8 = undefined;
+    if (path.len >= path_buf.len) return null;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const f = std.c.fopen(@ptrCast(&path_buf), "rb") orelse return null;
+    defer _ = std.c.fclose(f);
+    var list: std.ArrayList(u8) = .empty;
+    var chunk: [65536]u8 = undefined;
+    while (true) {
+        const n = std.c.fread(&chunk, 1, chunk.len, f);
+        if (n == 0) break;
+        list.appendSlice(gpa_alloc, chunk[0..n]) catch return null;
+        if (n < chunk.len) break;
+    }
+    return list.items;
+}
+
 // ─── fact writer (declare + txn_add_fact) ─────────────────────────────────
 
 fn declare(db: *DlDb, rel: [*:0]const u8, arity: u8, e: *ErrBuf) error{DeclareFailed}!void {
@@ -1032,11 +1053,39 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    // ── the config's INPUT identity (baliveau §8.3/§1a) ─────────────────────
+    // genhash content-addresses the config's PARSED fields, so two generations
+    // are distinguishable but neither names the FILE that produced it.  The
+    // fix records the input's identity beside the generation: bytes read here
+    // are hashed into the generation_config fact and retained as
+    // <gen_dir>/config.dhall (written after the genhash is computed, so the
+    // address cannot move).  Read BEFORE evaluation and re-read AFTER: the
+    // retained copy must be the bytes the evaluator saw, and a config edited
+    // mid-activation must fail loudly rather than pin a hybrid claim.
+    // Tamper-EVIDENT, not tamper-proof (§6b): an A→B→A rewrite inside the
+    // window is indistinguishable — stated residual, same stance as the rest
+    // of the record.
+    const cfg_bytes = readAllBytes(config_path_s) orelse {
+        std.debug.print("fx-activate: cannot read config '{s}': {s}\n", .{ config_path_s, errStr() });
+        std.process.exit(1);
+    };
+
     var cfg: FxConfig = undefined;
     cfg_mod.fx_config_load(&cfg, config_path_s, &e) catch {
         std.debug.print("fx-activate: {s}\n", .{e.slice()});
         std.process.exit(1);
     };
+
+    const cfg_again = readAllBytes(config_path_s) orelse {
+        std.debug.print("fx-activate: cannot re-read config '{s}': {s}\n", .{ config_path_s, errStr() });
+        std.process.exit(1);
+    };
+    if (!std.mem.eql(u8, cfg_bytes, cfg_again)) {
+        std.debug.print("fx-activate: config '{s}' changed during activation; re-run against a stable input\n", .{config_path_s});
+        std.process.exit(1);
+    }
+    var cfg_sha: [65]u8 = undefined;
+    fx.sha256_hex(cfg_bytes, &cfg_sha);
 
     var se = fx.store.ErrBuf{};
     const s = fx.fx_store_open(g_io, store_root_s, &se) catch {
@@ -1199,12 +1248,40 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("fx-activate: {s}\n", .{e.slice()});
             std.process.exit(1);
         };
+        // retain the evaluated config beside the buildfile (input identity;
+        // see the cfg_bytes note above).  In-scratch so it publishes
+        // atomically with etc/ + Dhakefile.dhall under the rename.
+        var cfgcp_buf: [PATH_MAX]u8 = undefined;
+        const cfgcp = snfmtz(&cfgcp_buf, "{s}/config.dhall", .{scratch});
+        writeFileP(cfgcp, cfg_bytes, &e) catch {
+            std.debug.print("fx-activate: {s}\n", .{e.slice()});
+            std.process.exit(1);
+        };
         if (std.c.rename(scratch.ptr, gen_dir.ptr) != 0) {
             // maybe a concurrent activation created it: adopt
             if (!isDir(std.Io.Dir.cwd(), io, gen_dir)) {
                 std.debug.print("fx-activate: rename {s} -> {s}: {s}\n", .{ scratch, gen_dir, errStr() });
                 std.process.exit(1);
             }
+        }
+    }
+
+    // adopted generation dir: keep the retained config in step with THIS
+    // activation's input.  A comment-only config edit parses to the same
+    // facts, keeps the genhash, and adopts the existing dir — whose retained
+    // copy would otherwise still be the OLDER bytes while the fact below
+    // records the newer hash.  Missing or differing → (re)write; identical →
+    // untouched (idempotent re-activation does not disturb the published
+    // bytes).
+    {
+        var cfgold_buf: [PATH_MAX]u8 = undefined;
+        const cfgold = snfmtz(&cfgold_buf, "{s}/config.dhall", .{gen_dir});
+        const cur = readAllBytes(cfgold);
+        if (cur == null or !std.mem.eql(u8, cur.?, cfg_bytes)) {
+            writeFileP(cfgold, cfg_bytes, &e) catch {
+                std.debug.print("fx-activate: {s}\n", .{e.slice()});
+                std.process.exit(1);
+            };
         }
     }
 
@@ -1226,6 +1303,7 @@ pub fn main(init: std.process.Init) !void {
     const Decl = struct { rel: [*:0]const u8, arity: u8 };
     const decls = [_]Decl{
         .{ .rel = "generation", .arity = 4 },
+        .{ .rel = "generation_config", .arity = 3 },
         .{ .rel = "svc", .arity = 3 },
         .{ .rel = "svc_argv", .arity = 3 },
         .{ .rel = "svc_env", .arity = 3 },
@@ -1279,6 +1357,26 @@ pub fn main(init: std.process.Init) !void {
             now,
         };
         addFact(db, "generation", &cols);
+    }
+    // generation_config(genhash, config_sha256, origin) a3 — the generation's
+    // INPUT identity (§8.3): which config produced this generation.  Cleared
+    // with the other generation facts each activation, so exactly one row
+    // describes the live generation.  origin is STORE-RELATIVE (the
+    // install/provides relocation convention): the RETAINED copy
+    // <genhash>-system-generation/config.dhall, written from the bytes that
+    // were read before evaluation and verified unchanged after it (see the
+    // cfg_bytes note in main).  The activation-time --config path is
+    // deliberately NOT a term: a host/cwd-relative string is neither
+    // relocatable nor durable, and the retained copy is the readable form of
+    // the same claim.
+    {
+        var cfgorg_buf: [PATH_MAX]u8 = undefined;
+        const cols = [3]u32{
+            fx.dl_intern_str(db, genhash[0..64 :0]),
+            fx.dl_intern_str(db, cfg_sha[0..64 :0]),
+            fx.dl_intern_str(db, snfmtz(&cfgorg_buf, "{s}-system-generation/config.dhall", .{genhash_s})),
+        };
+        addFact(db, "generation_config", &cols);
     }
     // tool_fxstore(path) a1 — record the activator's conventional rootfs path
     // so fx-init can fork fx-activate for re-activations over the control

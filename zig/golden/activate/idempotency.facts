@@ -1,6 +1,7 @@
 boot_grace 4000
 current 5
 generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
+generation_config H H H-system-generation/config.dhall
 install /bin/dhake H-dhake 0 H
 install /bin/fakesvc H-fakesvc 0 H
 install /bin/fx-activate H-fx-activate 0 H
