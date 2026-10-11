@@ -943,6 +943,135 @@ fn recovery_append(published: u32, from_failed: u32, gh: []const u8) void {
     syncfs_store();
 }
 
+// ─── durable operator journal: <store>/.operator ──────────────────────────
+//
+// WHY A SEPARATE FILE (the mirror of .recovery): the runtime datalog's
+// rt_control/rt_effect rows carry every ctrl command but live in
+// /run/fx/log.db — POST-PIVOT /run IS TMPFS, so the only durable trace of
+// an operator action was the ABSENCE of an automatic roll-forward.
+// .recovery's header EXCLUDES operator actions on purpose (a .recovery
+// row means an AUTOMATIC roll-forward — the audit and the reporter both
+// rely on that meaning), so operator rows must NOT be merged into it:
+// this file is its exact complement.  One DATA line per operator
+// intervention ON THE GENERATION PLANE, including the ones that failed
+// or were refused — an intervention that did not take effect is still
+// an intervention, and "who acted" must not depend on inferring it from
+// a roll-forward that did not happen.
+
+/// The header IS the definition, in the file itself (the .recovery
+/// discipline): what is recorded, what is NOT, and — because a record
+/// that silently omits a class is worse than none — which intervention
+/// paths CANNOT reach this file at all.
+const OPERATOR_HEADER =
+    \\# fx-init operator journal. One DATA line per OPERATOR intervention
+    \\# on the generation plane, i.e. per control-channel `activate`,
+    \\# `rollback` or `shutdown` — INCLUDING the ones that FAILED or were
+    \\# REFUSED: an intervention that did not take effect is still an
+    \\# intervention.  The count of interventions is the number of lines
+    \\# starting with a digit.
+    \\# line: <epoch-s> <action> <arg> <outcome> <from-version|-> <to-version|-> <boot-nonce|none>
+    \\#   action:  activate | rollback | shutdown (the ctrl arm that wrote it)
+    \\#   arg:     the operator's operand VERBATIM (config path, requested
+    \\#            version, "-" for shutdown)
+    \\#   outcome: ok              took effect (the store moved as asked)
+    \\#            failed:<rc>     the activate executor exited rc
+    \\#                            (fork/exec failure = -1)
+    \\#            refused         the STORE refused (rollback to a version
+    \\#                            that does not exist); nothing landed,
+    \\#                            to-version is "-"
+    \\#            refused-config  the store CURRENT moved but PID1's service
+    \\#                            table REFUSED the configuration (the
+    \\#                            service bound was exceeded): the
+    \\#                            generation is in the store but nothing
+    \\#                            supervises it
+    \\#            dhake-failed    activation committed, live-root reapply
+    \\#                            failed
+    \\#            unverified      the executor ran but the store could not
+    \\#                            be re-opened to confirm the result
+    \\#   from/to: the store CURRENT before/after the intervention;
+    \\#            "-" = unknown, or no generation move (shutdown)
+    \\# NOT recorded (not generation-plane interventions): the READS
+    \\# (status, q, grep, search), file transfers (put, rm), the
+    \\# interactive shell, per-service runtime commands (start/stop/
+    \\# restart), probe — and a malformed request (missing operand) that
+    \\# no arm ever executed.
+    \\# NOT recorded AND NOT DETECTABLE from this file — paths that
+    \\# bypass PID1's control handler entirely: a host-side
+    \\# `fxstore rollback` (a different process, in a deployment possibly
+    \\# not even inside the guest), `fxstore rollback --hard`, and a
+    \\# hand-edited store CURRENT.  Their only trace is the store's own
+    \\# version history minus this file: treat an unexplained generation
+    \\# move as one of these.
+    \\# SEPARATE from .recovery ON PURPOSE: a .recovery row is an AUTOMATIC
+    \\# roll-forward (the audit relies on that meaning), so operator
+    \\# actions are recorded here, never there.
+    \\# The final field is THIS boot's fx.bootnonce= token from the kernel
+    \\# command line ("none" = the host issued no nonce — an operator
+    \\# hand-boot); it binds the row to the boot it happened in exactly as
+    \\# .bootlog's 4th field binds a line — the same nonce discipline, not
+    \\# a new one.
+    \\# Written only by fx-init's control handler, one row per request,
+    \\# fsync'd before the reply is flushed.  Root in-guest can forge or
+    \\# truncate it exactly as it can .bootlog; a row is CHECKABLE against
+    \\# the store's version/genhash history, not authoritative over it.
+    \\
+;
+
+fn operator_path(out: [*]u8, cap: usize) void {
+    snfmtRaw(out, cap, "{s}/.operator", .{span(g_store)});
+}
+
+/// One journal line. Pure (unit-tested): epoch first so the file sorts by
+/// time, then the operator's own action/operand, the outcome token, the
+/// generation pair ("-" = unknown / no move — an honest absence), and
+/// the boot nonce.
+fn operator_line(out: []u8, epoch: u32, action: []const u8, arg: []const u8, outcome: []const u8, v_from: u32, v_to: ?u32) []const u8 {
+    var tobuf: [16]u8 = undefined;
+    const to: []const u8 = if (v_to) |t| snfmt(&tobuf, "{d}", .{t}) else "-";
+    return snfmt(out, "{d} {s} {s} {s} {d} {s} {s}\n", .{ epoch, action, arg, outcome, v_from, to, boot_nonce_str() });
+}
+
+/// Ensure the journal (with its definition header) exists on every store —
+/// the .recovery discipline: a machine where no operator ever intervened
+/// reads "file present, zero data lines", which is a measurement, not an
+/// absence.  Runs once per boot beside recovery_ensure.
+fn operator_ensure() void {
+    var p: [1100]u8 = undefined;
+    operator_path(&p, p.len);
+    if (std.c.access(@ptrCast(&p), F_OK) == 0) return;
+    _ = mkdirp(g_store);
+    const f = fopen(@ptrCast(&p), "w") orelse return;
+    _ = fprintf(f, "%s", @as([*:0]const u8, OPERATOR_HEADER));
+    _ = fflush(f);
+    _ = fsync(fileno(f));
+    _ = fclose(f);
+    syncfs_store();
+}
+
+/// Append one intervention. Called from the ctrl arms BEFORE the reply is
+/// flushed — the row is durable before the operator sees the answer, so a
+/// machine killed right after the response still carries the row (the
+/// durability this file exists for; /run/fx/log.db dies with the boot).
+/// A failing append (store unmounted, ENOSPC) is silent like every other
+/// record site: the intervention still proceeds — the journal must never
+/// refuse an action, only record it.
+fn operator_append(action: [*:0]const u8, arg: [*:0]const u8, outcome: [*:0]const u8, v_from: u32, v_to: ?u32) void {
+    var p: [1100]u8 = undefined;
+    operator_path(&p, p.len);
+    _ = mkdirp(g_store);
+    const f = fopen(@ptrCast(&p), "a") orelse return;
+    // the arg is a request token (<= REQ_MAX); +256 covers the fixed
+    // fields, and snfmt TRUNCATES on a pathologically long arg rather
+    // than overflowing.
+    var line: [REQ_MAX + 256]u8 = undefined;
+    const l = operator_line(&line, now_s(), span(action), span(arg), span(outcome), v_from, v_to);
+    _ = fwrite(l.ptr, 1, l.len, f);
+    _ = fflush(f);
+    _ = fsync(fileno(f));
+    _ = fclose(f);
+    syncfs_store();
+}
+
 /// Enumerate ALL published snapshot versions into a malloc'd ASCENDING
 /// array (caller frees; null on any anomaly — callers fail open, exactly
 /// as they did on an unenumerable store).  dl_snapshot_versions fills the
@@ -1668,10 +1797,11 @@ fn read_store_facts(version: u32) c_int {
 // ─── boot decision + dhake materialization (fx-init.c:628-745) ────────────
 
 fn decide_boot_version() u32 {
-    // the journal must exist from the machine's FIRST boot (header only,
-    // zero data lines = "never auto-recovered" is a measurement) — before
-    // any branch below can return early.
+    // the journals must exist from the machine's FIRST boot (header only,
+    // zero data lines = "never auto-recovered"/"no operator intervention"
+    // is a measurement) — before any branch below can return early.
     recovery_ensure();
+    operator_ensure();
     var err: [1024]u8 = undefined;
     const s = fx_store_open_wrap(g_store, &err, err.len) orelse {
         errf("fx-init: store open: {s}\n", .{span(@ptrCast(&err))});
@@ -3331,6 +3461,10 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
         rt_txn_begin();
         rt_control(txn, "shutdown", "");
         _ = rt_txn_commit();
+        // The journal row is durable BEFORE the machine begins stopping:
+        // a shutdown is the one intervention whose "did it take effect"
+        // can never be re-asked over the channel afterwards.
+        operator_append("shutdown", "-", "ok", g_current_version, null);
         g_shutdown.store(1, .monotonic);
         if (g_sigpipe[1] >= 0) {
             var b: [1]u8 = .{'T'};
@@ -3345,6 +3479,11 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             resp_err(o, "activate <path> | rollback <v>");
             return;
         };
+        // The generation the operator is intervening ON — every journal
+        // row below carries it as from-version, so the row attributes the
+        // action to the generation it was issued against, not just the
+        // one it produced.
+        const v_from = g_current_version;
         const txn = g_txn_id;
         g_txn_id += 1;
         rt_txn_begin();
@@ -3413,6 +3552,13 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 rc = if (std.os.linux.W.IFEXITED(st_u32)) @as(c_int, std.os.linux.W.EXITSTATUS(st_u32)) else 1;
             }
             if (rc != 0) {
+                // A failed activation is an intervention that did not
+                // take effect — record it with the executor's rc (to "-"
+                // for to-version: whether a failing child moved the store
+                // is NOT known from here).
+                var oc: [24]u8 = undefined;
+                _ = snfmt(&oc, "failed:{d}", .{rc});
+                operator_append("activate", arg, @ptrCast(&oc), v_from, null);
                 rt_txn_begin();
                 rt_effect(txn, "activate", "failed");
                 _ = rt_txn_commit();
@@ -3450,6 +3596,9 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             }
             var e2: [1024]u8 = undefined;
             const s = fx_store_open_wrap(g_store, &e2, e2.len) orelse {
+                // The child committed (rc == 0) but the result cannot be
+                // confirmed — "unverified", never a silent omission.
+                operator_append("activate", arg, "unverified", v_from, null);
                 resp_err(o, "store open after activate");
                 return;
             };
@@ -3457,6 +3606,10 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             store_close_durable(s);
             _ = read_store_facts(g_current_version);
             if (g_svc_overflow != 0) {
+                // The activation landed in the store but was REFUSED —
+                // this row is the durable record the activation-refusal
+                // class was missing (the runtime datalog dies with /run).
+                operator_append("activate", arg, "refused-config", v_from, g_current_version);
                 // The activated CONFIGURATION exceeds the service bound:
                 // read_store_facts refused it (loud line above — name,
                 // count, limit) and freed the table.  The store CURRENT
@@ -3513,6 +3666,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 // But answering OK would be a lie about the RUNNING system,
                 // so surface the reapply failure in the response (run_dhake
                 // already logged the per-action detail as svc=dhake).
+                operator_append("activate", arg, "dhake-failed", v_from, g_current_version);
                 rt_txn_begin();
                 rt_effect(txn, "activate", "dhake-failed");
                 _ = rt_txn_commit();
@@ -3525,6 +3679,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                 return;
             }
             _ = fprintf(o, "activated version %u\n", g_current_version);
+            operator_append("activate", arg, "ok", v_from, g_current_version);
             rt_txn_begin();
             rt_effect(txn, "version", "");
             _ = rt_txn_commit();
@@ -3544,11 +3699,16 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             const v: u32 = @truncate(strtoul(arg, null, 10));
             var e2: [1024]u8 = undefined;
             const s = fx_store_open_wrap(g_store, &e2, e2.len) orelse {
+                operator_append("rollback", arg, "unverified", v_from, null);
                 resp_err(o, "store open");
                 return;
             };
             if (fx_store_rollback_wrap(s, v, false, &e2, e2.len) != 0) {
                 store_close_durable(s);
+                // A REFUSED rollback (target version absent, renumber
+                // guard, ...) is an intervention that did not take
+                // effect — recorded, never just an ERR on the channel.
+                operator_append("rollback", arg, "refused", v_from, null);
                 resp_err(o, @ptrCast(&e2));
                 return;
             }
@@ -3564,6 +3724,10 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             syncfs_store();
             _ = read_store_facts(g_current_version);
             if (g_svc_overflow != 0) {
+                // The rollback landed in the store but the rolled-back-to
+                // CONFIGURATION was refused — same durable record as the
+                // activate arm's refusal, from the rollback direction.
+                operator_append("rollback", arg, "refused-config", v_from, g_current_version);
                 // The rolled-back-to CONFIGURATION exceeds the service
                 // bound: read_store_facts refused it (loud line above) and
                 // freed the table.  The rollback itself DID land in the
@@ -3585,6 +3749,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             rt_set_generation_current(g_current_version);
             _ = rt_txn_commit();
             _ = fprintf(o, "rolled back to version %u (current %u)\n", v, g_current_version);
+            operator_append("rollback", arg, "ok", v_from, g_current_version);
             resp_ok(o);
             return;
         }
@@ -5204,4 +5369,38 @@ test "recovery_line: one data line, epoch-first, '-' for an unresolvable genhash
     g_boot_nonce = g_boot_nonce_buf[0..8];
     const l3 = recovery_line(&buf, 6, 13, 12, "-");
     try std.testing.expectEqualStrings("6 13 12 - deadbeef\n", l3);
+}
+
+test "operator_line: the intervention grammar — epoch-first, verbatim arg, '-' for no move" {
+    var buf: [REQ_MAX + 256]u8 = undefined;
+    // no nonce issued (an operator hand-boot): the placeholder rides the row
+    const l = operator_line(&buf, 1700000000, "rollback", "7", "ok", 9, 7);
+    try std.testing.expectEqualStrings("1700000000 rollback 7 ok 9 7 none\n", l);
+    // a FAILED activation still records the intervention, with the
+    // executor's rc in the outcome token and "-" for the unknown result
+    const l2 = operator_line(&buf, 5, "activate", "/etc/bad.dhall", "failed:2", 9, null);
+    try std.testing.expectEqualStrings("5 activate /etc/bad.dhall failed:2 9 - none\n", l2);
+    // a shutdown moves no generation: from is the running version, to "-"
+    const l3 = operator_line(&buf, 6, "shutdown", "-", "ok", 13, null);
+    try std.testing.expectEqualStrings("6 shutdown - ok 13 - none\n", l3);
+    // an issued nonce binds the row to the boot it happened in — the same
+    // latched token .bootlog/.recovery carry, not a new discipline
+    const saved = g_boot_nonce;
+    const saved_buf = g_boot_nonce_buf;
+    defer {
+        g_boot_nonce = saved;
+        g_boot_nonce_buf = saved_buf;
+    }
+    g_boot_nonce_buf = [_]u8{0} ** 65;
+    @memcpy(g_boot_nonce_buf[0..8], "deadbeef");
+    g_boot_nonce_buf[8] = 0;
+    g_boot_nonce = g_boot_nonce_buf[0..8];
+    const l4 = operator_line(&buf, 7, "rollback", "9999", "refused", 13, null);
+    try std.testing.expectEqualStrings("7 rollback 9999 refused 13 - deadbeef\n", l4);
+    // the header's grammar line documents the data format, and the header
+    // itself must NAME the paths it cannot see (a record that silently
+    // omits a class is worse than none)
+    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "<epoch-s>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "fxstore rollback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "NOT recorded") != null);
 }
