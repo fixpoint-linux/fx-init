@@ -21,10 +21,17 @@
  * Machine-varying inputs are EXCLUDED from the goldens (the live C-vs-Zig
  * era asserted them in-process, where both sides saw the same values):
  *   - the env relation (a dump of this process's environ)
- *   - the kernel relation's version/release columns (real uname(2))
- *   - the fs relation's fstype column (whatever /tmp is mounted as)
- * Fixture-derived content (log DBs, process/file/device/net tuples,
- * kernel load/uptime/meminfo/hostname) is fully pinned.
+ *   - the kernel relation's sysname/release columns (real uname(2)) AND its
+ *     nodename column (also real uname(2) — the HOSTNAME, which is why this
+ *     was host-dependent: see the rt_rels comment)
+ *   - the fs relation's fstype column (whatever /tmp is mounted as) and its
+ *     capacity columns (the real backing fs's block counts)
+ *   - the file relation's uid/gid columns (a real stat(2) on the fixture
+ *     file) and its mtime column
+ * Fixture-derived content (log DBs, process/device/net tuples, the fs path
+ * column, the file path/size/mode columns, kernel load/uptime/meminfo) is
+ * pinned.  Fixture file modes are set EXPLICITLY by wf() so the file mode
+ * column does not depend on the running umask.
  *
  * Usage: log_probe_live --pin|--check <golden-dir>   (check is the default
  * fxctl_diff.sh/log_probe_diff.sh mode; --pin re-captures goldens from the
@@ -141,19 +148,30 @@ static char *dump_rel(struct dl_db *db, const char *rel, uint8_t arity,
 #define LOG_RELS \
     { "log", 4, 0xEu, 0xFu }, { "__postings__", 2, 0x0u, 0x3u }
 static const struct { const char *rel; uint8_t arity; uint32_t symmask, colmask; } log_rels[] = { LOG_RELS };
-/* probe relations, with the machine-varying columns masked OUT:
- *   fs     col1 = fstype (whatever /tmp is mounted as); cols 2-4 = capacity
- *          numbers of the REAL backing filesystems (block counts move as the
- *          host fs fills) — only the path column is pinnable
- *   kernel col0/col1 = version/release (real uname(2))
- *   env    machine environ — masked out entirely
+/* probe relations, with the machine-varying columns masked OUT.
+ * Column meanings, from the arity + the Zig port's tuple layout
+ * (src/probe.zig):
+ *   fs     cols 0-4 = path, fstype, total, used, avail.  col1 fstype is
+ *          whatever /tmp's backing fs is, and cols 2-4 are capacity numbers
+ *          of the REAL backing filesystems (block counts move as the host fs
+ *          fills) — only the path column is pinnable.
+ *   file   cols 0-5 = path, size, mode, uid, gid, mtime.  cols 3/4 (uid/gid)
+ *          are a real stat(2) on the fixture file, i.e. the CREATING USER's;
+ *          col5 is a live mtime epoch.  Path/size/mode come from the fixture
+ *          (wf() sets the mode explicitly, so it does not depend on umask).
+ *   kernel cols 0-6 = sysname, release, nodename, uptime_s, load1_x100,
+ *          memtotal_kb, memfree_kb.  cols 0/1 (sysname/release) AND col2
+ *          (nodename = THE HOSTNAME) are real uname(2) values — the module
+ *          documents that on purpose (src/probe.zig:406-410) — so only the
+ *          numerics, which come from the fixture's /proc files, are pinned.
+ *   env    machine environ — masked out entirely.
  */
 static const struct { const char *rel; uint8_t arity; uint32_t symmask, colmask; } rt_rels[] = {
     { "process", 6, 0x18u, 0x3Fu },  /* comm, state — all columns */
     { "fs", 5, 0x03u, 0x01u },       /* path only (fstype + capacity dropped) */
-    { "file", 6, 0x01u, 0x1Fu },     /* path..gid (col5 = live mtime epoch dropped) */
+    { "file", 6, 0x01u, 0x07u },     /* path, size, mode (uid/gid = real stat; mtime = live epoch) */
     { "device", 5, 0x09u, 0x1Fu },   /* name, type — all columns */
-    { "kernel", 7, 0x07u, 0x7Cu },   /* hostname + numerics (uname cols dropped) */
+    { "kernel", 7, 0x07u, 0x78u },   /* uptime/load/meminfo numerics (uname sysname+release+nodename dropped) */
     { "net", 6, 0x0Fu, 0x3Fu },      /* iface, addr, mac, state — all columns */
     { "env", 2, 0x03u, 0x0u },       /* machine environ — nothing pinned */
 };
@@ -271,6 +289,11 @@ static void mkp(const char *path) {
     mkdir(buf, 0755);
 }
 
+/* Create parent dirs + write fixture file content.  The file mode is set
+ * EXPLICITLY (not left to fopen's 0666 & ~umask): the probe stats /etc/hostname
+ * and the file relation's mode column is pinned in the golden, so a mode that
+ * depended on the running umask would make the golden host-dependent again.
+ * 0640 is what the original capture host produced. */
 static void wf(const char *path, const char *content) {
     char dir[1024];
     snprintf(dir, sizeof dir, "%s", path);
@@ -280,6 +303,7 @@ static void wf(const char *path, const char *content) {
     if (!f) { fprintf(stderr, "cannot write %s\n", path); return; }
     fputs(content, f);
     fclose(f);
+    chmod(path, 0640);
 }
 
 /* find a process tuple by pid (probe_test.c helper) */
