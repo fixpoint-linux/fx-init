@@ -614,8 +614,10 @@ pub const EtcItem = struct {
 /// symlink to the package DIR is un-exec-able, which is how the first
 /// in-guest `activate` failed: /bin/fx-activate -> dir => EACCES => 127).
 /// `pkg` is the closure package the link points into — the install fact
-/// derives the STORE-RELATIVE origin `<hash>-<pkg>` from it (emitBuildfile
-/// itself ignores it).
+/// derives the STORE-RELATIVE origin `<hash>-<pkg>/<basename(from)>` from
+/// it (emitBuildfile itself ignores it): the exact installed content, so a
+/// verify can compare it against the link target verbatim.  Its first path
+/// segment is the package's store dir.
 pub const BinLink = struct {
     name: []const u8,
     from: []const u8, // symlink target: the BINARY path, not the store dir
@@ -1626,9 +1628,14 @@ pub fn main(init: std.process.Init) !void {
     // mutation the buildfile performs: every /etc copy and every /bin
     // symlink.  `origin` is STORE-RELATIVE (resolved against the store root
     // at query time — the same relocation principle as the generation
-    // fact's buildfile/dhake columns).  `mode` is a raw u32 so reconcile
-    // can compare it against lstat's st_mode & 0o7777: 0o644 for the etc
-    // copies (emitBuildfile's Chmod), 0 for symlinks.
+    // fact's buildfile/dhake columns) and names the EXACT installed
+    // content: the /etc rows name `<gen>-system-generation/etc/<path>`,
+    // the /bin rows name `<hash>-<pkg>/<binary>` (the same path the
+    // Symlink action points at).  Its FIRST PATH SEGMENT is the store dir
+    // (`<hash>-<pkg>` / `<gen>-system-generation`); readers that want the
+    // dir resolve that segment (prov_what's rule).  `mode` is a raw u32 so
+    // reconcile can compare it against lstat's st_mode & 0o7777: 0o644 for
+    // the etc copies (emitBuildfile's Chmod), 0 for symlinks.
     for (etc) |it| {
         var tgt_buf: [PATH_MAX]u8 = undefined;
         var org_buf: [PATH_MAX]u8 = undefined;
@@ -1642,13 +1649,16 @@ pub fn main(init: std.process.Init) !void {
     }
     for (bin) |it| {
         // store-relative pkg dir `<hash>-<pkg>` (entryOf non-null: the bin
-        // construction above already required each pkg in the closure)
+        // construction above already required each pkg in the closure) —
+        // the origin is that dir + the binary's basename = the exact path
+        // the Symlink action points at, so `verify` can compare it against
+        // the link target verbatim.
         const be = entryOf(entries, it.pkg).?;
         var tgt_buf: [PATH_MAX]u8 = undefined;
         var org_buf: [PATH_MAX]u8 = undefined;
         const cols = [4]u32{
             fx.dl_intern_str(db, snfmtz(&tgt_buf, "/bin/{s}", .{it.name})),
-            fx.dl_intern_str(db, snfmtz(&org_buf, "{s}-{s}", .{ be.hash, it.pkg })),
+            fx.dl_intern_str(db, snfmtz(&org_buf, "{s}-{s}/{s}", .{ be.hash, it.pkg, baseName(it.from) })),
             0,
             fx.dl_intern_str(db, genhash[0..64 :0]),
         };

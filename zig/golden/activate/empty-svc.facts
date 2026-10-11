@@ -2,10 +2,10 @@ boot_grace 30000
 current 3
 generation H H-system-generation/Dhakefile.dhall H-dhake/dhake.com E
 generation_config H H H-system-generation/config.dhall
-install /bin/dhake H-dhake 0 H
-install /bin/fx-activate H-fx-activate 0 H
-install /bin/fxctl H-fxctl 0 H
-install /bin/init H-fx-init 0 H
+install /bin/dhake H-dhake/dhake.com 0 H
+install /bin/fx-activate H-fx-activate/fx-activate 0 H
+install /bin/fxctl H-fxctl/fxctl 0 H
+install /bin/init H-fx-init/fx-init 0 H
 install /etc/group H-system-generation/etc/group 420 H
 install /etc/hostname H-system-generation/etc/hostname 420 H
 install /etc/passwd H-system-generation/etc/passwd 420 H

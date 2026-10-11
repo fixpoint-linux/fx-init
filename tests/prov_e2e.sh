@@ -5,7 +5,9 @@
 # Proves the whole Lens-2 provenance stack end-to-end over a REAL bwrap boot:
 #   1. build the m3 fixture closure into a temp store (fxstore build)
 #   2. BEFORE any boot: fxstore what/why answer from the store db —
-#        what /bin/fakesvc    -> origin <hash>-fake-service, package
+#        what /bin/fakesvc    -> origin <hash>-fake-service/fakesvc (the exact
+#                                installed content; its first path segment is
+#                                the package store dir), package
 #                                fake-service, generation <gen_good>
 #        what /etc/hostname   -> generation-relative origin, package unknown
 #        what /etc/nonexistent-> rc 1 'unmanaged'
