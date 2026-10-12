@@ -3604,24 +3604,65 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             };
             _ = fx_store_current_version_wrap(s, &g_current_version, &e2, e2.len);
             store_close_durable(s);
-            _ = read_store_facts(g_current_version);
-            if (g_svc_overflow != 0) {
+            // THE ACTIVATED WINDOW IS OPEN ON DISK BEFORE ITS FACTS ARE
+            // READ.  Appended AFTER the CURRENT rewrite (the activate child
+            // committed above) and BEFORE read_store_facts, this line is
+            // why every activate-path verdict — the refusal below
+            // included — rides its OWN '(v, in-progress)' for the version
+            // being activated, FIRST and under this boot's nonce.  Without
+            // it a refused activation (or a crash between the publish and
+            // the verdict) left the window open with NO on-disk marker for
+            // the activated version, and the next boot had to infer the
+            // in-flight generation from CURRENT alone.  Same word the boot
+            // path appends, so decide_boot_version's roll-forward trigger
+            // (in-progress|failed == CURRENT, init.zig:1821) already reads
+            // it as stale.
+            bootlog_append(g_current_version, "in-progress", now_s());
+            const frc = read_store_facts(g_current_version);
+            if (g_svc_overflow != 0 or frc != 0) {
                 // The activation landed in the store but was REFUSED —
                 // this row is the durable record the activation-refusal
                 // class was missing (the runtime datalog dies with /run).
                 operator_append("activate", arg, "refused-config", v_from, g_current_version);
-                // The activated CONFIGURATION exceeds the service bound:
-                // read_store_facts refused it (loud line above — name,
-                // count, limit) and freed the table.  The store CURRENT
-                // already moved (the activate child committed), so say
-                // BOTH facts in the response; do NOT re-arm the boot
-                // decision and do NOT materialize — an EMPTY service
-                // table would judge the new generation with a vacuous
-                // boot-ok.  The operator rolls back or activates a
-                // smaller config.
                 var m: [256]u8 = undefined;
-                _ = snfmtRaw(&m, m.len, "activated version {d} but REFUSED: service '{s}' is #{d}, window {d}, {d} rows past it", .{ g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                if (g_svc_overflow != 0) {
+                    // The activated CONFIGURATION exceeds the service
+                    // bound: read_store_facts refused it (loud line above
+                    // — name, count, limit) and freed the table.
+                    _ = snfmtRaw(&m, m.len, "activated version {d} but REFUSED: service '{s}' is #{d}, window {d}, {d} rows past it", .{ g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                } else {
+                    // Any OTHER non-zero rc (restore/read failure): the
+                    // over-name fields are UNSET here, so a separate
+                    // message — reusing the overflow one would print
+                    // garbage.  Same refusal, same handling.
+                    _ = snfmtRaw(&m, m.len, "activated version {d} but REFUSED: its configuration could not be read (read_store_facts rc {d})", .{ g_current_version, frc });
+                }
                 log_line("fx-init", "error", @ptrCast(&m));
+                // THE HONEST VERDICT AND THE PIN.  The store CURRENT
+                // already moved (the activate child committed), so this
+                // generation IS current and its window is open on disk
+                // (the in-progress line above): close it with (v, failed)
+                // and pin the latch, so that (a) the disk never records a
+                // verdict for a configuration PID1 rejected, and (b)
+                // evaluate_boot_ok can never judge the table
+                // read_store_facts left (EMPTY on a read/refusal failure,
+                // the OLD generation's — intact and still supervising, so
+                // not judged at all — on a store-open failure) — a
+                // VACUOUS boot-ok
+                // for the refused generation at grace expiry.  Without
+                // the pin the main loop kept running this decision every
+                // pass and the latch stayed 0.  (g_boot_failed is
+                // write-only in this tree; the pin documents the intent.)
+                // No materialization and no re-arm: nothing from a
+                // refused configuration runs.  The operator rolls back or
+                // activates a smaller config; the next boot's
+                // roll-forward trigger is what closes the loop.
+                rt_txn_begin();
+                rt_set_boot(g_current_version, "failed");
+                _ = rt_txn_commit();
+                bootlog_append(g_current_version, "failed", now_s());
+                g_boot_decided = 1;
+                g_boot_failed = 1;
                 resp_err(o, @ptrCast(&m));
                 return;
             }
@@ -3643,8 +3684,10 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             // evaluate_boot_ok, which runs in the SAME main-loop pass that
             // forked the new services, would emit a WRONG boot-ok before the
             // crasher ever exited), so the activated generation gets its own
-            // verdict — including its own (v, failed) DISK .bootlog entry for
-            // the next boot's roll-forward to read.  read_store_facts just
+            // verdict — including its own (v, in-progress) + (v, failed) DISK
+            // .bootlog entries for the next boot's roll-forward to read (the
+            // in-progress is appended at the activation itself, above, before
+            // the facts are read).  read_store_facts just
             // rebuilt the service table with every service ST_PENDING (svc_name_cb),
             // so the restarted window genuinely re-judges the new generation.
             g_boot_decided = 0;
@@ -3722,20 +3765,41 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             // asked for.  The ctrl harness kills QEMU seconds after this
             // response — flush everything before answering.
             syncfs_store();
-            _ = read_store_facts(g_current_version);
-            if (g_svc_overflow != 0) {
+            const rrc = read_store_facts(g_current_version);
+            if (g_svc_overflow != 0 or rrc != 0) {
                 // The rollback landed in the store but the rolled-back-to
                 // CONFIGURATION was refused — same durable record as the
                 // activate arm's refusal, from the rollback direction.
                 operator_append("rollback", arg, "refused-config", v_from, g_current_version);
-                // The rolled-back-to CONFIGURATION exceeds the service
-                // bound: read_store_facts refused it (loud line above) and
-                // freed the table.  The rollback itself DID land in the
-                // store — say both facts; the running system manages NO
-                // services from the refused set.
                 var m: [256]u8 = undefined;
-                _ = snfmtRaw(&m, m.len, "rolled back to version {d} (current {d}) but service table REFUSED: '{s}' is #{d}, window {d}, {d} rows past it", .{ v, g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                if (g_svc_overflow != 0) {
+                    // The rolled-back-to CONFIGURATION exceeds the service
+                    // bound: read_store_facts refused it (loud line above)
+                    // and freed the table.  The rollback itself DID land in
+                    // the store — say both facts; the running system
+                    // manages NO services from the refused set.
+                    _ = snfmtRaw(&m, m.len, "rolled back to version {d} (current {d}) but service table REFUSED: '{s}' is #{d}, window {d}, {d} rows past it", .{ v, g_current_version, span(@ptrCast(&g_svc_over_name)), SVC_MAX_I + 1, SVC_MAX_I, g_svc_over_rows });
+                } else {
+                    // Any OTHER non-zero rc: store-open failure, missing
+                    // generation, or unreadable buildfile/dhake.  The
+                    // over-name fields are UNSET on these paths, so a
+                    // SEPARATE message — reusing the overflow one would
+                    // print garbage.  Same refusal, same handling.
+                    _ = snfmtRaw(&m, m.len, "rolled back to version {d} (current {d}) but REFUSED: its configuration could not be read (read_store_facts rc {d})", .{ v, g_current_version, rrc });
+                }
                 log_line("fx-init", "error", @ptrCast(&m));
+                // THE SAME PIN as the activate arm's refusal, for the same
+                // reason: the table is EMPTY now (on the store-open-failure
+                // rc it is the OLD generation's, left intact by the early
+                // return), and an open decision would judge it vacuously ok
+                // at grace expiry — a boot-ok for the generation the
+                // operator just rolled back to and this handler REFUSED.
+                // NO disk line: a rollback opens no window of its own
+                // (there is no (v, in-progress) for it), and inventing a
+                // verdict shape for it is out of scope — the pin alone is
+                // what makes the latch honest.
+                g_boot_decided = 1;
+                g_boot_failed = 1;
                 resp_err(o, @ptrCast(&m));
                 return;
             }
