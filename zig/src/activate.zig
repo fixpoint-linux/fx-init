@@ -31,6 +31,7 @@ const std = @import("std");
 const cfg_mod = @import("config");
 const fx = @import("fxstore");
 const fxstat = @import("fxstat"); // target-correct time ABI (see fxstat.zig)
+const opj = @import("operator_journal"); // the ONE <store>/.operator definition (header + grammar)
 
 const FxConfig = cfg_mod.FxConfig;
 const FxService = cfg_mod.FxService;
@@ -866,6 +867,50 @@ fn readAllBytes(path: []const u8) ?[]u8 {
     return list.items;
 }
 
+// ─── the RUNTIME RECORD (fx-activate's own <store>/.operator row) ─────────
+
+/// A boot process that executed fx-activate OUTSIDE PID1's control handler —
+/// the harness's channel-less direct-exec fallback, or a command in the M4
+/// debug shell — used to leave NO durable operator record: the generation
+/// moved and <store>/.operator (whose header named PID1's handler as its
+/// only writer) said nothing.  So the activator records its OWN publish,
+/// in exactly the handler's grammar: operator_journal.zig is the ONE
+/// definition of the header, the line shape and the boot-nonce parse, and
+/// both writers import it.
+///
+/// TWO conditions, both structural:
+///   * a channel activation must still leave EXACTLY ONE row.  The handler
+///     appends one for the REQUEST (whatever the outcome), so its child —
+///     this process — is told not to; PID1 sets FX_OPERATOR_RECORDED in the
+///     forked child before the exec, and the harness fallback's child env is
+///     an explicit WHITELIST (fx-verbs-server.c build_verb_envp) that cannot
+///     carry the key.  So: marker present ⇒ the handler owns the row.
+///   * a row must be ATTRIBUTABLE to the boot it happened in.  The journal's
+///     last field is this boot's fx.bootnonce=, and a self-recorded row must
+///     never carry the "none" placeholder — so the predicate requires a
+///     token, which is also what excludes EVERY offline caller: a host
+///     fixture, a golden diff and a CI run have no fx.bootnonce= on the
+///     HOST's own command line (the same kernel view in a namespace), and
+///     record nothing.
+///
+/// Silent by construction: the caller's stdout/stderr are byte-compared
+/// against pinned goldens, and a record site never refuses an action.
+fn selfRecord(store_root: []const u8, config_path: []const u8, outcome: []const u8, v_from: u32, v_to: ?u32) void {
+    if (std.c.getenv("FX_OPERATOR_RECORDED") != null) return;
+    const cmdline = readAllBytes("/proc/cmdline") orelse return;
+    const nonce = opj.parseKernelNonce(cmdline) orelse return;
+    var p_buf: [PATH_MAX:0]u8 = undefined;
+    const p = snfmtz(&p_buf, "{s}/.operator", .{store_root});
+    // the config operand VERBATIM.  Whitespace-free by construction on the two
+    // CHANNEL routes (the verbs server refuses such a path before the fallback;
+    // the channel grammar tokenizes on whitespace) — but NOT by construction on
+    // the M4-SHELL route: a shell direct exec can pass a config path containing
+    // a space, and that row's arg field would split read_operator's sscanf (a
+    // LOUD refusal of a real intervention row, never silent corruption) —
+    // unreachable in-guest, where no such path exists.
+    opj.append(p.ptr, "activate", config_path, outcome, v_from, v_to, nonce);
+}
+
 // ─── fact writer (declare + txn_add_fact) ─────────────────────────────────
 
 fn declare(db: *DlDb, rel: [*:0]const u8, arity: u8, e: *ErrBuf) error{DeclareFailed}!void {
@@ -1238,6 +1283,24 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const db = fx.fx_store_db(s).?;
+
+    // The generation this activation moves FROM: read on the ALREADY-OPEN
+    // handle (a second fx_store_open would self-deadlock on the store's
+    // process-lifetime exclusive lock) and BEFORE the publish, so a
+    // self-recorded row's from/to pair attributes the publish to the
+    // generation it moved from — the same pair PID1's handler records.
+    // v_from stays 0 when that read FAILS: the FRESH-STORE FIRST activation
+    // (fx_store_current_version rejects a store that published nothing, by
+    // design), and only that — a handler row always has a real
+    // g_current_version.  So "<epoch> activate … ok 0 <to>" is the first
+    // publish on a fresh store, not a lost FROM (the header's grammar note
+    // names it: from=0 — and not "-", since line() takes v_from as u32 and the
+    // store's versions start at 1).
+    var v_from: u32 = 0;
+    {
+        var se_from = fx.store.ErrBuf{};
+        fx.fx_store_current_version(g_io, s, &v_from, &se_from) catch {};
+    }
 
     // closure roots = config.packages
     const entries = computePaths(&ps, db, cfg.packages, store_root_s, &cerr, &e) catch |err| switch (err) {
@@ -1696,6 +1759,10 @@ pub fn main(init: std.process.Init) !void {
     };
     var v: u32 = 0;
     fx.fx_store_current_version(g_io, s, &v, &se2) catch {
+        // The publish COMMITTED but its result cannot be confirmed here:
+        // record the same AMBIGUITY PID1's handler records ("unverified"),
+        // with "-" for a to-version this process could not read.
+        selfRecord(store_root_s, config_path_s, "unverified", v_from, null);
         std.debug.print("fx-activate: {s}\n", .{se2.slice()});
         std.process.exit(1);
     };
@@ -1705,6 +1772,11 @@ pub fn main(init: std.process.Init) !void {
     // golden-compared and a 0/N line would be noise on every host run).
     if (src_free_resolved > 0)
         std.debug.print("fx-activate: src-free {d}/{d} packages resolved from published srcstore\n", .{ src_free_resolved, entries.len });
+
+    // THE RUNTIME RECORD, before the caller sees the answer (PID1's own
+    // discipline: the row is durable before the reply is flushed).  Prints
+    // NOTHING — stdout/stderr are byte-compared against the pinned goldens.
+    selfRecord(store_root_s, config_path_s, "ok", v_from, v);
 
     out.print("activated {s} as version {d}; buildfile {s}\n", .{ genhash_s, v, buildfile_abs }) catch {};
     out.flush() catch {};

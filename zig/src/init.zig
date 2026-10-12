@@ -23,6 +23,7 @@ const reloc_mod = @import("reloc");
 const sup = @import("supervise");
 const fx = @import("fxstore");
 const fxstat = @import("fxstat"); // target-correct stat/statfs/time ABI (see fxstat.zig)
+const opj = @import("operator_journal"); // the ONE <store>/.operator definition (header + grammar)
 
 const gpa_alloc = std.heap.c_allocator;
 
@@ -33,7 +34,7 @@ const DEFAULT_RUN = "/run/fx";
 const DEFAULT_PROBE_S: c_int = 10;
 const DEFAULT_LOG_CAP: u64 = 100000;
 const DEFAULT_GRACE_MS: u32 = 30000;
-const REQ_MAX: usize = 4096;
+const REQ_MAX: usize = opj.REQ_MAX;
 const PATH_MAX: usize = 4096;
 
 // Linux errno / fcntl / stdio constants used by the C.
@@ -716,29 +717,10 @@ fn bootlog_path(out: [*]u8, cap: usize) void {
     snfmtRaw(out, cap, "{s}/.bootlog", .{span(g_store)});
 }
 
-/// Find the `fx.bootnonce=<hex>` token in a kernel command line (the FIRST
-/// token-start occurrence wins, exactly like parse_kernel_store).  The value
-/// ends at the next space or control byte and must be 1..64 bytes; the
-/// literal "none" is RESERVED as the writer's no-nonce placeholder, so a
-/// host passing it is refused (treated as absent) rather than allowed to
-/// mint indistinguishable placeholder lines.
-fn parse_kernel_nonce(text: []const u8) ?[]const u8 {
-    const key = "fx.bootnonce=";
-    var rest = text;
-    while (std.mem.indexOf(u8, rest, key)) |hit| {
-        if (hit != 0 and rest[hit - 1] != ' ') {
-            rest = rest[hit + key.len ..]; // substring of another token: skip it
-            continue;
-        }
-        const val = rest[hit + key.len ..];
-        var end: usize = 0;
-        while (end < val.len and val[end] > ' ') end += 1;
-        if (end == 0 or end > 64) return null;
-        if (std.mem.eql(u8, val[0..end], "none")) return null;
-        return val[0..end];
-    }
-    return null;
-}
+// The kernel-command-line nonce PARSE lives in operator_journal.zig — the
+// module that owns the nonce's meaning on a journal row and shares it with
+// fx-activate's self-record predicate (the FIRST token-start `fx.bootnonce=`
+// wins, 1..64 bytes, "none" reserved as the writer's placeholder).
 
 /// Apply the kernel command line's `fx.bootnonce=` beside fx.store= — same
 /// window (after mount_early, before the first record append: decide_boot_version
@@ -754,7 +736,7 @@ fn apply_kernel_nonce() void {
     defer _ = fclose(f);
     var buf: [4096]u8 = undefined;
     const n = fread(&buf, 1, buf.len, f);
-    const nonce = parse_kernel_nonce(std.mem.sliceTo(buf[0..n], 0)) orelse return;
+    const nonce = opj.parseKernelNonce(std.mem.sliceTo(buf[0..n], 0)) orelse return;
     @memcpy(g_boot_nonce_buf[0..nonce.len], nonce);
     g_boot_nonce_buf[nonce.len] = 0;
     g_boot_nonce = g_boot_nonce_buf[0..nonce.len];
@@ -958,77 +940,20 @@ fn recovery_append(published: u32, from_failed: u32, gh: []const u8) void {
 // an intervention, and "who acted" must not depend on inferring it from
 // a roll-forward that did not happen.
 
-/// The header IS the definition, in the file itself (the .recovery
-/// discipline): what is recorded, what is NOT, and — because a record
-/// that silently omits a class is worse than none — which intervention
-/// paths CANNOT reach this file at all.
-const OPERATOR_HEADER =
-    \\# fx-init operator journal. One DATA line per OPERATOR intervention
-    \\# on the generation plane, i.e. per control-channel `activate`,
-    \\# `rollback` or `shutdown` — INCLUDING the ones that FAILED or were
-    \\# REFUSED: an intervention that did not take effect is still an
-    \\# intervention.  The count of interventions is the number of lines
-    \\# starting with a digit.
-    \\# line: <epoch-s> <action> <arg> <outcome> <from-version|-> <to-version|-> <boot-nonce|none>
-    \\#   action:  activate | rollback | shutdown (the ctrl arm that wrote it)
-    \\#   arg:     the operator's operand VERBATIM (config path, requested
-    \\#            version, "-" for shutdown)
-    \\#   outcome: ok              took effect (the store moved as asked)
-    \\#            failed:<rc>     the activate executor exited rc
-    \\#                            (fork/exec failure = -1)
-    \\#            refused         the STORE refused (rollback to a version
-    \\#                            that does not exist); nothing landed,
-    \\#                            to-version is "-"
-    \\#            refused-config  the store CURRENT moved but PID1's service
-    \\#                            table REFUSED the configuration (the
-    \\#                            service bound was exceeded): the
-    \\#                            generation is in the store but nothing
-    \\#                            supervises it
-    \\#            dhake-failed    activation committed, live-root reapply
-    \\#                            failed
-    \\#            unverified      the executor ran but the store could not
-    \\#                            be re-opened to confirm the result
-    \\#   from/to: the store CURRENT before/after the intervention;
-    \\#            "-" = unknown, or no generation move (shutdown)
-    \\# NOT recorded (not generation-plane interventions): the READS
-    \\# (status, q, grep, search), file transfers (put, rm), the
-    \\# interactive shell, per-service runtime commands (start/stop/
-    \\# restart), probe — and a malformed request (missing operand) that
-    \\# no arm ever executed.
-    \\# NOT recorded AND NOT DETECTABLE from this file — paths that
-    \\# bypass PID1's control handler entirely: a host-side
-    \\# `fxstore rollback` (a different process, in a deployment possibly
-    \\# not even inside the guest), `fxstore rollback --hard`, and a
-    \\# hand-edited store CURRENT.  Their only trace is the store's own
-    \\# version history minus this file: treat an unexplained generation
-    \\# move as one of these.
-    \\# SEPARATE from .recovery ON PURPOSE: a .recovery row is an AUTOMATIC
-    \\# roll-forward (the audit relies on that meaning), so operator
-    \\# actions are recorded here, never there.
-    \\# The final field is THIS boot's fx.bootnonce= token from the kernel
-    \\# command line ("none" = the host issued no nonce — an operator
-    \\# hand-boot); it binds the row to the boot it happened in exactly as
-    \\# .bootlog's 4th field binds a line — the same nonce discipline, not
-    \\# a new one.
-    \\# Written only by fx-init's control handler, one row per request,
-    \\# fsync'd before the reply is flushed.  Root in-guest can forge or
-    \\# truncate it exactly as it can .bootlog; a row is CHECKABLE against
-    \\# the store's version/genhash history, not authoritative over it.
-    \\
-;
+// ─── <store>/.operator: ONE definition, in operator_journal.zig ───────────
+//
+// The header text (the contract written INTO the file), the data-line
+// grammar and the boot-nonce PARSE live in the operator_journal module,
+// imported by both writers: PID1's control handler (below) and fx-activate,
+// which self-records the publish it committed when a boot process executes
+// it OUTSIDE this handler.  Two copies of the grammar — or of the header,
+// which IS the definition — would drift; so would two parses of the same
+// `fx.bootnonce=`.  The nonce is a PARAMETER of the module's line builder:
+// this file passes the token it latched at boot, fx-activate passes the one
+// it parsed out of /proc/cmdline for itself.
 
 fn operator_path(out: [*]u8, cap: usize) void {
     snfmtRaw(out, cap, "{s}/.operator", .{span(g_store)});
-}
-
-/// One journal line. Pure (unit-tested): epoch first so the file sorts by
-/// time, then the operator's own action/operand, the outcome token, the
-/// generation pair ("-" = unknown / no move — an honest absence), and
-/// the boot nonce.
-fn operator_line(out: []u8, epoch: u32, action: []const u8, arg: []const u8, outcome: []const u8, v_from: u32, v_to: ?u32) []const u8 {
-    var tobuf: [16]u8 = undefined;
-    const to: []const u8 = if (v_to) |t| snfmt(&tobuf, "{d}", .{t}) else "-";
-    return snfmt(out, "{d} {s} {s} {s} {d} {s} {s}\n", .{ epoch, action, arg, outcome, v_from, to, boot_nonce_str() });
 }
 
 /// Ensure the journal (with its definition header) exists on every store —
@@ -1038,14 +963,7 @@ fn operator_line(out: []u8, epoch: u32, action: []const u8, arg: []const u8, out
 fn operator_ensure() void {
     var p: [1100]u8 = undefined;
     operator_path(&p, p.len);
-    if (std.c.access(@ptrCast(&p), F_OK) == 0) return;
-    _ = mkdirp(g_store);
-    const f = fopen(@ptrCast(&p), "w") orelse return;
-    _ = fprintf(f, "%s", @as([*:0]const u8, OPERATOR_HEADER));
-    _ = fflush(f);
-    _ = fsync(fileno(f));
-    _ = fclose(f);
-    syncfs_store();
+    opj.ensure(@ptrCast(&p));
 }
 
 /// Append one intervention. Called from the ctrl arms BEFORE the reply is
@@ -1054,22 +972,12 @@ fn operator_ensure() void {
 /// durability this file exists for; /run/fx/log.db dies with the boot).
 /// A failing append (store unmounted, ENOSPC) is silent like every other
 /// record site: the intervention still proceeds — the journal must never
-/// refuse an action, only record it.
+/// refuse an action, only record it.  This wrapper supplies only what is
+/// PID1's own: the store's journal path and THIS boot's latched nonce.
 fn operator_append(action: [*:0]const u8, arg: [*:0]const u8, outcome: [*:0]const u8, v_from: u32, v_to: ?u32) void {
     var p: [1100]u8 = undefined;
     operator_path(&p, p.len);
-    _ = mkdirp(g_store);
-    const f = fopen(@ptrCast(&p), "a") orelse return;
-    // the arg is a request token (<= REQ_MAX); +256 covers the fixed
-    // fields, and snfmt TRUNCATES on a pathologically long arg rather
-    // than overflowing.
-    var line: [REQ_MAX + 256]u8 = undefined;
-    const l = operator_line(&line, now_s(), span(action), span(arg), span(outcome), v_from, v_to);
-    _ = fwrite(l.ptr, 1, l.len, f);
-    _ = fflush(f);
-    _ = fsync(fileno(f));
-    _ = fclose(f);
-    syncfs_store();
+    opj.append(@ptrCast(&p), span(action), span(arg), span(outcome), v_from, v_to, span(boot_nonce_str()));
 }
 
 /// Enumerate ALL published snapshot versions into a malloc'd ASCENDING
@@ -3510,6 +3418,21 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
                     _ = std.c.dup2(epipe[1], 2);
                     _ = std.c.close(epipe[1]);
                 }
+                // THE MARKER: this child IS the handler's request, and the handler appends
+                // ITS row for it (below, whatever the outcome) — so the child must NOT
+                // self-record the publish it makes, or a channel activation leaves TWO rows
+                // where the invariant is ONE.  fx-activate suppresses its own row when this
+                // is set (operator_journal is the ONE definition of that contract).  Set
+                // HERE, in the child, after the stderr dup2 and before the exec: the parent's
+                // environment is untouched, and build_verb_envp's WHITELIST (fx-verbs-server.c)
+                // structurally cannot carry the key — a direct exec always self-records, a
+                // channel child never does.  The setenv below is CHECKED: a failure would
+                // leave the child WITHOUT the marker and BOTH would record — TWO rows for
+                // ONE activation, the exact failure the marker prevents.  LOUD, never silent.
+                if (setenv("FX_OPERATOR_RECORDED", "1", 1) != 0) {
+                    _ = std.c.write(2, "fx-init: setenv FX_OPERATOR_RECORDED failed\n", "fx-init: setenv FX_OPERATOR_RECORDED failed\n".len);
+                    std.c._exit(127);
+                }
                 const av = [_:null]?[*:0]const u8{ @ptrCast(&g_fxstore), "--store", g_store, "--package-set", "/usr/fx/package-set.dhall", "--config", arg };
                 _ = exec_sh_retry(@ptrCast(&g_fxstore), &av);
                 _ = std.c.write(2, "fx-init: exec fx-activate failed\n", "fx-init: exec fx-activate failed\n".len);
@@ -4927,32 +4850,6 @@ test "parse_kernel_store: the shapes a kernel command line actually has" {
     try std.testing.expect(parse_kernel_store("fx.store= fx.store=/second") == null);
 }
 
-test "parse_kernel_nonce: token-start, reserved placeholder, length bound" {
-    // token-start matches, value ends at space/control — the store battery's
-    // discipline, applied to the nonce
-    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.bootnonce=a1b2c3d4e5f60718").?);
-    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.bootnonce=a1b2c3d4e5f60718 console=ttyS0").?);
-    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("fx.store=/fx/store fx.bootnonce=a1b2c3d4e5f60718 panic=-1\n").?);
-    try std.testing.expectEqualStrings("a1b2c3d4e5f60718", parse_kernel_nonce("a=1  fx.bootnonce=a1b2c3d4e5f60718  b=2").?);
-    // a substring of another token is not a token (the fx.store lesson)
-    try std.testing.expect(parse_kernel_nonce("notfx.bootnonce=deadbeef") == null);
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=") == null);
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce= console=ttyS0") == null);
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=\n") == null);
-    // "none" is the WRITER's placeholder — a host may not mint lines that
-    // read as "no nonce was issued"
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=none") == null);
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=none fx.bootnonce=deadbeef01") == null); // first token wins, and it is reserved
-    // length bound: the 65-byte buffer backs the global; a longer token
-    // must not be truncated into a DIFFERENT nonce silently
-    const nonce65 = "d" ** 65;
-    const nonce64 = "d" ** 64;
-    try std.testing.expect(parse_kernel_nonce("fx.bootnonce=" ++ nonce65) == null);
-    try std.testing.expectEqualStrings(nonce64, parse_kernel_nonce("fx.bootnonce=" ++ nonce64).?); // the cap itself is legal
-    // no token: the normal case (hand-boot)
-    try std.testing.expect(parse_kernel_nonce("console=ttyS0,115200 rdinit=/fx/store/x/fx-init fx.store=/fx/store panic=-1 oops=panic\n") == null);
-}
-
 test "bootlog_append + recovery_line carry the boot nonce as a trailing field" {
     // the additive 4th/5th field: every existing reader parses with 2-4
     // leading conversions and ignores the tail (bootlog_last "%u %63s",
@@ -5433,38 +5330,4 @@ test "recovery_line: one data line, epoch-first, '-' for an unresolvable genhash
     g_boot_nonce = g_boot_nonce_buf[0..8];
     const l3 = recovery_line(&buf, 6, 13, 12, "-");
     try std.testing.expectEqualStrings("6 13 12 - deadbeef\n", l3);
-}
-
-test "operator_line: the intervention grammar — epoch-first, verbatim arg, '-' for no move" {
-    var buf: [REQ_MAX + 256]u8 = undefined;
-    // no nonce issued (an operator hand-boot): the placeholder rides the row
-    const l = operator_line(&buf, 1700000000, "rollback", "7", "ok", 9, 7);
-    try std.testing.expectEqualStrings("1700000000 rollback 7 ok 9 7 none\n", l);
-    // a FAILED activation still records the intervention, with the
-    // executor's rc in the outcome token and "-" for the unknown result
-    const l2 = operator_line(&buf, 5, "activate", "/etc/bad.dhall", "failed:2", 9, null);
-    try std.testing.expectEqualStrings("5 activate /etc/bad.dhall failed:2 9 - none\n", l2);
-    // a shutdown moves no generation: from is the running version, to "-"
-    const l3 = operator_line(&buf, 6, "shutdown", "-", "ok", 13, null);
-    try std.testing.expectEqualStrings("6 shutdown - ok 13 - none\n", l3);
-    // an issued nonce binds the row to the boot it happened in — the same
-    // latched token .bootlog/.recovery carry, not a new discipline
-    const saved = g_boot_nonce;
-    const saved_buf = g_boot_nonce_buf;
-    defer {
-        g_boot_nonce = saved;
-        g_boot_nonce_buf = saved_buf;
-    }
-    g_boot_nonce_buf = [_]u8{0} ** 65;
-    @memcpy(g_boot_nonce_buf[0..8], "deadbeef");
-    g_boot_nonce_buf[8] = 0;
-    g_boot_nonce = g_boot_nonce_buf[0..8];
-    const l4 = operator_line(&buf, 7, "rollback", "9999", "refused", 13, null);
-    try std.testing.expectEqualStrings("7 rollback 9999 refused 13 - deadbeef\n", l4);
-    // the header's grammar line documents the data format, and the header
-    // itself must NAME the paths it cannot see (a record that silently
-    // omits a class is worse than none)
-    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "<epoch-s>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "fxstore rollback") != null);
-    try std.testing.expect(std.mem.indexOf(u8, OPERATOR_HEADER, "NOT recorded") != null);
 }

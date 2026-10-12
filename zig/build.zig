@@ -81,6 +81,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // operator_journal: THE ONE definition of <store>/.operator — the header
+    // text (the contract, written into the file), the data-line grammar and
+    // the boot-nonce parse.  Imported by BOTH writers (fx-init's control
+    // handler and fx-activate's self-record), so the grammar and the header
+    // — which IS the definition — can never drift.
+    const operator_journal_mod = b.createModule(.{
+        .root_source_file = b.path("src/operator_journal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "fxstat", .module = fxstat_mod },
+        },
+    });
+
     // config: the FxConfig types + walker + load pipeline (port of src/config.c).
     const config_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -362,6 +377,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "config", .module = config_mod },
             .{ .name = "fxstore", .module = fxstore_mod },
             .{ .name = "fxstat", .module = fxstat_mod },
+            .{ .name = "operator_journal", .module = operator_journal_mod },
         },
     });
     linkDatalog(b, activate_mod, is_musl, datalog_lib);
@@ -420,6 +436,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "supervise", .module = supervise_mod },
             .{ .name = "fxstore", .module = fxstore_mod },
             .{ .name = "fxstat", .module = fxstat_mod },
+            .{ .name = "operator_journal", .module = operator_journal_mod },
         },
     });
     linkDatalog(b, init_mod, is_musl, datalog_lib);
@@ -438,6 +455,8 @@ pub fn build(b: *std.Build) void {
     const run_log_tests = b.addRunArtifact(log_tests);
     const probe_tests = b.addTest(.{ .root_module = probe_test_mod });
     const run_probe_tests = b.addRunArtifact(probe_tests);
+    const opj_tests = b.addTest(.{ .root_module = operator_journal_mod });
+    const run_opj_tests = b.addRunArtifact(opj_tests);
     const fxctl_tests = b.addTest(.{ .root_module = fxctl_mod });
     const run_fxctl_tests = b.addRunArtifact(fxctl_tests);
     const activate_tests = b.addTest(.{ .root_module = activate_mod });
@@ -485,6 +504,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sup_tests.step);
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_probe_tests.step);
+    test_step.dependOn(&run_opj_tests.step);
     test_step.dependOn(&run_fxctl_tests.step);
     test_step.dependOn(&run_activate_tests.step);
     test_step.dependOn(&run_init_tests.step);

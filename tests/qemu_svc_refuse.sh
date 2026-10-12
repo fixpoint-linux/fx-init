@@ -295,6 +295,53 @@ sys.stdout.write(b"".join(chunks).decode("utf-8", "replace"))
     esac
 }
 
+# paced_session SOCK REQFILE TRANSCRIPT [GAP] — ctrl_session, but the request
+# file's lines are sent ONE AT A TIME with a gap between them (qemu_shell.sh's
+# paced writer).  THE GAP IS LOAD-BEARING: a single BURST can arrive in ONE
+# read(2) and the handler then walks that whole buffer in one pass, consuming
+# the lines that belong to the SHELL it just forked (MEASURED on fx-init's
+# qemu_operator_journal.sh boot-5 arm: a burst produced "OK shell pid N" then
+# one "ERR unknown command" per shell line, and the direct exec never ran).
+# The shell owns the port until it exits; the parent skips it via its latch.
+paced_session() { # paced_session SOCK REQFILE TRANSCRIPT [GAP]
+    _sock=$1 _req=$2 _out=$3 _gap=${4:-2}
+    if [ "$CTRL_TOOL" = "nc" ]; then
+        { while IFS= read -r _l || [ -n "$_l" ]; do
+              [ -n "$_l" ] || continue
+              printf '%s\n' "$_l"
+              sleep "$_gap"
+          done < "$_req"; } | timeout 240 nc -w 20 -U "$_sock" > "$_out" 2>&1
+    else
+        cat > "$WORK/paced.py" <<'PYEOF'
+import socket, sys, time
+sock, req, out = sys.argv[1], sys.argv[2], sys.argv[3]
+gap = float(sys.argv[4]) if len(sys.argv) > 4 else 2.0
+lines = [l for l in open(req, "rb").read().split(b"\n") if l.strip()]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+s.settimeout(3)
+chunks = []
+def drain(t):
+    end = time.time() + t
+    while time.time() < end:
+        try:
+            b = s.recv(4096)
+        except socket.timeout:
+            return
+        if not b:
+            return
+        chunks.append(b)
+        end = time.time() + 1.0
+for l in lines:
+    s.sendall(l + b"\n")
+    drain(gap)
+drain(20)
+open(out, "wb").write(b"".join(chunks))
+PYEOF
+        timeout 240 python3 "$WORK/paced.py" "$_sock" "$_req" "$_out" "$_gap" > /dev/null 2>&1
+    fi
+}
+
 # ─── ONE arm: provision, ONE channel boot + ONE reboot, assertions ────────
 run_arm() { # run_arm TAG BINDIR MODE(treat|ctrl)
     TAG=$1 BINDIR=$2 MODE=$3
@@ -390,6 +437,56 @@ run_arm() { # run_arm TAG BINDIR MODE(treat|ctrl)
         _i=$((_i + 1))
     done
 
+    # ── THE PREDICATE'S NEGATIVE PIN (the runtime-record closure) ────────
+    # This boot's kernel command line carries NO fx.bootnonce= (it is not
+    # passed below, and that is the regime this arm measures — the guard
+    # asserts it rather than assuming it).  A DIRECT exec of fx-activate on
+    # such a boot must leave <store>/.operator UNCHANGED: the self-record
+    # predicate is FALSE without a boot nonce, because a row has to be
+    # attributable to the boot it happened in and a self-recorded row may
+    # NEVER wear the "none" placeholder.
+    #   The exec'd config is uploaded FIRST (the same `put` the channel arm
+    # uses), then /bin/fx-activate is run INSIDE the M4 `shell` — PID1 never
+    # sees it — and the publish it makes is asserted, so the reading below
+    # cannot be a vacuous "the exec never ran".
+    if grep -q 'fx.bootnonce=' "$CON" || grep -q 'fx-init: boot nonce' "$CON"; then
+        fail "$TAG: this boot LATCHED a boot nonce — the negative pin needs a NONCE-LESS boot (its -append carries no fx.bootnonce=)"
+    fi
+    echo "--- arm $TAG: NONCE-LESS direct exec over the M4 shell ---"
+    # session A — the upload (a `put`: a file transfer, not a request)
+    {
+        echo 'put /run/fx/config-direct.dhall'
+        base64 -w 76 "$CFG_OK2"
+        echo '.'
+    } > "$WORK/$TAG/req-nonnonce-put.txt"
+    ctrl_session "$SOCK" "$WORK/$TAG/req-nonnonce-put.txt" "$WORK/$TAG/put-nononce.log"
+    grep -q 'OK put [0-9][0-9]* bytes' "$WORK/$TAG/put-nononce.log" \
+        || { cat "$WORK/$TAG/put-nononce.log"; kill "$QPID" 2>/dev/null; fail "$TAG: the config upload never landed on the channel"; }
+    # session B — the DIRECT EXEC, PACED
+    {
+        echo 'shell'
+        echo '/bin/fx-activate --store /fx/disk/store --package-set /usr/fx/package-set.dhall --config /run/fx/config-direct.dhall'
+        echo 'echo DIRECT-RC=$?'
+        echo 'echo DONE-NONONCE'
+        echo 'exit'
+    } > "$WORK/$TAG/req-nononce-shell.txt"
+    paced_session "$SOCK" "$WORK/$TAG/req-nononce-shell.txt" "$WORK/$TAG/shell-nononce.log" 2
+    echo "--- arm $TAG no-nonce shell transcript ---"; cat "$WORK/$TAG/shell-nononce.log"; echo "---"
+    grep -q 'OK shell pid [0-9][0-9]*' "$WORK/$TAG/shell-nononce.log" \
+        || { cat "$WORK/$TAG/shell-nononce.log"; kill "$QPID" 2>/dev/null; fail "$TAG: the in-guest shell never spawned ('OK shell pid N' missing)"; }
+    _i=0
+    while [ "$_i" -lt 60 ]; do
+        grep -q 'activated [0-9a-f]* as version' "$WORK/$TAG/shell-nononce.log" && break
+        sleep 0.5
+        _i=$((_i + 1))
+    done
+    VD_NONONCE=$(sed -n 's/.*activated [0-9a-f]* as version \([0-9][0-9]*\).*/\1/p' "$WORK/$TAG/shell-nononce.log" | head -1)
+    [ -n "$VD_NONONCE" ] \
+        || { cat "$WORK/$TAG/shell-nononce.log"; kill "$QPID" 2>/dev/null; fail "$TAG: the nonce-less DIRECT exec never published — the negative pin would be vacuous (it must reach the publish step and record NOTHING there)"; }
+    [ "$VD_NONONCE" -gt "$V1" ] \
+        || { kill "$QPID" 2>/dev/null; fail "$TAG: the nonce-less direct exec's v$VD_NONONCE is not above v$V1"; }
+    echo "$TAG: the nonce-less direct exec published v$VD_NONONCE — .operator is read back off the disk at the end of this boot"
+
     CTRL1="$WORK/$TAG/ctrl-v2.log"
     ctrl_session "$SOCK" "$WORK/$TAG/req-v2.txt" "$CTRL1"
     echo "--- arm $TAG ctrl (activate v2) ---"; cat "$CTRL1"; echo "---"
@@ -443,6 +540,23 @@ run_arm() { # run_arm TAG BINDIR MODE(treat|ctrl)
     done
     kill "$QPID" 2>/dev/null
     wait "$QPID" 2>/dev/null
+
+    # THE NEGATIVE PIN'S MEASUREMENT: two CHANNEL interventions happened in
+    # this boot (the v2 activate and the refused v3), so .operator must hold
+    # EXACTLY TWO rows — the nonce-less DIRECT exec added NONE.  Two ways to
+    # pass this by accident are closed: the exec's own config path must
+    # appear on NO row, and no row may carry more than one row's worth of
+    # epoch (the file is read back with the same replay+debugfs path the
+    # journal gate uses).
+    read_store_file "$DISK" /store/.operator "$WORK/$TAG/operator1.txt"
+    echo "--- arm $TAG disk .operator (boot 1) ---"
+    cat "$WORK/$TAG/operator1.txt" 2>/dev/null; echo "---"
+    _nop=$(grep -c '^[0-9]' "$WORK/$TAG/operator1.txt" 2>/dev/null || true)
+    [ "${_nop:-0}" = "2" ] \
+        || fail "$TAG: .operator holds ${_nop:-0} data row(s) after boot 1 — want EXACTLY 2 (the two CHANNEL interventions): a NONCE-LESS direct exec must self-record NOTHING (the runtime-record predicate is false without fx.bootnonce=)"
+    grep -q 'config-direct.dhall' "$WORK/$TAG/operator1.txt" 2>/dev/null \
+        && { cat "$WORK/$TAG/operator1.txt"; kill "$QPID" 2>/dev/null; fail "$TAG: .operator carries a row naming the nonce-less DIRECT exec's config — the predicate let a nonce-less self-record through"; }
+    true
 
     read_store_file "$DISK" /store/.bootlog "$WORK/$TAG/bootlog1.txt"
     echo "--- arm $TAG disk .bootlog (boot 1) ---"

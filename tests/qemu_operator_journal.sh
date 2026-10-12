@@ -186,6 +186,54 @@ sys.stdout.write(b"".join(chunks).decode("utf-8", "replace"))
     esac
 }
 
+# paced_session SOCK REQFILE TRANSCRIPT [GAP] — like ctrl_session, but the
+# request file's lines are sent ONE AT A TIME with a gap between them
+# (qemu_shell.sh's paced writer).  THE GAP IS LOAD-BEARING: a single BURST
+# can arrive in ONE read(2), and the handler then walks that whole buffer in
+# one pass — consuming the lines that belong to the SHELL it just forked
+# (MEASURED on this arm's first run: `shell` + 4 command lines in one burst
+# produced "OK shell pid N" followed by FOUR "ERR unknown command" lines,
+# and the direct exec never ran).  Sending `shell` alone, then waiting,
+# lets the fork take the port — the latch then makes the parent skip it.
+paced_session() { # paced_session SOCK REQFILE TRANSCRIPT [GAP]
+    _sock=$1 _req=$2 _out=$3 _gap=${4:-2}
+    if [ "$CTRL_TOOL" = "nc" ]; then
+        { while IFS= read -r _l || [ -n "$_l" ]; do
+              [ -n "$_l" ] || continue
+              printf '%s\n' "$_l"
+              sleep "$_gap"
+          done < "$_req"; } | timeout 240 nc -w 20 -U "$_sock" > "$_out" 2>&1
+    else
+        cat > "$WORK/paced.py" <<'PYEOF'
+import socket, sys, time
+sock, req, out = sys.argv[1], sys.argv[2], sys.argv[3]
+gap = float(sys.argv[4]) if len(sys.argv) > 4 else 2.0
+lines = [l for l in open(req, "rb").read().split(b"\n") if l.strip()]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+s.settimeout(3)
+chunks = []
+def drain(t):
+    end = time.time() + t
+    while time.time() < end:
+        try:
+            b = s.recv(4096)
+        except socket.timeout:
+            return
+        if not b:
+            return
+        chunks.append(b)
+        end = time.time() + 1.0
+for l in lines:
+    s.sendall(l + b"\n")
+    drain(gap)
+drain(20)  # let the exec's own output land
+open(out, "wb").write(b"".join(chunks))
+PYEOF
+        timeout 240 python3 "$WORK/paced.py" "$_sock" "$_req" "$_out" "$_gap" > /dev/null 2>&1
+    fi
+}
+
 # ─── freeze the package sources (qemu_boot_rollback.sh's shield, verbatim) ─
 freeze_src() { # freeze_src SRC DST
     mkdir -p "$2"
@@ -627,6 +675,82 @@ run_arm() {
         _n=$(j_lines "$WORK/$TAG/rec4.txt")
         [ "$_n" = 1 ] || fail "$TAG boot 4: .recovery gained $_n line(s) on an ordinary boot (want still 1)"
     fi
+
+    # ── boot 5: THE DIRECT EXEC (the runtime-record closure's SECOND
+    # WRITER).  A nonce boot with NO channel intervention of its own: the
+    # harness uploads a config over the channel (a `put` — a file transfer,
+    # NOT a generation-plane request, and the header names it as not
+    # recorded) and then execs /bin/fx-activate DIRECTLY from inside the
+    # M4 `shell` (init.zig's shell arm, tests/qemu_shell.sh's route): PID1
+    # never sees that exec, exactly as in the harness's channel-less
+    # fallback.  The publish it commits must SELF-RECORD — ONE row, under
+    # THIS boot's nonce — beside the five channel rows, and the file
+    # underneath must be untouched.
+    #   CONTROL (pinned $PIN_REV, the pre-journal tree): the same commands
+    # publish exactly the same way and leave NO file, so every assertion
+    # below fails on it, as the arm's other journal assertions do.
+    NONCE5="dead4f2a00000005"
+    echo "=== arm $TAG boot 5: DIRECT EXEC of /bin/fx-activate from the in-guest shell (nonce $NONCE5) ==="
+    run_boot "$WORK/$TAG/console5.log" 1 "$NONCE5"
+    grep -q "fx-init: boot-ok v$V_ROLL" "$WORK/$TAG/console5.log" \
+        || { tail -40 "$WORK/$TAG/console5.log"; kill "$QPID" 2>/dev/null; fail "$TAG boot 5: want boot-ok v$V_ROLL"; }
+    grep -q "fx-init: boot nonce $NONCE5" "$WORK/$TAG/console5.log" \
+        || { tail -40 "$WORK/$TAG/console5.log"; kill "$QPID" 2>/dev/null; fail "$TAG boot 5: the nonce was never latched"; }
+    _i=0
+    while [ ! -S "$SOCK" ] && [ "$_i" -lt 60 ]; do sleep 0.5; _i=$((_i + 1)); done
+    [ -S "$SOCK" ] || { kill "$QPID" 2>/dev/null; fail "$TAG boot 5: chardev socket never appeared"; }
+    # session A — the upload (a `put`: a file transfer, NOT a generation-plane
+    # request; the file's own header names it as not recorded).  Burst is fine:
+    # every line belongs to the handler.
+    {
+        echo 'put /run/fx/config-direct.dhall'
+        base64 -w 76 "$CFG_GOOD"
+        echo '.'
+    } > "$WORK/$TAG/req5put.txt"
+    ctrl_session "$SOCK" "$WORK/$TAG/req5put.txt" "$WORK/$TAG/put5.log"
+    grep -q '^OK put [0-9][0-9]* bytes' "$WORK/$TAG/put5.log" \
+        || { cat "$WORK/$TAG/put5.log"; kill "$QPID" 2>/dev/null; fail "$TAG boot 5: the config upload never landed on the channel"; }
+    # session B — the DIRECT EXEC, PACED (see paced_session: the shell's own
+    # command lines must reach the SHELL, not the handler)
+    {
+        echo 'shell'
+        echo '/bin/fx-activate --store /fx/disk/store --package-set /usr/fx/package-set.dhall --config /run/fx/config-direct.dhall'
+        echo 'echo DIRECT-RC=$?'
+        echo 'echo DONE-DIRECT'
+        echo 'exit'
+    } > "$WORK/$TAG/req5shell.txt"
+    paced_session "$SOCK" "$WORK/$TAG/req5shell.txt" "$WORK/$TAG/shell5.log" 2
+    echo "--- arm $TAG boot-5 shell transcript ---"; cat "$WORK/$TAG/shell5.log"; echo "---"
+    # the spawn really happened (otherwise the exec below could not have run)
+    grep -q 'OK shell pid [0-9][0-9]*' "$WORK/$TAG/shell5.log" \
+        || { cat "$WORK/$TAG/shell5.log"; kill "$QPID" 2>/dev/null; fail "$TAG boot 5: the in-guest shell never spawned ('OK shell pid N' missing)"; }
+    _i=0
+    while [ "$_i" -lt 60 ]; do
+        grep -q 'activated [0-9a-f]* as version' "$WORK/$TAG/shell5.log" && break
+        sleep 0.5
+        _i=$((_i + 1))
+    done
+    V_DIRECT=$(sed -n 's/.*activated [0-9a-f]* as version \([0-9][0-9]*\).*/\1/p' "$WORK/$TAG/shell5.log" | head -1)
+    [ -n "$V_DIRECT" ] \
+        || { cat "$WORK/$TAG/shell5.log"; kill "$QPID" 2>/dev/null; fail "$TAG boot 5: the DIRECT exec published nothing (no 'activated ... as version N' in the shell transcript) — every journal assertion below would be vacuous"; }
+    [ "$V_DIRECT" -gt "$V_ROLL" ] \
+        || { kill "$QPID" 2>/dev/null; fail "$TAG boot 5: the direct exec's v$V_DIRECT is not above v$V_ROLL (the publish did not ratchet)"; }
+    wait_disk_quiet
+    kill "$QPID" 2>/dev/null; wait "$QPID" 2>/dev/null
+
+    read_operator "$DISK" "$WORK/$TAG/op5.txt"
+    _n=$(j_lines "$WORK/$TAG/op5.txt")
+    [ "$_n" = 6 ]; jassert "boot 5: exactly SIX data lines — the DIRECT exec self-recorded ONE row (got $_n)" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 2); [ "$_f" = activate ]; jassert "boot 5: the new row is action=activate (got '$_f')" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 3); [ "$_f" = /run/fx/config-direct.dhall ]; jassert "boot 5: the new row's arg is the config operand VERBATIM (got '$_f')" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 4); [ "$_f" = ok ]; jassert "boot 5: the new row's outcome=ok — a publish that REACHED COMMIT (got '$_f')" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 5); [ "$_f" = "$V_ROLL" ]; jassert "boot 5: the new row's from=v$V_ROLL (the CURRENT the exec moved from) (got '$_f')" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 6); [ "$_f" = "$V_DIRECT" ]; jassert "boot 5: the new row's to=v$V_DIRECT (the version the exec published) (got '$_f')" "$?"
+    _f=$(j_field "$WORK/$TAG/op5.txt" 6 7); [ "$_f" = "$NONCE5" ]; jassert "boot 5: the new row's nonce=$NONCE5 — NEVER 'none' (the predicate forbids it) (got '$_f')" "$?"
+    _t5=$(wc -l < "$WORK/$TAG/op5.txt" 2>/dev/null || echo 0)
+    head -n $((_t5 - 1)) "$WORK/$TAG/op5.txt" > "$WORK/$TAG/op5head.txt" 2>/dev/null
+    cmp -s "$WORK/$TAG/op4.txt" "$WORK/$TAG/op5head.txt"
+    jzassert "boot 5: the five channel rows underneath are byte-identical to boot 4's file (the second writer APPENDED, it rewrote nothing)" "$?"
 
     if [ "$MODE" = ctrl ]; then
         [ "$JPASS" = 0 ] || fail "control arm: $JPASS journal assertion(s) PASSED on pinned $PIN_REV — the control is not pre-fix (pin or probe broken)"
