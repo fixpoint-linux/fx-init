@@ -146,9 +146,11 @@ chmod 755 "$STAGE/usr/bin/busybox"
 ln -s /usr/bin/busybox "$STAGE/bin/sh"
 ln -s /usr/bin/busybox "$STAGE/bin/mount"
 ln -s /usr/bin/busybox "$STAGE/usr/bin/mount"
-# the M4 disk path's applets (zig/src/init.zig execs /usr/bin/busybox
-# directly via its multi-call form, so these are belt + a debugging aid —
-# but the image must visibly carry them)
+# the applet links are belt + a debugging aid only, and NO LONGER a boot
+# dependency: zig/src/init.zig's disk path runs its migration NATIVELY
+# (rm_rf/copy_tree/rename/syncfs_path — the guest image carries no busybox
+# and no shell, which is the baliveau containment claim), so nothing here
+# is exec'd by fx-init.  fx-init's own TEST images keep the debug shell.
 for applet in mkfs.ext2 cp rm mv sync; do
     ln -sf /usr/bin/busybox "$STAGE/usr/bin/$applet"
 done

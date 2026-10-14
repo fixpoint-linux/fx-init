@@ -1,0 +1,8 @@
+slice 2 (v86guest) -- qemu_disk_probe.sh evidence, 2026-10-13T20:01:12Z
+kernel     f0278a8f2893eb93a8c857f3f2d5a589a5b9aa6a45033171bc5411fc10f658cd  /home/jaye/futaie/souche/tests/images/vmlinuz-i386-v86guest
+busybox    6391caa6c0b4c8074ceb29509e1c5a345ecbb7ec7fdabb808c9955ed1eafa4b8  (Debian busybox-static 1.38.0-3+b1 i386)
+initrd-post    78e2941ffaa6667c3a0f2b824bc0b3c7dfe8bde84fe53e8bb0e5495055a7c5e7
+initrd-empty   4dca16be03102c2f84cfde45178e0c6e73cb56c9b6c08a9d7a2208392a412040
+initrd-prefix  4287d0417fa6d7c3715e969b96b78596f0f72b7412120d6d4247ba6d071c7842
+store (post-fix, v3) /tmp/fx-init-disk-probe/store
+store (G3 ramfs copy)      /tmp/fx-init-disk-probe/store-empty

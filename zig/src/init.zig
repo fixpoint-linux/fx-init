@@ -752,8 +752,9 @@ fn bootlog_append(v: u32, status: [*:0]const u8, epoch: u32) void {
     _ = fflush(f);
     _ = fsync(fileno(f));
     _ = fclose(f);
-    // the disk store is mounted r/w NOJOURNAL4 (busybox mkfs.ext2 under
-    // ext4): metadata churn can sit unflushed when a harness kills the VM
+    // the disk store is mounted r/w NOJOURNAL4 (the pre-formatted ext4
+    // image, mounted as ext4): metadata churn can sit unflushed when a
+    // harness kills the VM
     // at the verdict — the next mount then finds "doubly allocated" inode
     // state (see store_close_durable for the measured failure).  Target the
     // STORE's own filesystem: post-pivot "/" is tmpfs, so a bare sync()
@@ -2167,9 +2168,11 @@ fn mount_early() void {
 /// root whose sibling lands on another st_dev — i.e. a store root that is
 /// itself a mountpoint cannot be opened at all.
 ///
-/// Three cases once the disk is mounted (busybox mkfs.ext2 -F when blank;
-/// mounted -t ext4, NOT ext2: CONFIG_EXT2_FS is unset, only
-/// EXT4_USE_FOR_EXT2=y, and busybox `mount -t ext2` fails EINVAL — MEASURED
+/// Three cases once the disk is mounted (the disk must be PRE-FORMATTED: a
+/// blank disk is refused loudly below, never formatted in-guest — the image
+/// carries no busybox and no shell to do it with; mounted -t ext4, NOT
+/// ext2: CONFIG_EXT2_FS is unset, only EXT4_USE_FOR_EXT2=y, and the kernel
+/// refuses `-t ext2` EINVAL — MEASURED
 /// in the POC):
 ///   unseeded disk:                     seed = cp -a the ramfs store over;
 ///   seeded, ramfs CURRENT <= disk:     the DISK wins (persistence);
@@ -2192,9 +2195,26 @@ const DISK_STORE = "/fx/disk/store";
 /// byte-for-byte as before.
 const DISK_DEV_BASE = "/dev/vda";
 const DISK_DEV_PART = "/dev/vda1";
+/// The probe order pick_disk_dev walks, FIRST PRESENT WINS.  The vda pair
+/// stays FIRST, and that ordering is a correctness requirement, not a
+/// preference: the QEMU lane's x86_64 kernel builds NO ATA driver
+/// (# CONFIG_ATA is not set in its resolved config), so /dev/sda* can never
+/// exist there and the vda pair is what it always resolved to — the lane is
+/// byte-for-byte unchanged.  The sda pair serves the v86/ATA lane, which
+/// has no virtio-blk at all (MEASURED: v86 ships virtio_balloon/console/net
+/// only) and whose disks are named /dev/sda by libata (NOT /dev/hda, which
+/// would need the legacy CONFIG_IDE driver).  Whole disk LAST within each
+/// pair, for the same reason vda1 precedes vda above: an MBR'd disk's store
+/// belongs in the partition, never over the boot region.
+const DISK_DEVS = [_][:0]const u8{ DISK_DEV_PART, DISK_DEV_BASE, "/dev/sda1", "/dev/sda" };
 const DISK_STORE_DB = DISK_STORE ++ "/.db";
 const DISK_STORE_BOOTLOG = DISK_STORE ++ "/.bootlog";
 const DISK_STORE_RECOVERY = DISK_STORE ++ "/.recovery";
+/// Where the adopt path parks the disk's OWN history while the ramfs store
+/// replaces the store dir — siblings of it, so the copy can never reach
+/// them, and back again by rename(2) WITHIN /fx/disk.
+const DISK_KEEP_BOOTLOG = DISK_MOUNT ++ "/bootlog.keep";
+const DISK_KEEP_RECOVERY = DISK_MOUNT ++ "/recovery.keep";
 const Dirent = extern struct {
     d_ino: u64,
     d_off: i64,
@@ -2206,22 +2226,160 @@ extern "c" fn opendir(name: [*:0]const u8) ?*anyopaque;
 extern "c" fn readdir(dir: *anyopaque) ?*Dirent;
 extern "c" fn closedir(dir: *anyopaque) c_int;
 
-/// Run a busybox applet to completion (the image ships busybox at
-/// /usr/bin/busybox; argv = {"busybox", applet, a1..} is the multi-call
-/// form).  Returns the exit status, or -1 on fork/exec/wait failure (127 =
-/// exec failed).  Used only BEFORE the SIGCHLD handler + main loop exist,
-/// so a plain waitpid is safe here.
-fn run_bb(applet: [*:0]const u8, a1: ?[*:0]const u8, a2: ?[*:0]const u8, a3: ?[*:0]const u8) c_int {
-    const pid = std.c.fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        const av = [_:null]?[*:0]const u8{ "busybox", applet, a1, a2, a3 };
-        _ = execv("/usr/bin/busybox", @ptrCast(&av));
-        std.c._exit(127);
+// ─── the disk migration's filesystem primitives ────────────────────────────
+// The four applets the seed/adopt migration used to exec through busybox
+// (rm -rf / cp -a / mv / sync) are HERE, natively, because the guest image
+// deliberately carries NO busybox and NO shell: the baliveau containment
+// claim (futaie/baliveau/docs/baliveau-self-plan.md) is about binaries that
+// DO NOT EXIST — the shipped /usr/bin/busybox carried sh, ash AND hush
+// (MEASURED on the pinned build), which is the hole this closes.  Formatting
+// a disk is likewise not a guest operation anymore: see the refusal in
+// ensure_disk_store — the disk must be PRE-FORMATTED at build time.
+
+const S_IFMT: c_uint = 0o170000;
+const S_IFDIR: c_uint = 0o040000;
+const S_IFREG: c_uint = 0o100000;
+
+// lstat(2) is bound by fxstat.zig: the i386-musl headers redirect the bare
+// symbol to __lstat_time64, and a wrong `struct stat` shape reads the wrong
+// st_mode with no error (fxstat.zig owns the layout for exactly that).
+const lstat = fxstat.lstat;
+
+/// <dir>/<name> into a caller buffer, NUL-terminated.  Null when the join
+/// would not fit — the store's tree is <pkg>-<sha256>/<file> (deepest path
+/// MEASURED 118 chars), and 1100 is mkdirp's own budget, so a truncation is
+/// a broken tree, never a silent partial path.
+fn path_join(out: []u8, dir: [*:0]const u8, name: [*]const u8, name_len: usize) ?[*:0]const u8 {
+    const dlen = span(dir).len;
+    if (dlen + 1 + name_len + 1 > out.len) return null;
+    @memcpy(out[0..dlen], span(dir));
+    out[dlen] = '/';
+    @memcpy(out[dlen + 1 ..][0..name_len], name[0..name_len]);
+    out[dlen + 1 + name_len] = 0;
+    return @ptrCast(out.ptr);
+}
+
+/// The next directory entry's NAME length, bounded by d_reclen: d_name is
+/// only NUL-terminated within its own record, and `Dirent` is a projection
+/// over libc's buffer (never allocated by us — only its field offsets are
+/// read, and those coincide on i386 and LP64: MEASURED sizeof 276/280,
+/// d_reclen @16, d_type @18, d_name @19 on both).
+fn dirent_name_len(de: *const Dirent) usize {
+    const off = @offsetOf(Dirent, "d_name");
+    if (de.d_reclen <= off + 1) return 0;
+    const nl = @min(de.d_reclen - off - 1, de.d_name.len);
+    var n: usize = 0;
+    while (n < nl and de.d_name[n] != 0) : (n += 1) {}
+    return n;
+}
+
+/// Recursively unlink `path` — the `rm -rf` of the seed/adopt migration.
+/// ENOENT anywhere is success, exactly like `rm -rf`; any other failure is
+/// -1 and the caller disables the disk store loudly.
+fn rm_rf(path: [*:0]const u8) c_int {
+    var st: fxstat.Stat = undefined;
+    if (lstat(path, &st) != 0) {
+        return if (std.c._errno().* == ENOENT) 0 else -1;
     }
-    var status: c_int = 0;
-    while (std.c.waitpid(pid, &status, 0) < 0 and std.c._errno().* == EINTR) {}
-    return if (std.os.linux.W.IFEXITED(@bitCast(status))) @as(c_int, std.os.linux.W.EXITSTATUS(@bitCast(status))) else -1;
+    if (st.st_mode & S_IFMT != S_IFDIR) return std.c.unlink(path);
+    var rc: c_int = 0;
+    const d = opendir(path) orelse return -1;
+    while (readdir(d)) |de| {
+        const nl = dirent_name_len(de);
+        // "." and ".." by shape: strcmp on a name that may not be
+        // NUL-terminated would read past its record.
+        if (nl == 1 and de.d_name[0] == '.') continue;
+        if (nl == 2 and de.d_name[0] == '.' and de.d_name[1] == '.') continue;
+        var child: [1100]u8 = undefined;
+        const cp = path_join(&child, path, &de.d_name, nl) orelse {
+            errf("fx-init: disk: rm: {s}/<name> too long — refusing\n", .{span(path)});
+            rc = -1;
+            continue;
+        };
+        if (rm_rf(cp) != 0) rc = -1;
+    }
+    _ = closedir(d);
+    if (std.c.rmdir(path) != 0 and std.c._errno().* != ENOENT) rc = -1;
+    return rc;
+}
+
+/// Copy ONE regular file's contents and carry its mode — the executable bit
+/// is load-bearing (dhake's /bin symlinks resolve INTO this tree, and the
+/// next boot execs through them).  chmod after the create, not a mode on
+/// open: open's mode is umask-masked and the copy must not depend on PID1's
+/// umask being 0.
+fn copy_file(src: [*:0]const u8, dst: [*:0]const u8, mode: c_uint) c_int {
+    const in = fopen(src, "rb") orelse return -1;
+    defer _ = fclose(in);
+    const out = fopen(dst, "wb") orelse return -1;
+    var buf: [64 * 1024]u8 = undefined;
+    var rc: c_int = 0;
+    while (true) {
+        const n = fread(&buf, 1, buf.len, in);
+        if (n == 0) {
+            if (ferror(in) != 0) rc = -1;
+            break;
+        }
+        if (fwrite(&buf, 1, n, out) != n) {
+            rc = -1;
+            break;
+        }
+    }
+    if (fclose(out) != 0) rc = -1; // fclose flushes; a failed flush IS a failed copy
+    if (rc == 0 and std.c.chmod(dst, @intCast(mode & 0o7777)) != 0) rc = -1;
+    return rc;
+}
+
+/// Recursively copy a DIRECTORY TREE (the `cp -a` of the seed/adopt
+/// migration): mkdirp the directories, copy every regular file's contents,
+/// carry every mode.  Anything else in the tree — a symlink, a device node,
+/// a fifo — is REFUSED loudly rather than copied wrong: the store tree is
+/// dirs and regular files (MEASURED at seed time: 127 entries, no symlink,
+/// no special file), and a tree that grows one must fail the seed visibly,
+/// not silently dereference a link into the wrong place.
+fn copy_tree(src: [*:0]const u8, dst: [*:0]const u8) c_int {
+    var st: fxstat.Stat = undefined;
+    if (lstat(src, &st) != 0) return -1;
+    if (st.st_mode & S_IFMT != S_IFDIR) return -1;
+    if (mkdirp(dst) != 0) return -1;
+    const d = opendir(src) orelse return -1;
+    var rc: c_int = 0;
+    while (readdir(d)) |de| {
+        const nl = dirent_name_len(de);
+        if (nl == 1 and de.d_name[0] == '.') continue;
+        if (nl == 2 and de.d_name[0] == '.' and de.d_name[1] == '.') continue;
+        var sp: [1100]u8 = undefined;
+        var dp: [1100]u8 = undefined;
+        const s = path_join(&sp, src, &de.d_name, nl) orelse {
+            errf("fx-init: disk: copy: {s}/<name> too long — refusing\n", .{span(src)});
+            rc = -1;
+            continue;
+        };
+        const dp_ = path_join(&dp, dst, &de.d_name, nl) orelse {
+            errf("fx-init: disk: copy: {s}/<name> too long — refusing\n", .{span(dst)});
+            rc = -1;
+            continue;
+        };
+        var cst: fxstat.Stat = undefined;
+        if (lstat(s, &cst) != 0) {
+            rc = -1;
+            continue;
+        }
+        switch (cst.st_mode & S_IFMT) {
+            S_IFDIR => if (copy_tree(s, dp_) != 0) {
+                rc = -1;
+            },
+            S_IFREG => if (copy_file(s, dp_, cst.st_mode) != 0) {
+                rc = -1;
+            },
+            else => {
+                errf("fx-init: disk: copy: {s} is neither a directory nor a regular file — refusing\n", .{span(s)});
+                rc = -1;
+            },
+        }
+    }
+    _ = closedir(d);
+    return rc;
 }
 
 /// Is /dev already a kernel-populated devtmpfs mount?  On the host (and in
@@ -2274,14 +2432,22 @@ fn store_current_of(root: [:0]const u8) u32 {
     return v;
 }
 
-/// The device the disk store formats/mounts: /dev/vda1 when the kernel
-/// parsed an MBR partition (the standalone fx-image layout — the partition
-/// is where the store BELONGS; the boot region lives below LBA 65536
-/// outside it and must never be formatted over), else /dev/vda (the blank
-/// harness disks: no partition table, so vda1 never appears and behavior
-/// is byte-for-byte today's).
+/// The device the disk store formats/mounts: the FIRST present candidate of
+/// DISK_DEVS — /dev/vda1 when the kernel parsed an MBR partition (the
+/// standalone fx-image layout — the partition is where the store BELONGS;
+/// the boot region lives below LBA 65536 outside it and must never be
+/// formatted over), else /dev/vda (the blank harness disks: no partition
+/// table, so vda1 never appears and behavior is byte-for-byte today's),
+/// else the ATA pair (the v86 lane: no virtio-blk, so no vda at all).
+/// NOTHING present still yields the whole-disk vda spelling — the caller's
+/// "no /dev/vda — using ramfs store" warning is a PINNED pre-fix control
+/// (fx-demo docs/BOOT.md), so the fallback's spelling is part of the
+/// contract and must not drift to whichever candidate happens to be last.
 fn pick_disk_dev() [:0]const u8 {
-    return if (std.c.access(DISK_DEV_PART, F_OK) == 0) DISK_DEV_PART else DISK_DEV_BASE;
+    for (DISK_DEVS) |dev| {
+        if (std.c.access(dev, F_OK) == 0) return dev;
+    }
+    return DISK_DEV_BASE;
 }
 
 /// Bring up the persistent disk store (see the block comment above).  Runs
@@ -2291,12 +2457,14 @@ fn pick_disk_dev() [:0]const u8 {
 /// asserts the success line, so a broken disk path fails the harness, not
 /// the boot.
 fn ensure_disk_store() void {
-    // PID1 only: the path mkfs's a block device, and presence-discovery
+    // PID1 only: the path mounts and seeds a block device, and
+    // presence-discovery
     // (below) is exactly the right gate for a real init.  An FX_INIT_FORCE
-    // run on a host that happens to have a /dev/vda must never reach it.
+    // run on a host that happens to have a /dev/vda — or a real /dev/sda —
+    // must never reach it.
     if (std.c.getpid() != 1) return;
-    // /dev must be kernel-populated for /dev/vda to appear once virtio_blk
-    // loads.  The image ships baked device nodes, so mount_early SKIPPED
+    // /dev must be kernel-populated for /dev/vda (or the ATA lane's
+    // /dev/sda) to appear.  The image ships baked device nodes, so mount_early SKIPPED
     // devtmpfs (its /dev/null probe hits) — mount it here.  INTERPRETATION:
     // this mount succeeding also separates "initramfs PID1 in the initial
     // user namespace" from every harness path (bwrap/user ns: EPERM).  If a
@@ -2324,26 +2492,26 @@ fn ensure_disk_store() void {
 
     _ = mkdirp(DISK_MOUNT);
     if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
-        // blank disk: the GUEST formats it (the host cannot mkfs/populate
-        // the image as uid 1001 — that constraint is this whole design)
-        const mk = run_bb("mkfs.ext2", "-F", dev, null);
-        if (mk != 0) {
-            errf("fx-init: disk: mkfs.ext2 FAILED (exit {d}) — disk store disabled\n", .{mk});
-            return;
-        }
-        if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
-            errf("fx-init: disk: mount {s} ext4 FAILED: {s} — disk store disabled\n", .{ dev, errnoStr() });
-            return;
-        }
+        // The disk must be PRE-FORMATTED, and that is a BUILD condition, not
+        // a guest one: the host mkfs's the FILE image (needs no privilege —
+        // only MOUNT is a host limit, MEASURED), and the guest image carries
+        // no busybox and no shell to format with (the containment claim is
+        // about binaries that do not exist).  Refuse by name, say why, leave
+        // the disk untouched — no silent fallback, no in-guest format.
+        errf("fx-init: disk: {s} is not a formatted filesystem (mount ext4: {s}) — the disk must be pre-formatted at build time; disk store disabled\n", .{ dev, errnoStr() });
+        return;
     }
 
     if (std.c.access(DISK_STORE_DB, F_OK) != 0) {
         // unseeded: copy the whole ramfs store over (mkinitramfs already
         // stripped the .build/.tmp scratch from the image copy)
-        _ = run_bb("rm", "-rf", DISK_STORE, null);
-        const cp = run_bb("cp", "-a", DEFAULT_STORE, DISK_MOUNT);
-        if (cp != 0) {
-            errf("fx-init: disk: seed cp FAILED (exit {d}) — disk store disabled\n", .{cp});
+        _ = rm_rf(DISK_STORE);
+        if (copy_tree(DEFAULT_STORE, DISK_STORE) != 0) {
+            // never leave a PARTIAL store: the copy reaches .db early, so a
+            // half-copied tree would look seeded to the next boot (and
+            // half-seeded is worse than unseeded)
+            _ = rm_rf(DISK_STORE);
+            errf("fx-init: disk: seed copy FAILED — disk store disabled\n", .{});
             return;
         }
     } else {
@@ -2357,20 +2525,29 @@ fn ensure_disk_store() void {
             // wrote, and the recovery journal is the same machine-lifetime
             // record: an adopt must not silently zero the oscillator
             // count while keeping the failures it counts.
-            _ = run_bb("mv", DISK_STORE_BOOTLOG, "/fx/disk/bootlog.keep", null);
-            _ = run_bb("mv", DISK_STORE_RECOVERY, "/fx/disk/recovery.keep", null);
-            _ = run_bb("rm", "-rf", DISK_STORE, null);
-            const cp = run_bb("cp", "-a", DEFAULT_STORE, DISK_MOUNT);
-            _ = run_bb("mv", "/fx/disk/bootlog.keep", DISK_STORE_BOOTLOG, null);
-            _ = run_bb("mv", "/fx/disk/recovery.keep", DISK_STORE_RECOVERY, null);
-            if (cp != 0) {
-                errf("fx-init: disk: adopt cp FAILED (exit {d}) — disk store disabled\n", .{cp});
+            _ = std.c.rename(DISK_STORE_BOOTLOG, DISK_KEEP_BOOTLOG);
+            _ = std.c.rename(DISK_STORE_RECOVERY, DISK_KEEP_RECOVERY);
+            _ = rm_rf(DISK_STORE);
+            if (copy_tree(DEFAULT_STORE, DISK_STORE) != 0) {
+                // the adopt failed: put the history back, or the next boot
+                // loses the roll-forward input and the oscillator count —
+                // and clear the PARTIAL copy (it reaches .db early, so it
+                // would look seeded to the next boot)
+                _ = std.c.rename(DISK_KEEP_BOOTLOG, DISK_STORE_BOOTLOG);
+                _ = std.c.rename(DISK_KEEP_RECOVERY, DISK_STORE_RECOVERY);
+                _ = rm_rf(DISK_STORE);
+                errf("fx-init: disk: adopt copy FAILED — disk store disabled\n", .{});
                 return;
             }
+            _ = std.c.rename(DISK_KEEP_BOOTLOG, DISK_STORE_BOOTLOG);
+            _ = std.c.rename(DISK_KEEP_RECOVERY, DISK_STORE_RECOVERY);
             errf("fx-init: disk store adopted ramfs v{d} over disk v{d} (bootlog preserved)\n", .{ ramfs_v, disk_v });
         }
     }
-    _ = run_bb("sync", null, null, null); // belt: flush the copy before an abrupt harness kill
+    // belt: flush the copy before an abrupt harness kill.  g_store is
+    // repointed BELOW, so syncfs_store() would see a ramfs store here and
+    // flush nothing — the DISK mount is what needs its bitmap pages out.
+    syncfs_path(DISK_MOUNT);
 
     g_store = DISK_STORE;
     errf("fx-init: disk store mounted (current v{d})\n", .{store_current_of(DISK_STORE)});
@@ -2655,8 +2832,10 @@ fn pivot_root_to_tmpfs() void {
         fx_bound = true;
     }
     // Keep the new root a complete runtime for the store's dynamic binaries
-    // (fx-activate needs the loader + libc; /usr carries busybox for later
-    // store ops).  B itself needs neither — dhake/fakesvc are static.
+    // (fx-activate needs the loader + libc; /usr is one of the binds, so
+    // whatever the IMAGE stages there travels along — fx-init's own test
+    // images stage the debug busybox, the baliveau/demo image stages
+    // nothing).  B itself needs neither — dhake/fakesvc are static.
     for (pivot_binds) |b| {
         if (mount(b[0].ptr, @ptrCast(b[1].ptr), "", MS_BIND, null) != 0) {
             errf("fx-init: warning: pivot: bind {s} failed: {s} — staying on initramfs root\n", .{ b[0], errnoStr() });
@@ -3181,7 +3360,7 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
     }
 
     // shell — M4 F: fork a child that dups the CONTROL vport onto 0/1/2 and
-    // execs /bin/sh -i (busybox ash; TERM=dumb so it emits no ANSI).  The
+    // execs /bin/sh -i (TERM=dumb so it emits no ANSI).  The
     // session then IS the terminal: every shell output line is
     // indistinguishable from a protocol response, so the HOST treats the
     // session as opaque until an agreed SENTINEL (the harness echoes a
@@ -3239,11 +3418,13 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
             _ = setenv("PS1", "fx# ", 1);
             _ = setenv("PATH", "/bin:/usr/bin", 1);
             _ = std.posix.sigaction(std.posix.SIG.CHLD, &std.mem.zeroes(std.posix.Sigaction), null);
-            // /usr/bin/busybox, NOT /bin/sh: the image's /bin/sh lives on the
-            // INITRAMFS root, which the pivot left behind at /oldroot — the
-            // pivoted /bin carries only the generation's package symlinks.
-            // /usr is one of the pivot binds, so busybox is on the new root;
-            // argv[0]="sh" selects the ash applet.
+            // /usr/bin/busybox when the image carries one (fx-init's OWN test
+            // images do — tests/mkinitramfs.sh stages it as the debug shell),
+            // NOT /bin/sh: the pivoted /bin carries only the generation's
+            // package symlinks, and /usr is one of the pivot binds.  The
+            // baliveau/demo image stages NO busybox on purpose (the
+            // containment claim), so there `shell` falls through to the 127
+            // below — a missing shell is a visible absence, not a crash.
             const av = [_:null]?[*:0]const u8{ "sh", "-i" };
             _ = execvp("/usr/bin/busybox", @ptrCast(&av));
             _ = std.c.write(2, "fx-init: shell exec failed\n", "fx-init: shell exec failed\n".len);
@@ -4780,6 +4961,101 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // ─── tests (pure parts: parse_on, boot_decision, next_timeout, on_ready) ──
+
+test "the disk migration's native fs primitives: rm_rf + copy_tree round-trip" {
+    // The guest image ships NO busybox and NO shell, so these helpers ARE the
+    // disk path's `rm -rf` / `cp -a` / `mv` / `sync`.  They must survive a
+    // real nested tree of the store's actual shape (dirs + regular files,
+    // an executable among them), and refuse what they cannot copy faithfully.
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    const alloc = std.testing.allocator;
+
+    // the SOURCE tree: 3 dirs deep, 4 files, one 0755 (dhake's /bin symlinks
+    // resolve INTO the store, so the exec bit must travel), one 70k file
+    // (larger than copy_file's 64k chunk)
+    try t.dir.createDirPath(io, "store/a/b/c");
+    try t.dir.writeFile(io, .{ .sub_path = "store/.bootlog", .data = "3 ok 1700000001 n1\n" });
+    try t.dir.writeFile(io, .{ .sub_path = "store/a/top", .data = "top" });
+    try t.dir.writeFile(io, .{ .sub_path = "store/a/b/mid", .data = "0123456789" ** 7000 });
+    try t.dir.writeFile(io, .{ .sub_path = "store/a/b/c/deep", .data = "deep" });
+    var tb: [1100]u8 = undefined;
+    const top_src = try std.fmt.bufPrintZ(&tb, ".zig-cache/tmp/{s}/store/a/top", .{t.sub_path});
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(top_src, 0o755));
+
+    // the destination sits under a DIFFERENT parent (the seed copies the
+    // ramfs /fx/store onto the disk's /fx/disk/store), so the copy must
+    // create the leaf directory itself
+    try t.dir.createDirPath(io, "disk");
+
+    // THREE buffers: these are NUL-terminated C paths handed to lstat/fopen,
+    // and the helpers keep nothing — but each buffer must outlive its own use
+    var sb: [1100]u8 = undefined;
+    var db: [1100]u8 = undefined;
+    var pb: [1100]u8 = undefined;
+    const src_store = try std.fmt.bufPrintZ(&sb, ".zig-cache/tmp/{s}/store", .{t.sub_path});
+    const dst_store = try std.fmt.bufPrintZ(&db, ".zig-cache/tmp/{s}/disk/store", .{t.sub_path});
+
+    try std.testing.expectEqual(@as(c_int, 0), copy_tree(src_store, dst_store));
+
+    // every file arrived, byte-identical, with its mode
+    const cases = [_]struct { rel: []const u8, mode: u32, data: []const u8 }{
+        .{ .rel = ".bootlog", .mode = 0o644, .data = "3 ok 1700000001 n1\n" },
+        .{ .rel = "a/top", .mode = 0o755, .data = "top" },
+        .{ .rel = "a/b/c/deep", .mode = 0o644, .data = "deep" },
+    };
+    for (cases) |c| {
+        const p = try std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ dst_store, c.rel });
+        var st: fxstat.Stat = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), lstat(p, &st));
+        try std.testing.expectEqual(c.mode, @as(u32, @intCast(st.st_mode & 0o7777)));
+        const got = try t.dir.readFileAlloc(io, try std.fmt.bufPrint(&pb, "disk/store/{s}", .{c.rel}), alloc, .limited(4096));
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.data, got);
+    }
+    const got_mid = try t.dir.readFileAlloc(io, "disk/store/a/b/mid", alloc, .limited(200000));
+    defer alloc.free(got_mid);
+    try std.testing.expectEqual(@as(usize, 70000), got_mid.len);
+    for (got_mid, 0..) |ch, i| try std.testing.expectEqual(@as(u8, '0' + @as(u8, @intCast(i % 10))), ch);
+
+    // rm_rf removes the whole tree, is a silent no-op the second time, and
+    // leaves the SOURCE untouched
+    var st: fxstat.Stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), rm_rf(dst_store));
+    try std.testing.expectEqual(@as(c_int, 0), rm_rf(dst_store));
+    try std.testing.expectEqual(@as(c_int, 0), lstat(src_store, &st));
+    try std.testing.expect(lstat(dst_store, &st) != 0);
+
+    // the seed is repeatable onto the SAME emptied disk (the adopt path's
+    // shape: rm -rf then copy again)
+    const disk_dir = try std.fmt.bufPrintZ(&pb, ".zig-cache/tmp/{s}/disk", .{t.sub_path});
+    try std.testing.expectEqual(@as(c_int, 0), rm_rf(disk_dir));
+    try std.testing.expectEqual(@as(c_int, 0), copy_tree(src_store, dst_store));
+}
+
+test "copy_tree REFUSES what it cannot copy faithfully (no silent dereference)" {
+    // a symlink in the store tree: the seed must FAIL loudly rather than
+    // follow the link (a silent dereference would copy the TARGET's bytes
+    // under the LINK's name and call the store seeded)
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "store");
+    try t.dir.writeFile(io, .{ .sub_path = "store/real", .data = "x" });
+    try t.dir.createDirPath(io, "store/d");
+    try t.dir.symLink(io, "../real", "store/d/link", .{});
+    try t.dir.createDirPath(io, "out");
+
+    var sb: [1100]u8 = undefined;
+    var db: [1100]u8 = undefined;
+    const src = try std.fmt.bufPrintZ(&sb, ".zig-cache/tmp/{s}/store", .{t.sub_path});
+    const dst = try std.fmt.bufPrintZ(&db, ".zig-cache/tmp/{s}/out", .{t.sub_path});
+    try std.testing.expect(copy_tree(src, dst) != 0);
+    // the CALLER owns the cleanup (ensure_disk_store rm_rf's the partial
+    // tree — the copy reaches .db early, so a half-seeded store would be
+    // read back as seeded); this test asserts the refusal itself
+}
 
 test "pivot gate constants (linux/magic.h + the measured rootfs fstype)" {
     // The pivot gate/proof depend on kernel-fixed values.  A wrong constant

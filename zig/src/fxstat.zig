@@ -315,6 +315,7 @@ pub const StatVfs = if (musl_ilp32) StatVfsI386Musl else StatVfsLp64;
 
 const sym = struct {
     extern fn stat(path: [*:0]const u8, buf: *Stat) c_int;
+    extern fn lstat(path: [*:0]const u8, buf: *Stat) c_int;
     extern fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
     extern fn statvfs(path: [*:0]const u8, buf: *StatVfs) c_int;
     extern fn clock_gettime(clk: c_int, tp: *Timespec) c_int;
@@ -322,17 +323,19 @@ const sym = struct {
     extern fn time(t: ?*i64) i64;
 };
 
-/// The same six as the i386 headers rename them.  Declared on every target (an
-/// unreferenced extern fn costs nothing, and it is never LINKED on 64-bit) so
-/// the selection below is one expression.
+/// The same seven as the i386 headers rename them.  Declared on every target
+/// (an unreferenced extern fn costs nothing, and it is never LINKED on 64-bit)
+/// so the selection below is one expression.
 const sym_time64 = struct {
     extern fn __stat_time64(path: [*:0]const u8, buf: *Stat) c_int;
+    extern fn __lstat_time64(path: [*:0]const u8, buf: *Stat) c_int;
     extern fn __clock_gettime64(clk: c_int, tp: *Timespec) c_int;
     extern fn __nanosleep_time64(rqtp: *const Timespec, rmtp: ?*Timespec) c_int;
     extern fn __time64(t: ?*i64) i64;
 };
 
 pub const stat = if (musl_ilp32) &sym_time64.__stat_time64 else &sym.stat;
+pub const lstat = if (musl_ilp32) &sym_time64.__lstat_time64 else &sym.lstat;
 pub const clock_gettime = if (musl_ilp32) &sym_time64.__clock_gettime64 else &sym.clock_gettime;
 pub const nanosleep = if (musl_ilp32) &sym_time64.__nanosleep_time64 else &sym.nanosleep;
 pub const time = if (musl_ilp32) &sym_time64.__time64 else &sym.time;

@@ -11,7 +11,7 @@
 #      VACUOUS "boot-ok" for the generation PID1 had just REFUSED — the
 #      store then holds an ok verdict for a configuration the substrate
 #      rejected, and the next boot's roll-forward reads it.  The boot path
-#      pre-decides exactly this away (init.zig:4772-4778); the activate path
+#      pre-decides exactly this away (init.zig:4793-4799); the activate path
 #      did not;
 #  (2) the activation wrote NO on-disk marker for the activated version: a
 #      refused generation left NOTHING in .bootlog, so the next boot had no

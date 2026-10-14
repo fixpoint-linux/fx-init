@@ -1,0 +1,6 @@
+fx-init: warning: mount sysfs on /sys failed: No such file or directory
+fx-init: boot start store /fx/store
+fx-init: disk: /dev/sda1 is not a formatted filesystem (mount ext4: Operation not permitted) — the disk must be pre-formatted at build time; disk store disabled
+fx-init: root fstype is 'tmpfs' (not rootfs) — pivot not attempted
+fx-init: fifo control up (/run/fx/control.in + /run/fx/control.out)
+fx-init: boot-ok v3
