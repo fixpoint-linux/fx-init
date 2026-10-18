@@ -41,10 +41,12 @@
 # -device virtserialport,chardev=fxctl0,name=fxctl0 (CONFIG_VIRTIO_CONSOLE=y
 # + CONFIG_VIRTIO_PCI=y built into the pinned kernel — no module to ship;
 #   since M5 every disk-path driver is built in, module-free by construction).
-# Host writer: nc -w 5 -U (NOT -N: MEASURED on this host, -N's half-close makes
+# Host writer: nc -w 20 -U (NOT -N: MEASURED on this host, -N's half-close makes
 # qemu tear the chardev down before the guest's response write, silently
 # dropping it); the guest needs no EOF — requests are newline-delimited, so nc
-# idles out via -w 5 after the responses arrive.  python3 fallback if no nc -U.
+# idles out via -w 20 after the responses arrive (MEASURED: the in-guest rollback reply can land
+# 7-10 s after the status reply, so a 5 s window raced it — the sibling gate qemu_operator_journal.sh
+# already uses -w 20 for the same reason).  python3 fallback if no nc -U.
 #
 # Env: FXSTORE/FX_ACTIVATE/FX_INIT_BIN/FX_SIBLINGS/QEMU_BOOT_TIMEOUT/
 #      QEMU_KEEP — same contract as tests/qemu_boot_rollback.sh.
@@ -127,13 +129,14 @@ echo "qemu-ctrl: channel writer: $CTRL_TOOL"
 # the chardev socket in ONE connection (NO half-close — MEASURED: -N makes
 # qemu tear the chardev down before the guest's response write, silently
 # dropping it); requests are newline-delimited, so the guest needs no EOF.
-# nc idles out via -w 5 after the responses arrive; timeout(1) is the hard
+# nc idles out via -w 20 after the responses arrive (see the host-writer note above);
+# timeout(1) is the hard
 # backstop.
 ctrl_session() { # ctrl_session SOCK REQFILE TRANSCRIPT
     _sock=$1 _req=$2 _out=$3
     case "$CTRL_TOOL" in
-        nc) timeout 30 nc -w 5 -U "$_sock" < "$_req" > "$_out" 2>&1 ;;
-        python3) timeout 30 python3 -c '
+        nc) timeout 90 nc -w 20 -U "$_sock" < "$_req" > "$_out" 2>&1 ;;
+        python3) timeout 90 python3 -c '
 import socket, sys, time
 sock, req = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -141,7 +144,7 @@ s.connect(sock)
 s.sendall(open(req, "rb").read())
 # NO shutdown(SHUT_WR): the guest writes responses on the same connection
 # and a half-close makes qemu drop the chardev before they are written.
-s.settimeout(8)
+s.settimeout(25)
 chunks = []
 deadline = time.time() + 8
 while time.time() < deadline:
