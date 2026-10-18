@@ -239,6 +239,11 @@ var g_put_b64_len: usize = 0;
 var g_put_b64_cap: usize = 0;
 var g_sigpipe: [2]c_int = .{ -1, -1 };
 var g_shutdown: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0);
+// The `reboot` ctrl arm's decision, acted on by main() AFTER the reply is
+// flushed — a SEPARATE flag from g_shutdown on purpose: a shutdown stops the
+// machine, a reboot RE-ENTERS the boot path in a fresh address space (both
+// end the loop, and that is the only thing they share).
+var g_reboot: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0);
 var g_txn_id: u32 = 1;
 var g_boot_decided: c_int = 0;
 var g_boot_failed: c_int = 0;
@@ -400,6 +405,10 @@ extern "c" fn strerror(errnum: c_int) [*:0]const u8;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+// the re-entry's environment (see reexec_self): the SAME envp this PID1 was
+// started with, so a soft reboot cannot silently change the launch
+extern "c" var environ: [*:null]?[*:0]u8;
 // execvp (not execv) for store binaries: modern cosmocc emits APEs without
 // a #!-shell preamble, so a raw execve fails ENOEXEC.  glibc's execvp then
 // retries via /bin/sh itself; musl's does NOT (a slash path is a plain
@@ -728,6 +737,16 @@ fn bootlog_path(out: [*]u8, cap: usize) void {
 /// case (hand-boot, every non-harness launch) and stays silent: the
 /// placeholder does the talking on the record lines.  A nonce actually
 /// issued gets ONE console line so the host can see its token was read.
+///
+/// A SOFT REBOOT RE-RUNS THIS and re-latches the SAME value: the kernel
+/// command line did not change, so the token cannot.  THE INVARIANT THAT
+/// MAKES THAT SOUND (and that the readers of .bootlog/.operator/.recovery
+/// must be read against) is therefore NOT "one nonce per PID1 lifetime" —
+/// it is ONE NONCE PER KERNEL BOOT, WITH A SOFT REBOOT BEING A NEW PID1
+/// LIFETIME UNDER THE SAME NONCE, delimited on the record by the admitted
+/// `.operator` `reboot` row that asked for it.  A reader that assumes one
+/// nonce means one lifetime would call every legitimate soft reboot a
+/// forged verdict.
 fn apply_kernel_nonce() void {
     var p: [512]u8 = undefined;
     const root: []const u8 = if (g_probe_root) |r| span(r) else "";
@@ -980,6 +999,15 @@ fn operator_append(action: [*:0]const u8, arg: [*:0]const u8, outcome: [*:0]cons
     operator_path(&p, p.len);
     opj.append(@ptrCast(&p), span(action), span(arg), span(outcome), v_from, v_to, span(boot_nonce_str()));
 }
+
+/// How much of the journal TAIL the reboot admission reads.  The bound exists
+/// because the journal is append-only and grows for the machine's life, so
+/// "read the whole file" is not a shape a request handler can have; it is
+/// this wide because the admission only needs the reboot streak at the END
+/// (readTail returns a line-aligned slice), and 4 KiB holds far more rows
+/// than REBOOT_SAME_VERSION_MAX could ever span without a generation move
+/// ending the streak first.
+const OPJ_TAIL_MAX: usize = 4096;
 
 /// Enumerate ALL published snapshot versions into a malloc'd ASCENDING
 /// array (caller frees; null on any anomaly — callers fail open, exactly
@@ -2491,15 +2519,25 @@ fn ensure_disk_store() void {
     }
 
     _ = mkdirp(DISK_MOUNT);
-    if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
-        // The disk must be PRE-FORMATTED, and that is a BUILD condition, not
-        // a guest one: the host mkfs's the FILE image (needs no privilege —
-        // only MOUNT is a host limit, MEASURED), and the guest image carries
-        // no busybox and no shell to format with (the containment claim is
-        // about binaries that do not exist).  Refuse by name, say why, leave
-        // the disk untouched — no silent fallback, no in-guest format.
-        errf("fx-init: disk: {s} is not a formatted filesystem (mount ext4: {s}) — the disk must be pre-formatted at build time; disk store disabled\n", .{ dev, errnoStr() });
-        return;
+    // A SOFT REBOOT RE-ENTERS HERE with /fx/disk ALREADY MOUNTED: execve keeps
+    // the mount table, so an unconditional mount(2) of the same device on the
+    // same mountpoint would STACK a second mount over the first — the disk
+    // mounted twice, one copy hidden, and its dirty pages lost when something
+    // finally unmounts the top.  Gate the MOUNT only; the seed check and the
+    // adopt rule below run either way, and on a re-entry both see the disk
+    // this machine already seeded (so no adopt, and the CURRENT it boots is
+    // the one that was current when the reboot was admitted).
+    if (!is_mountpoint(DISK_MOUNT)) {
+        if (mount(dev, DISK_MOUNT, "ext4", 0, null) != 0) {
+            // The disk must be PRE-FORMATTED, and that is a BUILD condition, not
+            // a guest one: the host mkfs's the FILE image (needs no privilege —
+            // only MOUNT is a host limit, MEASURED), and the guest image carries
+            // no busybox and no shell to format with (the containment claim is
+            // about binaries that do not exist).  Refuse by name, say why, leave
+            // the disk untouched — no silent fallback, no in-guest format.
+            errf("fx-init: disk: {s} is not a formatted filesystem (mount ext4: {s}) — the disk must be pre-formatted at build time; disk store disabled\n", .{ dev, errnoStr() });
+            return;
+        }
     }
 
     if (std.c.access(DISK_STORE_DB, F_OK) != 0) {
@@ -2642,6 +2680,28 @@ fn root_mount_fstype(out: []u8) []const u8 {
         }
     }
     return out[0..found_len];
+}
+
+/// Is `path` a MOUNT POINT according to /proc/mounts?  The re-entry gate for
+/// ensure_disk_store: a soft reboot keeps the mount table (execve unmounts
+/// nothing), so mounting the same device on the same mountpoint again would
+/// STACK a second mount over the first.  Same reader shape as
+/// root_mount_fstype — /proc/mounts is the authority here because it is what
+/// the kernel itself reports, not a remembered constant.
+fn is_mountpoint(path: [*:0]const u8) bool {
+    const want = span(path);
+    const f = fopen("/proc/mounts", "r") orelse return false;
+    defer _ = fclose(f);
+    var line: [512]u8 = undefined;
+    while (fgets(&line, @intCast(line.len), f)) |_| {
+        var spec: [128]u8 = undefined;
+        var mnt: [128]u8 = undefined;
+        var fst: [64]u8 = undefined;
+        if (sscanf(@ptrCast(&line), "%127s %127s %63s", &spec, &mnt, &fst) == 3) {
+            if (std.mem.eql(u8, std.mem.sliceTo(&mnt, 0), want)) return true;
+        }
+    }
+    return false;
 }
 
 /// Mount src on dst by MOVING it (MS_MOVE); fall back to a bind mount so a
@@ -3544,6 +3604,82 @@ fn handle_request(o: *FILE, line: [*:0]u8) void {
         return;
     }
 
+    if (strcmp(cmd, "reboot") == 0) {
+        // THE SOFT REBOOT VERB (S3).  `reboot <reason>`: the operand is a
+        // REASON TOKEN (operator-request, oracle-recovery, ...), not a path
+        // and not a version — this verb moves no generation.  A missing one
+        // is an ERR rather than a default, because the row is this
+        // intervention's only durable trace and a reboot nobody can attribute
+        // is not one a reader can account for.
+        const reason = strtok_r(null, " \t", &save) orelse {
+            resp_err(o, "reboot <reason>");
+            return;
+        };
+        const txn = g_txn_id;
+        g_txn_id += 1;
+        rt_txn_begin();
+        rt_control(txn, "reboot", reason);
+        _ = rt_txn_commit();
+        // THE ADMISSION — one call into operator_journal.admit, which is the
+        // ONLY place the guards live: the verdict latch (not-decided while
+        // the grace window is open, boot-failed when the verdict landed
+        // FAILED), the open interactive shell, and REBOOT_SAME_VERSION_MAX
+        // consecutive admitted reboots at this from-version.  Nothing here
+        // re-derives them, and there is no second opinion: a reboot may never
+        // contradict a verdict.  Note the consequence the operator meets:
+        // `activate` RE-ARMS the latch (init.zig's post-activate re-arm), so
+        // immediately after an activation the machine is undecided and this
+        // refuses — the loop is activate -> poll status until the
+        // post-activate verdict -> reboot.
+        var tail_buf: [OPJ_TAIL_MAX]u8 = undefined;
+        var op: [1100]u8 = undefined;
+        operator_path(&op, op.len);
+        const tail = opj.readTail(@ptrCast(&op), &tail_buf);
+        const latch = opj.Latch{ .decided = g_boot_decided != 0, .failed = g_boot_failed != 0 };
+        const d = opj.admit(latch, g_current_version, tail, g_shell_pid.load(.monotonic) > 0);
+        // ONE row, outcome = the ADMISSION, and DURABLE BEFORE THE REPLY (the
+        // shutdown arm's discipline): after an admitted reboot this row is the
+        // only durable record of why the machine re-entered.  It binds to the
+        // boot by nonce — and a soft reboot re-enters under the SAME nonce
+        // (the kernel command line does not change), so a reboot row joins the
+        // boot it produced by nonce plus order.  The row records the
+        // ADMISSION, never the execution: an admitted reboot that never
+        // executed is read as the absence of a later .bootlog line under this
+        // row's nonce (operator_journal.zig's header defines that, and why
+        // there is no second row on an exec failure).
+        operator_append(opj.REBOOT_ACTION, reason, @ptrCast(d.outcome().token()), g_current_version, null);
+        switch (d) {
+            .refuse => |r| {
+                // Each refusal names ITSELF and what the operator does about
+                // it: a refusal the requester cannot act on is a dead end.
+                var m: [400]u8 = undefined;
+                switch (r) {
+                    .not_decided => _ = snfmt(&m, "reboot refused: not-decided (no boot verdict yet — an activate re-arms the window, so poll status until the post-activate verdict lands)", .{}),
+                    .boot_failed => _ = snfmt(&m, "reboot refused: boot-failed (this boot's verdict LANDED and it is FAILED — the verb for a failed generation is rollback)", .{}),
+                    .shell_open => _ = snfmt(&m, "reboot refused: shell-open (an interactive shell is open on the console)", .{}),
+                    .same_version_loop => _ = snfmt(&m, "reboot refused: same-version-loop ({d} consecutive admitted reboots at v{d} moved no generation — activate something first)", .{ opj.REBOOT_SAME_VERSION_MAX, g_current_version }),
+                }
+                resp_err(o, @ptrCast(&m));
+                return;
+            },
+            .admit => {},
+        }
+        // ORDER IS LOAD-BEARING: the reply is FLUSHED before the flag is set,
+        // and the exec runs on a LATER main-loop pass — never inside this
+        // handler.  resp_ok fflushes into the connected socket/fifo now; the
+        // teardown then unlinks the PATH and closes the fd, which sends those
+        // bytes and then a FIN, so the client reads its answer from a channel
+        // whose writer is already gone.  PID1 is single-threaded, so
+        // admit-then-act has no TOCTOU window.  Do NOT reorder these two.
+        resp_ok(o);
+        g_reboot.store(1, .monotonic);
+        if (g_sigpipe[1] >= 0) {
+            var b: [1]u8 = .{'T'};
+            _ = std.c.write(g_sigpipe[1], &b, 1);
+        }
+        return;
+    }
+
     if (strcmp(cmd, "shutdown") == 0) {
         const txn = g_txn_id;
         g_txn_id += 1;
@@ -4346,10 +4482,13 @@ fn handle_fifo() void {
     }
 }
 
-// ─── shutdown (fx-init.c:1194-1220) ───────────────────────────────────────
+// ─── teardown (factored out of do_shutdown for the soft reboot, S3) ───────
 
-fn do_shutdown() void {
-    log_line("fx-init", "info", "shutdown");
+/// Phase 1 of the teardown: the SERVICES.  TERM sweep in reverse start order,
+/// up to 50 x 100ms of quiet reaping, then a KILL sweep and a final waitpid
+/// drain.  Split from the close phase ONLY so the shutdown RECORD line can sit
+/// between them without re-ordering anything (see do_shutdown).
+fn stop_services() void {
     var i: c_int = g_nsvc - 1;
     while (i >= 0) : (i -= 1) {
         const sv = &g_svc.?[@intCast(i)];
@@ -4393,7 +4532,14 @@ fn do_shutdown() void {
     }
     var status: c_int = 0;
     while (std.c.waitpid(-1, &status, std.os.linux.W.NOHANG) > 0) {}
-    bootlog_append(g_current_version, "shutdown", now_s());
+}
+
+/// Phase 2 of the teardown: the boot's PATHS and HANDLES.  Unlink the control
+/// socket and the fifo pair (a stale path would let a client connect to a dead
+/// PID1), close every fixed fd, and close the two database handles — dl_close
+/// also releases the datalog's fcntl LOCK with its fd, which is what lets a
+/// re-entry re-open the run dir.
+fn close_boot_paths() void {
     var sp: [1100]u8 = undefined;
     _ = snfmt(&sp, "{s}/control.sock", .{span(@ptrCast(&g_run))});
     _ = std.c.unlink(@ptrCast(&sp));
@@ -4406,7 +4552,14 @@ fn do_shutdown() void {
     _ = snfmt(&fpout, "{s}/control.out", .{span(@ptrCast(&g_run))});
     _ = std.c.unlink(@ptrCast(&fpin));
     _ = std.c.unlink(@ptrCast(&fpout));
-    if (g_ctrl_fd >= 0) _ = std.c.close(g_ctrl_fd);
+    if (g_ctrl_fd >= 0) {
+        _ = std.c.close(g_ctrl_fd);
+        // -1, not just closed: the exec-failure path returns to the main loop,
+        // and a CLOSED fd number left here would be put straight back into the
+        // poll set (a permanent POLLNVAL) — a spinning PID1 instead of a loud
+        // failure.  do_shutdown exits right after, so this is inert for it.
+        g_ctrl_fd = -1;
+    }
     if (g_vio_fd >= 0) {
         // g_vio_wf is an fdopen over g_vio_fd and owns it — one fclose
         // closes both (fdclose(3) is not in this libc; no double close).
@@ -4431,6 +4584,210 @@ fn do_shutdown() void {
     }
     if (g_rt) |r| dl_close(r);
     if (g_log) |l| fx_log_close(l);
+    // Closed handles are NULLED: every caller but do_shutdown survives this
+    // (the soft reboot keeps running until the exec, and returns to the loop
+    // if the exec fails), so a dangling handle here would be a use-after-free
+    // in a later pass.  do_shutdown exits immediately after, so it is inert
+    // for the shutdown path.
+    g_rt = null;
+    g_log = null;
+}
+
+/// THE TEARDOWN, whole: both phases in the order do_shutdown has always run
+/// them.  This is the S3 factor-out — the body, not a rewrite — with the two
+/// RECORD appends left to the callers, because they owe different records: a
+/// shutdown appends its log line before and its `.bootlog` line between the
+/// phases, while a REBOOT appends neither (a re-entry is not a shutdown, and
+/// fx-audit budgets at most ONE `shutdown` line per window).  Nothing here
+/// touches g_sigpipe, so the main loop's wake pipe survives a failed reboot.
+fn teardown() void {
+    stop_services();
+    close_boot_paths();
+}
+
+// ─── shutdown (fx-init.c:1194-1220) ───────────────────────────────────────
+
+fn do_shutdown() void {
+    log_line("fx-init", "info", "shutdown");
+    stop_services();
+    bootlog_append(g_current_version, "shutdown", now_s());
+    close_boot_paths();
+}
+
+// ─── soft reboot: RE-ENTER the boot path (S3) ─────────────────────────────
+//
+// WHAT THIS IS, before anything else a reader might assume: a USERSPACE
+// RE-ENTRY, not a reboot(2).  It execve's /proc/self/exe so PID1's own boot
+// path runs again from main() in a FRESH ADDRESS SPACE — the store handle,
+// the latched boot decision, the runtime db, the control fds, the service
+// table: all re-created exactly as after a kernel boot.  That is the point:
+// it eliminates the forgotten-reset class structurally, because every
+// file-scope latch dies with the address space.
+//
+// IT IS NOT A HARD REBOOT and must never be read as one: no firmware, no
+// device re-init, no kernel restart.  /dev, the virtio ports and every
+// kernel-side resource are the ones this incarnation already had, so a
+// device that wedged stays wedged and a reboot that would have fixed it will
+// not.  A hard reboot is the HOST's act — under the pinned gates qemu runs
+// with -no-reboot, so reboot(2) makes the guest EXIT and the restart is the
+// host's, which would leave nothing in-guest but the request.  kexec is not
+// built into the guest kernel (MEASURED: # CONFIG_KEXEC is not set) and
+// would be a capability widening (an unsigned kernel exec on a store the
+// agent can write), not a convenience.
+//
+// IT IS NOT A RECOVERY REFLEX either: nothing crashed, so there is no
+// die -> reboot -> auto roll-forward loop.  A generation whose verdict is
+// FAILED cannot ask (operator_journal.admit), because the guardrail already
+// rolls a failed generation forward at the next boot; the verb for that is
+// `rollback`.
+
+/// Open the per-boot runtime state in the run dir: the datalog db
+/// (state.db, relations declared) and the log db.  main() calls this once
+/// per PID1 LIFETIME, and do_soft_reboot's failure path calls it AGAIN —
+/// after close_boot_paths() closed (not merely hid) both handles, the loop
+/// this machine returns to reads them on every pass.  false = the machine
+/// cannot supervise itself; the caller decides what that means.
+fn open_run_state() bool {
+    _ = mkdirp(@ptrCast(&g_run));
+    var rtp: [1100]u8 = undefined;
+    _ = snfmt(&rtp, "{s}/state.db", .{span(@ptrCast(&g_run))});
+    g_rt = dl_open(@ptrCast(&rtp)) orelse {
+        errf("fx-init: dl_open {s}: {s}\n", .{ span(@ptrCast(&rtp)), errnoStr() });
+        return false;
+    };
+    if (declare_runtime(g_rt.?) != 0) {
+        errf("fx-init: declare_runtime failed\n", .{});
+        return false;
+    }
+    var lp: [1100]u8 = undefined;
+    _ = snfmt(&lp, "{s}/log.db", .{span(@ptrCast(&g_run))});
+    g_log = fx_log_open(@ptrCast(&lp));
+    if (g_log == null) errf("fx-init: warning: log DB open failed (logging disabled)\n", .{});
+    return true;
+}
+
+/// Empty the runtime state a REAL reboot would have taken with it.
+///
+/// /run is tmpfs after the pivot, so a kernel boot always starts with an
+/// empty /run — which is exactly why no durable record may live there.  A
+/// re-entry that kept it would accumulate one machine's boot status across
+/// every soft reboot, and a reader of `status` could no longer tell THIS
+/// boot's verdict from the last one's.  Removed by NAME FAMILY, not by
+/// emptying the directory: g_run is also where the control paths live (the
+/// teardown already unlinked those) and a reboot is not a licence to delete
+/// something another arm put there.
+fn wipe_run_state() void {
+    const names = [_][*:0]const u8{ "state.db", "LOCK", "log.db" };
+    var p: [1100]u8 = undefined;
+    for (names) |n| {
+        _ = snfmt(&p, "{s}/{s}", .{ span(@ptrCast(&g_run)), span(n) });
+        _ = std.c.unlink(@ptrCast(&p));
+    }
+    // The datalog's RELATION files (<rel>.dafsa / <rel>.base.dafsa / .wal),
+    // which dl_open recreates on demand — see datalog-dafsa's file set.  They
+    // are collected FIRST and unlinked after the directory is closed: unlink
+    // during readdir may skip the entry after the freed slot, and a survivor
+    // here is not cosmetic — a stale relation file would put the PREVIOUS
+    // boot's facts back into this boot's runtime db, which is exactly the
+    // accumulating-state bug this wipe exists to prevent.  Two bounded passes
+    // for the same reason (a directory whose entries move during a scan).
+    var keep: [64][64]u8 = undefined;
+    var lens: [64]usize = [_]usize{0} ** 64;
+    var n_keep: usize = 0;
+    var pass: usize = 0;
+    while (pass < 2) : (pass += 1) {
+        n_keep = 0;
+        const d = opendir(@ptrCast(&g_run)) orelse return;
+        while (readdir(d)) |de| {
+            if (n_keep == lens.len) break;
+            const nl = dirent_name_len(de);
+            if (nl == 0 or nl > 63) continue;
+            const name = de.d_name[0..nl];
+            const suffix = std.mem.endsWith(u8, name, ".dafsa") or std.mem.endsWith(u8, name, ".wal");
+            if (!suffix) continue;
+            @memcpy(keep[n_keep][0..nl], name);
+            lens[n_keep] = nl;
+            n_keep += 1;
+        }
+        _ = closedir(d);
+        if (n_keep == 0) return;
+        var k: usize = 0;
+        while (k < n_keep) : (k += 1) {
+            _ = snfmt(&p, "{s}/{s}", .{ span(@ptrCast(&g_run)), keep[k][0..lens[k]] });
+            _ = std.c.unlink(@ptrCast(&p));
+        }
+    }
+}
+
+/// argv re-passed UNCHANGED across a soft reboot (main fills it from its own
+/// arena, which lives for the whole run).  Re-passing what this process was
+/// started with is faithful in both launch shapes: an rdinit boot's argv is
+/// empty (the kernel passes NONE — MEASURED), and main's parser reads from
+/// index 1, so a harness launch keeps its --store/--run-dir/...
+var g_argv: ?[]?[*:0]const u8 = null;
+
+/// THE RE-ENTRY: execve /proc/self/exe with argv and env unchanged.  Returns
+/// ONLY on failure — a successful execve never returns.  /proc/self/exe
+/// resolves even after the pivot (CONFIG_PROC_FS=y, /proc is one of the
+/// pivot's moved mounts), and it names THIS binary, not a path a store
+/// activation could have replaced between the reply and the exec.
+fn reexec_self() c_int {
+    const av = g_argv orelse return -1; // impossible before main_loop; never a silent no-op
+    return execve("/proc/self/exe", @ptrCast(av.ptr), @ptrCast(std.c.environ));
+}
+
+/// true = the machine is alive and back in the main loop; false = it could
+/// not be restarted and the caller must shut it down.
+fn do_soft_reboot() bool {
+    // 1. THE SAME TEARDOWN a shutdown does — services stopped and reaped, the
+    //    control paths unlinked, every fixed fd and both db handles closed —
+    //    but with NO shutdown record: this boot is not ending, it is
+    //    re-entering, and fx-audit budgets at most ONE `shutdown` line per
+    //    window.  The reply the operator saw was already flushed into the
+    //    connected socket/fifo by the arm, so closing here sends it and then
+    //    a FIN; the client reads its answer from a channel whose writer is
+    //    already gone.
+    teardown();
+    // 2. what a real reboot would have emptied.
+    wipe_run_state();
+    // 3. the store must be durable BEFORE the address space is replaced:
+    //    nothing after this point can flush it.  The bootlog in-progress/ok
+    //    pair this boot wrote and the operator's reboot row must already be
+    //    on the disk the NEXT incarnation reads.
+    syncfs_store();
+    errf("fx-init: soft reboot: re-entering the boot path (execve /proc/self/exe) — a USERSPACE re-entry, NOT a hard reboot: no firmware, no device re-init, no kernel restart\n", .{});
+    // 4. THE RE-ENTRY.  On success this frame ceases to exist.
+    const rc = reexec_self();
+    const e = std.c._errno().*;
+    // ── reachable ONLY on exec failure ────────────────────────────────────
+    // Never leave a torn machine: the service TABLE is intact in memory, so
+    // the honest recovery is these loud lines plus restarting the services
+    // from that table, then returning to the loop.  The boot verdict is
+    // untouched (it is already decided-OK — that is the only way this was
+    // admitted), so nothing downstream is misjudged.
+    //
+    // The RECORD of the failure, and its honest limit: the arm's .operator
+    // row already carries `ok`, because that row records the ADMISSION and is
+    // durable BEFORE the reply is flushed (the shutdown arm has the identical
+    // property).  An admitted-but-never-executed reboot is read as the
+    // ABSENCE of a later .bootlog line under that row's nonce — which is what
+    // operator_journal.zig's header defines, and why no second row is written
+    // here.
+    errf("fx-init: soft reboot FAILED: execve /proc/self/exe rc {d}: {s} — the machine was NOT restarted\n", .{ rc, errnoStrOf(e) });
+    if (!open_run_state()) {
+        errf("fx-init: soft reboot FAILED and the runtime state could not be re-opened — shutting down instead of looping unsupervised\n", .{});
+        return false;
+    }
+    errf("fx-init: soft reboot FAILED: services restarted from the in-memory table; the control channel (socket, fifo pair, virtio port) is GONE until the next boot\n", .{});
+    var si: c_int = 0;
+    while (si < g_nsvc) : (si += 1) {
+        const sv = &g_svc.?[@intCast(si)];
+        if (sv.pid <= 0) {
+            sv.state = ST_PENDING;
+            start_service(sv);
+        }
+    }
+    return true;
 }
 
 // ─── main loop (fx-init.c:1225-1352) ──────────────────────────────────────
@@ -4462,7 +4819,9 @@ fn next_timeout() i32 {
 }
 
 fn main_loop() void {
-    while (g_shutdown.load(.monotonic) == 0) {
+    // Two ways out, and they are different acts: g_shutdown STOPS the machine,
+    // g_reboot RE-ENTERS the boot path (main() decides, after this returns).
+    while (g_shutdown.load(.monotonic) == 0 and g_reboot.load(.monotonic) == 0) {
         // [2 + 1 + 1 + SVC_MAX]: sigpipe+ctrl, the VIRTIO port, the fifo
         // control fd, then one pipe per non-console service.  EVERY fixed
         // fd the loop can add must be in the arithmetic: the virtio fd was
@@ -4729,6 +5088,18 @@ fn apply_kernel_store(store_explicit: bool) void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     g_io = init.io;
+    // argv re-passed UNCHANGED across a soft reboot (see reexec_self).  Built
+    // from main's OWN arena — it must outlive every use, and it is never
+    // freed, exactly like the args slice it copies — and filled BEFORE the
+    // parse below so the re-entry carries the launch this machine was
+    // actually started with, not a reconstruction of it.
+    {
+        const arena_alloc = init.arena.allocator();
+        const av = try arena_alloc.alloc(?[*:0]const u8, args.len + 1);
+        for (args, 0..) |a, k| av[k] = a.ptr;
+        av[args.len] = null;
+        g_argv = av;
+    }
 
     var store_explicit = false;
     var i: usize = 1;
@@ -4841,21 +5212,7 @@ pub fn main(init: std.process.Init) !void {
         errf("fx-init: warning: PR_SET_CHILD_SUBREAPER failed: {s} (orphaned daemon grandchildren may not be reaped)\n", .{errnoStr()});
     }
 
-    _ = mkdirp(@ptrCast(&g_run));
-    var rtp: [1100]u8 = undefined;
-    _ = snfmt(&rtp, "{s}/state.db", .{span(@ptrCast(&g_run))});
-    g_rt = dl_open(@ptrCast(&rtp)) orelse {
-        errf("fx-init: dl_open {s}: {s}\n", .{ span(@ptrCast(&rtp)), errnoStr() });
-        std.process.exit(1);
-    };
-    if (declare_runtime(g_rt.?) != 0) {
-        errf("fx-init: declare_runtime failed\n", .{});
-        std.process.exit(1);
-    }
-    var lp: [1100]u8 = undefined;
-    _ = snfmt(&lp, "{s}/log.db", .{span(@ptrCast(&g_run))});
-    g_log = fx_log_open(@ptrCast(&lp));
-    if (g_log == null) errf("fx-init: warning: log DB open failed (logging disabled)\n", .{});
+    if (!open_run_state()) std.process.exit(1);
 
     var perr: [256]u8 = undefined;
     _ = fx_probe_refresh(g_rt, g_probe_root, &perr, perr.len);
@@ -4957,6 +5314,18 @@ pub fn main(init: std.process.Init) !void {
 
     log_line("fx-init", "info", "entered main loop");
     main_loop();
+    // THE REBOOT BRANCH (S3): a soft reboot has ended the loop, not the boot.
+    // main_loop returns again on the next admission, so this is a LOOP — the
+    // machine keeps running and can be asked again (the same-version bound in
+    // operator_journal.admit is what stops a reboot that changes nothing from
+    // being asked forever).  do_soft_reboot returns false only when the
+    // machine cannot supervise itself any more; it is then shut down cleanly
+    // instead of being left in a half-torn state.
+    while (g_reboot.load(.monotonic) != 0) {
+        g_reboot.store(0, .monotonic);
+        if (!do_soft_reboot()) break; // cannot restart: fall through to a clean shutdown
+        main_loop();
+    }
     do_shutdown();
 }
 

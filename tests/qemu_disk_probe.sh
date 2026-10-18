@@ -121,7 +121,9 @@ PREFIX_BLOB=7c054559821da222fddf793c62989b4b65e97361
 # end of the pre-fix swap: the swap must be a no-op for the tree.  (Round 2,
 # reviewer SF2: the false-premise comment at old :2348-2349 was corrected
 # COMMENT-ONLY, line for line, so this blob moved and NO cited line did.)
-POST_BLOB=201cf9ed6a5303e52e69dc9d40d5f7cf24d558c5
+# MOVED by REBOOT S3 (the soft reboot's wiring in init.zig): re-measured with
+# git hash-object against this tree, not remembered.
+POST_BLOB=bf8fa631e442b0c4468fb8946b0cf3deb8d05e57
 
 # ── the candidate-safety INVARIANT pins() asserts ─────────────────────────
 # DISK_DEVS in zig/src/init.zig is the probe's WHOLE candidate list, and this
