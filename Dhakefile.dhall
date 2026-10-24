@@ -18,18 +18,23 @@
 -- behavior, see each zig/*_diff.sh header).  The production binaries are
 -- the Zig build (zig/build.zig):
 --
---   fx-init      — lean PID1/supervisor (U-C1); links fxstore_c (vendored C
---                  fxstore + dhall-c core) + the datalog-dafsa/dafsa engine,
---                  NO dhall-c link beyond what packageset needs.
---   fx-activate  — activation tool (U-B); drives fxstore_c through the
---                  extern block in activate.zig.
+--   fx-init      — lean PID1/supervisor (U-C1); the Zig build compiles the
+--                  fxstore store core (vendored submodule vendor/fxstore) and
+--                  the datalog-dafsa engine (vendored submodule
+--                  vendor/datalog-dafsa) in-graph as a STATIC libdatalog.a.
+--                  No C fxstore core is compiled, and nothing links another
+--                  checkout's build output.
+--   fx-activate  — activation tool (U-B); imports the same fxstore Zig
+--                  modules directly (no extern block).
 --   fxctl        — pure-POSIX control/query client (U-D).
 --   fakesvc      — test fixture service (tests/fixtures/fakesvc/fakesvc.c,
 --                  kept C — it is a fixture the harness compiles, not an
 --                  oracle).
 --
--- NOTE: this repo vendors dafsa as a TOP-LEVEL submodule (vendor/dafsa/),
--- NOT under vendor/datalog-dafsa/vendor/ as fxstore does.
+-- NOTE: two dafsa copies exist and are pinned to the SAME commit: the
+-- TOP-LEVEL vendor/dafsa and the nested vendor/datalog-dafsa/vendor/dafsa
+-- that the engine's build reads.  The top-level copy is not an input of the
+-- Zig build (nor of any recipe in this Dhakefile).
 
 let Action =
       < Shell : Text
