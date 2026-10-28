@@ -120,6 +120,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // intent_citation: THE ONE definition of <store>/.intents — the intent
+    // CITATION journal (the header text, the id SHAPE, the row grammar).  A
+    // citation gets its own file rather than a new `.operator` column: that
+    // header is one frozen definition with two writers, and a new file is the
+    // additive shape every reader already has a rule for (ignore what you do
+    // not know).  Imported by fx-activate, the activation path that writes it.
+    const intent_citation_mod = b.createModule(.{
+        .root_source_file = b.path("src/intent_citation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "operator_journal", .module = operator_journal_mod },
+            .{ .name = "fxstat", .module = fxstat_mod },
+        },
+    });
+
     // config: the FxConfig types + walker + load pipeline (port of src/config.c).
     const config_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -399,6 +416,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "fxstore", .module = fxstore_mod },
             .{ .name = "fxstat", .module = fxstat_mod },
             .{ .name = "operator_journal", .module = operator_journal_mod },
+            .{ .name = "intent_citation", .module = intent_citation_mod },
         },
     });
     linkDatalog(b, activate_mod, datalog_lib);
@@ -478,6 +496,8 @@ pub fn build(b: *std.Build) void {
     const run_probe_tests = b.addRunArtifact(probe_tests);
     const opj_tests = b.addTest(.{ .root_module = operator_journal_mod });
     const run_opj_tests = b.addRunArtifact(opj_tests);
+    const intents_tests = b.addTest(.{ .root_module = intent_citation_mod });
+    const run_intents_tests = b.addRunArtifact(intents_tests);
     const fxctl_tests = b.addTest(.{ .root_module = fxctl_mod });
     const run_fxctl_tests = b.addRunArtifact(fxctl_tests);
     const activate_tests = b.addTest(.{ .root_module = activate_mod });
@@ -526,6 +546,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_probe_tests.step);
     test_step.dependOn(&run_opj_tests.step);
+    test_step.dependOn(&run_intents_tests.step);
     test_step.dependOn(&run_fxctl_tests.step);
     test_step.dependOn(&run_activate_tests.step);
     test_step.dependOn(&run_init_tests.step);

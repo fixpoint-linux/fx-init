@@ -79,7 +79,9 @@ fn span(p: [*:0]const u8) []const u8 {
 
 /// mkdir -p the DIRECTORY part of `path` (everything before the last '/'),
 /// the `mkdirp(g_store)` the writer has always done before opening the file.
-fn mkdirpDir(path: [*:0]const u8) void {
+/// PUB because it is the family's ONE store-record-file directory rule, and
+/// the `.intents` citation journal (intent_citation.zig) owes the same one.
+pub fn mkdirpDir(path: [*:0]const u8) void {
     var buf: [1100]u8 = undefined;
     const p = span(path);
     if (p.len == 0 or p.len >= buf.len) return;
@@ -109,7 +111,8 @@ fn mkdirpDir(path: [*:0]const u8) void {
 /// constant: fx-activate has no notion of the guest's DISK_MOUNT, and the
 /// journal lives on whatever fs its store does.  On a ramfs/tmpfs store this
 /// is a harmless no-op for the caller that used to skip it.
-fn syncfsDir(path: [*:0]const u8) void {
+/// PUB for the same reason as mkdirpDir: every store record file owes it.
+pub fn syncfsDir(path: [*:0]const u8) void {
     var buf: [1100]u8 = undefined;
     const p = span(path);
     if (p.len == 0 or p.len >= buf.len) return;

@@ -32,6 +32,7 @@ const cfg_mod = @import("config");
 const fx = @import("fxstore");
 const fxstat = @import("fxstat"); // target-correct time ABI (see fxstat.zig)
 const opj = @import("operator_journal"); // the ONE <store>/.operator definition (header + grammar)
+const intent_citation = @import("intent_citation"); // the ONE <store>/.intents definition (a CITATION journal)
 
 const FxConfig = cfg_mod.FxConfig;
 const FxService = cfg_mod.FxService;
@@ -1145,6 +1146,13 @@ const usage_text =
     "  --store DIR        store root (default /fx/store)\n" ++
     "  --config PATH      config.dhall path (default config.dhall from cwd)\n" ++
     "  --package-set PATH package-set.dhall path (default package-set.dhall from cwd)\n" ++
+    "  --intent ID        CITE an orchestrator intent id on this activation: recorded\n" ++
+    "                     VERBATIM in <store>/.intents as a CITATION (the agent's\n" ++
+    "                     claim, never evidence).  The id's SHAPE is checked\n" ++
+    "                     (intent-<64 lowercase hex>); its EXISTENCE is not — this\n" ++
+    "                     tool cannot verify an approval, and a record is not more\n" ++
+    "                     authoritative than its writer.  A well-formed id nobody\n" ++
+    "                     has issued is accepted; the reader decides what it is worth.\n" ++
     "  -h, --help         show this help\n";
 
 fn usage(w: *std.Io.Writer) void {
@@ -1172,6 +1180,7 @@ pub fn main(init: std.process.Init) !void {
     var store_root: ?[:0]const u8 = null;
     var config_path: ?[:0]const u8 = null;
     var pkgset_path: ?[:0]const u8 = null;
+    var intent_id: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a: [:0]const u8 = args[i];
@@ -1205,6 +1214,16 @@ pub fn main(init: std.process.Init) !void {
             pkgset_path = args[i];
         } else if (std.mem.startsWith(u8, a, "--package-set=")) {
             pkgset_path = a[14..];
+        } else if (std.mem.eql(u8, a, "--intent")) {
+            i += 1;
+            if (i >= args.len) {
+                errw.print("fx-activate: --intent requires an id\n", .{}) catch {};
+                errw.flush() catch {};
+                std.process.exit(2);
+            }
+            intent_id = args[i];
+        } else if (std.mem.startsWith(u8, a, "--intent=")) {
+            intent_id = a[9..];
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usage(out);
             out.flush() catch {};
@@ -1216,6 +1235,26 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         }
     }
+    // ── THE CITED INTENT: SHAPE checked here, EXISTENCE never ────────────
+    // Refused BEFORE anything is read, published or written, so a malformed
+    // citation can never ride an activation that then has to be explained
+    // away: an id that is not a claim is noise, and recording it would put a
+    // line in the record that says nothing.  What is NOT refused is an id
+    // this tool has never seen — it CANNOT check one (the approvals are the
+    // orchestrator's, published on its side), and a record is not more
+    // authoritative than its writer.  An unknown-but-well-formed id is a
+    // claim the agent made; the reader weighs it.
+    if (intent_id) |cid| {
+        if (intent_citation.idDefect(cid)) |why| {
+            errw.print("fx-activate: --intent REFUSED: \"{s}\" is not the shape of an intent id ({s}) — " ++
+                "the shape is `intent-<64 lowercase hex>`, the id CNC publishes in its intent stream. " ++
+                "An id of any other shape is not a claim, it is noise; a WELL-FORMED id this tool has " ++
+                "never seen is accepted and recorded verbatim as a citation.\n", .{ cid, why }) catch {};
+            errw.flush() catch {};
+            std.process.exit(2);
+        }
+    }
+
     const store_root_s: [:0]const u8 = store_root orelse "/fx/store";
     const config_path_s: []const u8 = config_path orelse "config.dhall";
     const pkgset_path_s: [:0]const u8 = pkgset_path orelse "package-set.dhall";
@@ -1777,6 +1816,21 @@ pub fn main(init: std.process.Init) !void {
     // discipline: the row is durable before the reply is flushed).  Prints
     // NOTHING — stdout/stderr are byte-compared against the pinned goldens.
     selfRecord(store_root_s, config_path_s, "ok", v_from, v);
+
+    // THE CITATION, beside the operator row and for the same reason (durable
+    // before the caller sees the answer).  It is written HERE and not in
+    // selfRecord because its predicate is different by design: an operator row
+    // needs a boot nonce to be attributable, a CITATION is anchored by the
+    // ACTIVATION it belongs to — the version and genhash just published, which
+    // only this process knows.  So a host-side activation (a fixture, a golden
+    // diff, no PID1) records its citation, and the nonce column says `none`.
+    if (intent_id) |cid| {
+        var ip_buf: [PATH_MAX:0]u8 = undefined;
+        const ip = snfmtz(&ip_buf, "{s}/.intents", .{store_root_s});
+        const inonce = readAllBytes("/proc/cmdline") orelse "";
+        const nonce = opj.parseKernelNonce(inonce) orelse "none";
+        intent_citation.append(ip.ptr, cid, v_from, v, genhash_s, nonce);
+    }
 
     out.print("activated {s} as version {d}; buildfile {s}\n", .{ genhash_s, v, buildfile_abs }) catch {};
     out.flush() catch {};
